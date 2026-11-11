@@ -90,6 +90,34 @@ def test_secrets_come_from_environment(
     assert config.media.s3.secret_access_key == "s3-key"
 
 
+def test_toml_secrets_are_ignored_in_favour_of_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FORESIGHT_DB_PASSWORD", "db-password-from-env")
+    monkeypatch.setenv("FORESIGHT_LLM_API_KEY", "llm-key-from-env")
+    monkeypatch.setenv("FORESIGHT_S3_ACCESS_KEY_ID", "s3-id-from-env")
+    monkeypatch.setenv("FORESIGHT_S3_SECRET_ACCESS_KEY", "s3-secret-from-env")
+    path = _write_config(
+        tmp_path,
+        """
+[database]
+password = "db-password-from-toml"
+
+[media.s3]
+access_key_id = "s3-id-from-toml"
+secret_access_key = "s3-secret-from-toml"
+
+[ai]
+api_key = "llm-key-from-toml"
+""",
+    )
+    config = load_config(path)
+    assert config.database.password == "db-password-from-env"
+    assert config.ai.api_key == "llm-key-from-env"
+    assert config.media.s3.access_key_id == "s3-id-from-env"
+    assert config.media.s3.secret_access_key == "s3-secret-from-env"
+
+
 def test_postgres_url_encodes_password(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FORESIGHT_DB_PASSWORD", "p@ss/word")
     path = _postgres_config(tmp_path)
@@ -135,6 +163,47 @@ def test_non_numeric_env_api_port_raises_config_error(
     monkeypatch.setenv("FORESIGHT_API_PORT", "not-a-number")
     with pytest.raises(ConfigError):
         load_config(path)
+
+
+def test_non_string_database_user_raises_config_error(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path, '[database]\nbackend = "postgresql"\nuser = 123\n'
+    )
+    with pytest.raises(ConfigError, match="database.user"):
+        load_config(path)
+
+
+def test_string_use_path_style_raises_config_error(tmp_path: Path) -> None:
+    path = _write_config(tmp_path, '[media.s3]\nuse_path_style = "false"\n')
+    with pytest.raises(ConfigError, match="use_path_style"):
+        load_config(path)
+
+
+def test_string_ai_enabled_raises_config_error(tmp_path: Path) -> None:
+    path = _write_config(tmp_path, '[ai]\nenabled = "false"\n')
+    with pytest.raises(ConfigError, match="ai.enabled"):
+        load_config(path)
+
+
+def test_correctly_typed_values_still_load(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        """
+[database]
+backend = "postgresql"
+user = "fsuser"
+
+[media.s3]
+use_path_style = false
+
+[ai]
+enabled = true
+""",
+    )
+    config = load_config(path)
+    assert config.database.user == "fsuser"
+    assert config.media.s3.use_path_style is False
+    assert config.ai.enabled is True
 
 
 def test_unknown_log_level_raises_config_error(tmp_path: Path) -> None:
@@ -206,6 +275,25 @@ def test_setup_logging_sets_requested_level() -> None:
         setup_logging("DEBUG")
         assert root.level == logging.DEBUG
     finally:
+        root.handlers = original_handlers
+        root.setLevel(original_level)
+
+
+def test_setup_logging_keeps_existing_file_handler_usable(tmp_path: Path) -> None:
+    root = logging.getLogger()
+    original_handlers = root.handlers[:]
+    original_level = root.level
+    log_file = tmp_path / "app.log"
+    handler = logging.FileHandler(log_file, encoding="utf-8")
+    try:
+        root.addHandler(handler)
+        setup_logging("INFO")
+        assert handler in root.handlers
+        logging.getLogger("foresight.test").warning("file handler still works")
+        assert "file handler still works" in log_file.read_text(encoding="utf-8")
+    finally:
+        root.removeHandler(handler)
+        handler.close()
         root.handlers = original_handlers
         root.setLevel(original_level)
 

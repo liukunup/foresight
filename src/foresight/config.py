@@ -152,6 +152,25 @@ def _as_int(value: Any, key: str) -> int:
         ) from exc
 
 
+def _as_str(value: Any, key: str) -> str:
+    """Validate that ``value`` is a string, reporting failures as a
+    :class:`ConfigError`."""
+    if not isinstance(value, str):
+        raise ConfigError(f"invalid value for {key}: {value!r} (expected a string)")
+    return value
+
+
+def _as_bool(value: Any, key: str) -> bool:
+    """Validate that ``value`` is a boolean, reporting failures as :class:`ConfigError`.
+
+    Strings are rejected on purpose: ``"false"`` is truthy in Python, so
+    accepting it would silently enable a feature the operator meant to disable.
+    """
+    if not isinstance(value, bool):
+        raise ConfigError(f"invalid value for {key}: {value!r} (expected a boolean)")
+    return value
+
+
 def _as_int_list(value: Any, key: str) -> tuple[int, ...]:
     """Coerce a sequence of values to a tuple of ints."""
     if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
@@ -163,7 +182,7 @@ def _as_int_list(value: Any, key: str) -> tuple[int, ...]:
 
 def _as_log_level(value: Any, key: str = "logging.level") -> str:
     """Normalise and validate a logging level name."""
-    level = str(value).strip().upper()
+    level = _as_str(value, key).strip().upper()
     if level not in logging.getLevelNamesMapping():
         raise ConfigError(f"invalid value for {key}: {value!r} (unknown log level)")
     return level
@@ -200,11 +219,11 @@ def _build(raw: dict[str, Any], config_path: Path) -> Config:
         raise ConfigError(f"unsupported database backend: {backend!r}")
     database = DatabaseConfig(
         backend=backend,
-        path=db_raw.get("path", "data/foresight.db"),
-        host=db_raw.get("host", "localhost"),
+        path=_as_str(db_raw.get("path", "data/foresight.db"), "database.path"),
+        host=_as_str(db_raw.get("host", "localhost"), "database.host"),
         port=_as_int(db_raw.get("port", 5432), "database.port"),
-        database=db_raw.get("database", "foresight"),
-        user=db_raw.get("user", "foresight"),
+        database=_as_str(db_raw.get("database", "foresight"), "database.database"),
+        user=_as_str(db_raw.get("user", "foresight"), "database.user"),
         password=os.environ.get("FORESIGHT_DB_PASSWORD", ""),
     )
 
@@ -215,7 +234,9 @@ def _build(raw: dict[str, Any], config_path: Path) -> Config:
     s3_raw = _section(media_raw, "s3")
     media = MediaConfig(
         backend=media_backend,
-        local_root=media_raw.get("local_root", "data/media"),
+        local_root=_as_str(
+            media_raw.get("local_root", "data/media"), "media.local_root"
+        ),
         max_download_size_mb=_as_int(
             media_raw.get("max_download_size_mb", 100), "media.max_download_size_mb"
         ),
@@ -223,11 +244,15 @@ def _build(raw: dict[str, Any], config_path: Path) -> Config:
             media_raw.get("download_concurrency", 3), "media.download_concurrency"
         ),
         s3=S3Config(
-            bucket=s3_raw.get("bucket", ""),
-            endpoint_url=s3_raw.get("endpoint_url", ""),
-            region=s3_raw.get("region", "auto"),
-            prefix=s3_raw.get("prefix", "foresight"),
-            use_path_style=bool(s3_raw.get("use_path_style", True)),
+            bucket=_as_str(s3_raw.get("bucket", ""), "media.s3.bucket"),
+            endpoint_url=_as_str(
+                s3_raw.get("endpoint_url", ""), "media.s3.endpoint_url"
+            ),
+            region=_as_str(s3_raw.get("region", "auto"), "media.s3.region"),
+            prefix=_as_str(s3_raw.get("prefix", "foresight"), "media.s3.prefix"),
+            use_path_style=_as_bool(
+                s3_raw.get("use_path_style", True), "media.s3.use_path_style"
+            ),
             access_key_id=os.environ.get("FORESIGHT_S3_ACCESS_KEY_ID", ""),
             secret_access_key=os.environ.get("FORESIGHT_S3_SECRET_ACCESS_KEY", ""),
         ),
@@ -236,7 +261,7 @@ def _build(raw: dict[str, Any], config_path: Path) -> Config:
     api_raw = _section(raw, "api")
     api_host = os.environ.get("FORESIGHT_API_HOST")
     if api_host is None:
-        api_host = str(api_raw.get("host", "127.0.0.1"))
+        api_host = _as_str(api_raw.get("host", "127.0.0.1"), "api.host")
     api_port_value = os.environ.get("FORESIGHT_API_PORT")
     if api_port_value is None:
         api_port = _as_int(api_raw.get("port", 8000), "api.port")
@@ -245,15 +270,19 @@ def _build(raw: dict[str, Any], config_path: Path) -> Config:
     api = ApiConfig(
         host=api_host,
         port=api_port,
-        metrics_token=api_raw.get("metrics_token", ""),
+        metrics_token=_as_str(api_raw.get("metrics_token", ""), "api.metrics_token"),
     )
 
     ai_raw = _section(raw, "ai")
     ai = AiConfig(
-        enabled=bool(ai_raw.get("enabled", False)),
-        base_url=ai_raw.get("base_url", "https://api.openai.com/v1"),
-        model=ai_raw.get("model", "gpt-4o-mini"),
-        translation_target=ai_raw.get("translation_target", "zh-CN"),
+        enabled=_as_bool(ai_raw.get("enabled", False), "ai.enabled"),
+        base_url=_as_str(
+            ai_raw.get("base_url", "https://api.openai.com/v1"), "ai.base_url"
+        ),
+        model=_as_str(ai_raw.get("model", "gpt-4o-mini"), "ai.model"),
+        translation_target=_as_str(
+            ai_raw.get("translation_target", "zh-CN"), "ai.translation_target"
+        ),
         max_concurrency=_as_int(
             ai_raw.get("max_concurrency", 2), "ai.max_concurrency"
         ),
