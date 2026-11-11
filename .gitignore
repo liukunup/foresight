@@ -221,3 +221,9 @@ __marimo__/
 
 # Superpowers scratch directory
 .superpowers/
+
+# Local runtime artifacts
+#   SQLite database, downloaded media and the locally created config file
+#   (config.toml is copied from config.example.toml and never committed).
+data/
+config.toml

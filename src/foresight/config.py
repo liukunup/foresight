@@ -7,12 +7,13 @@ matching TOML keys.
 
 from __future__ import annotations
 
+import logging
 import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import quote_plus
+from urllib.parse import quote
 
 DatabaseBackend = Literal["sqlite", "postgresql", "mysql"]
 MediaBackend = Literal["local", "s3"]
@@ -45,16 +46,26 @@ class DatabaseConfig:
             return f"sqlite+aiosqlite:///{self.path}"
         if self.backend == "postgresql":
             return (
-                f"postgresql+asyncpg://{quote_plus(self.user)}:{quote_plus(self.password)}"
+                f"postgresql+asyncpg://{quote(self.user, safe='')}:"
+                f"{quote(self.password, safe='')}"
                 f"@{self.host}:{self.port}/{self.database}"
             )
         return (
-            f"mysql+asyncmy://{quote_plus(self.user)}:{quote_plus(self.password)}"
+            f"mysql+asyncmy://{quote(self.user, safe='')}:"
+            f"{quote(self.password, safe='')}"
             f"@{self.host}:{self.port}/{self.database}"
         )
 
     @property
     def readonly_sqlalchemy_url(self) -> str:
+        """URL to use when the database must only be read from.
+
+        For SQLite this is a ``file:...?mode=ro`` URI, so the driver itself
+        rejects any write statement. PostgreSQL and MySQL have no equivalent
+        URI-level switch, so for those backends the normal
+        :attr:`sqlalchemy_url` is returned and read-only access is enforced
+        at query time by a read-only transaction in the query runner.
+        """
         if self.backend == "sqlite":
             return f"sqlite+aiosqlite:///file:{self.path}?mode=ro&uri=true"
         return self.sqlalchemy_url
@@ -129,19 +140,59 @@ def _section(raw: dict[str, Any], name: str) -> dict[str, Any]:
     return value
 
 
+def _as_int(value: Any, key: str) -> int:
+    """Coerce ``value`` to ``int``, reporting failures as :class:`ConfigError`."""
+    if isinstance(value, bool):
+        raise ConfigError(f"invalid value for {key}: {value!r} (expected an integer)")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            f"invalid value for {key}: {value!r} (expected an integer)"
+        ) from exc
+
+
+def _as_int_list(value: Any, key: str) -> tuple[int, ...]:
+    """Coerce a sequence of values to a tuple of ints."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ConfigError(
+            f"invalid value for {key}: {value!r} (expected a list of integers)"
+        )
+    return tuple(_as_int(item, f"{key}[{index}]") for index, item in enumerate(value))
+
+
+def _as_log_level(value: Any, key: str = "logging.level") -> str:
+    """Normalise and validate a logging level name."""
+    level = str(value).strip().upper()
+    if level not in logging.getLevelNamesMapping():
+        raise ConfigError(f"invalid value for {key}: {value!r} (unknown log level)")
+    return level
+
+
 def load_config(path: str | Path | None = None) -> Config:
-    """Load configuration from TOML plus environment overrides."""
+    """Load configuration from TOML plus environment overrides.
+
+    Every problem with the configuration (missing file, malformed TOML,
+    unusable value) is reported as :class:`ConfigError`.
+    """
     config_path = Path(path or os.environ.get("FORESIGHT_CONFIG", DEFAULT_CONFIG_PATH))
     if not config_path.exists():
         raise ConfigError(f"config file not found: {config_path}")
-    with config_path.open("rb") as fh:
-        raw = tomllib.load(fh)
+    try:
+        with config_path.open("rb") as fh:
+            raw = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"invalid TOML in {config_path}: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"cannot read config file {config_path}: {exc}") from exc
     return _build(raw, config_path)
 
 
 def _build(raw: dict[str, Any], config_path: Path) -> Config:
     discord_raw = _section(raw, "discord")
-    channel_ids = tuple(int(cid) for cid in discord_raw.get("channel_ids", []))
+    channel_ids = _as_int_list(
+        discord_raw.get("channel_ids", []), "discord.channel_ids"
+    )
 
     db_raw = _section(raw, "database")
     backend = db_raw.get("backend", "sqlite")
@@ -151,7 +202,7 @@ def _build(raw: dict[str, Any], config_path: Path) -> Config:
         backend=backend,
         path=db_raw.get("path", "data/foresight.db"),
         host=db_raw.get("host", "localhost"),
-        port=int(db_raw.get("port", 5432)),
+        port=_as_int(db_raw.get("port", 5432), "database.port"),
         database=db_raw.get("database", "foresight"),
         user=db_raw.get("user", "foresight"),
         password=os.environ.get("FORESIGHT_DB_PASSWORD", ""),
@@ -165,8 +216,12 @@ def _build(raw: dict[str, Any], config_path: Path) -> Config:
     media = MediaConfig(
         backend=media_backend,
         local_root=media_raw.get("local_root", "data/media"),
-        max_download_size_mb=int(media_raw.get("max_download_size_mb", 100)),
-        download_concurrency=int(media_raw.get("download_concurrency", 3)),
+        max_download_size_mb=_as_int(
+            media_raw.get("max_download_size_mb", 100), "media.max_download_size_mb"
+        ),
+        download_concurrency=_as_int(
+            media_raw.get("download_concurrency", 3), "media.download_concurrency"
+        ),
         s3=S3Config(
             bucket=s3_raw.get("bucket", ""),
             endpoint_url=s3_raw.get("endpoint_url", ""),
@@ -179,9 +234,17 @@ def _build(raw: dict[str, Any], config_path: Path) -> Config:
     )
 
     api_raw = _section(raw, "api")
+    api_host = os.environ.get("FORESIGHT_API_HOST")
+    if api_host is None:
+        api_host = str(api_raw.get("host", "127.0.0.1"))
+    api_port_value = os.environ.get("FORESIGHT_API_PORT")
+    if api_port_value is None:
+        api_port = _as_int(api_raw.get("port", 8000), "api.port")
+    else:
+        api_port = _as_int(api_port_value, "FORESIGHT_API_PORT (api.port)")
     api = ApiConfig(
-        host=os.environ.get("FORESIGHT_API_HOST", api_raw.get("host", "127.0.0.1")),
-        port=int(os.environ.get("FORESIGHT_API_PORT", api_raw.get("port", 8000))),
+        host=api_host,
+        port=api_port,
         metrics_token=api_raw.get("metrics_token", ""),
     )
 
@@ -191,20 +254,28 @@ def _build(raw: dict[str, Any], config_path: Path) -> Config:
         base_url=ai_raw.get("base_url", "https://api.openai.com/v1"),
         model=ai_raw.get("model", "gpt-4o-mini"),
         translation_target=ai_raw.get("translation_target", "zh-CN"),
-        max_concurrency=int(ai_raw.get("max_concurrency", 2)),
-        timeout_seconds=int(ai_raw.get("timeout_seconds", 30)),
+        max_concurrency=_as_int(
+            ai_raw.get("max_concurrency", 2), "ai.max_concurrency"
+        ),
+        timeout_seconds=_as_int(
+            ai_raw.get("timeout_seconds", 30), "ai.timeout_seconds"
+        ),
         api_key=os.environ.get("FORESIGHT_LLM_API_KEY", ""),
     )
 
     writer_raw = _section(raw, "writer")
     writer = WriterConfig(
-        batch_size=int(writer_raw.get("batch_size", 100)),
-        flush_interval_ms=int(writer_raw.get("flush_interval_ms", 50)),
-        queue_maxsize=int(writer_raw.get("queue_maxsize", 10000)),
+        batch_size=_as_int(writer_raw.get("batch_size", 100), "writer.batch_size"),
+        flush_interval_ms=_as_int(
+            writer_raw.get("flush_interval_ms", 50), "writer.flush_interval_ms"
+        ),
+        queue_maxsize=_as_int(
+            writer_raw.get("queue_maxsize", 10000), "writer.queue_maxsize"
+        ),
     )
 
     logging_raw = _section(raw, "logging")
-    logging_cfg = LoggingConfig(level=logging_raw.get("level", "INFO"))
+    logging_cfg = LoggingConfig(level=_as_log_level(logging_raw.get("level", "INFO")))
 
     return Config(
         discord=DiscordConfig(channel_ids=channel_ids),
