@@ -160,7 +160,7 @@ foresight/
 
 - Discord 雪花 ID 存 `BIGINT`（< 2^63，安全且可索引）
 - 时间统一存 **UTC ISO-8601 TEXT**，例：`2026-11-11T13:45:00+00:00`。SQLite 的 `date()`/`strftime()`、PG 的 `to_char()`、MySQL 的 `DATE_FORMAT()` 都能处理
-- JSON 字段一律用 `TEXT` 存 JSON 字符串，序列化在应用层做（不引入 PG `JSONB` 等方言专属类型，保证三方言行为一致）
+- JSON 字段一律用 **文本类型** 存 JSON 字符串，序列化在应用层做（不引入 PG `JSONB` 等方言专属类型，保证三方言行为一致）。实现上用 `Text().with_variant(mysql.LONGTEXT, "mysql")`：SQLite / PG 仍是 `TEXT`，MySQL 用 `LONGTEXT` 绕开其 65,535 字节上限
 - 布尔列用 SQLAlchemy `Boolean`（SQLite 存 0/1，PG 原生 bool，MySQL TINYINT）
 
 ### 5.2 表结构
@@ -262,6 +262,8 @@ foresight/
 | `captured_at` | TEXT | 入库时间 |
 | `stored_at` | TEXT | 存储完成时间 |
 
+唯一约束 `(message_id, attachment_id)`（名 `uq_attachments_target`）：附件行以这两个字段定位更新，没有它就只能全表扫描，且同一消息下重复的 `attachment_id` 会导致更新多行。
+
 **message_analysis**
 
 | 列 | 类型 | 说明 |
@@ -293,6 +295,8 @@ attachments(status)
 ### 5.4 外键策略
 
 `reactions` 与 `attachments` **不声明外键到 `messages`**，只建索引。原因：机器人启动前就存在的消息，可能在服务运行期间被人加表情或被引用，此时 `messages` 表里没有对应行，强外键会导致写入失败。
+
+命名唯一约束两处：`uq_reactions_target`（`reactions` 的 `(message_id, user_id, emoji)`，upsert 冲突目标）与 `uq_attachments_target`（`attachments` 的 `(message_id, attachment_id)`，附件状态更新的定位键）。
 
 ### 5.5 关键语义（分析口径）
 
