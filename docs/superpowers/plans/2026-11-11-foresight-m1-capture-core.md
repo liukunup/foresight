@@ -37,7 +37,7 @@
 
 **Files:**
 - Create: `pyproject.toml`
-- Create: `.gitignore`
+- Create: `.gitignore`（扩展已有的 `.gitignore`，保留原有条目；需要忽略 `.superpowers/`、`data/`、`config.toml`）
 - Create: `src/foresight/__init__.py`
 - Create: `src/foresight/config.py`
 - Create: `src/foresight/logging_setup.py`
@@ -189,7 +189,7 @@ dependencies = [
     "rich>=13.9",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
@@ -210,9 +210,11 @@ packages = ["src/foresight"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
-filterwarnings = ["ignore::DeprecationWarning"]
 ```
+
+注意：dev 依赖用 PEP 735 的 `[dependency-groups]` 而不是 `[project.optional-dependencies]` —— uv 默认只安装 dependency group，把它写成 extra 会导致 `uv run pytest` 在全新检出上直接失败（`Failed to spawn: pytest`），而且 `uv sync` 会把 pytest 整套工具链卸载掉。
 
 创建 `src/foresight/__init__.py`：
 
@@ -467,7 +469,7 @@ def setup_logging(level: str = "INFO") -> None:
 Run: `uv run pytest tests/unit/test_config.py -v`
 Expected: PASS —— 8 passed
 
-若尚未安装依赖，先执行：`uv venv && uv pip install -e ".[dev]"`
+若尚未安装依赖，先执行：`uv venv && uv sync`（`uv sync` 会安装 dev dependency group）
 
 - [ ] **Step 5: 提交**
 

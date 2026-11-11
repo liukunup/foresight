@@ -1017,7 +1017,7 @@ docker compose up -d
 
 ```bash
 uv venv
-uv pip install -e ".[dev]"
+uv sync
 
 cp config.example.toml config.toml
 export DISCORD_TOKEN="你的 bot token"
