@@ -1,0 +1,295 @@
+"""Schema-level regression tests for the SQLAlchemy Core table definitions.
+
+Later tasks depend on specific schema properties: the *name* of the unique
+constraint used as an ``ON CONFLICT`` target, the absence of foreign keys on
+``reactions``/``attachments``, auto-incrementing surrogate primary keys, and
+TEXT-only timestamp and JSON columns. A typo in any of those fails at runtime
+against a real database, so they are pinned here.
+"""
+
+from __future__ import annotations
+
+import pytest
+import sqlalchemy as sa
+from sqlalchemy import UniqueConstraint
+from sqlalchemy.dialects import mysql, postgresql, sqlite
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.schema import CreateTable
+
+from foresight.storage.tables import (
+    attachments,
+    channels,
+    guilds,
+    message_analysis,
+    messages,
+    metadata,
+    reactions,
+    users,
+)
+
+ALL_TABLES = (
+    guilds,
+    channels,
+    users,
+    messages,
+    reactions,
+    attachments,
+    message_analysis,
+)
+
+EXPECTED_INDEXES = {
+    "ix_messages_channel_created": ("messages", ["channel_id", "created_at"]),
+    "ix_messages_author_created": ("messages", ["author_id", "created_at"]),
+    "ix_messages_guild_created": ("messages", ["guild_id", "created_at"]),
+    "ix_messages_created": ("messages", ["created_at"]),
+    "ix_messages_analysis_status": ("messages", ["analysis_status"]),
+    "ix_reactions_message": ("reactions", ["message_id"]),
+    "ix_attachments_message": ("attachments", ["message_id"]),
+    "ix_attachments_status": ("attachments", ["status"]),
+}
+
+EXPECTED_TIMESTAMP_COLUMNS = {
+    "guilds": {"captured_at"},
+    "channels": {"captured_at"},
+    "users": {"account_created_at", "guild_joined_at", "updated_at"},
+    "messages": {"created_at", "captured_at", "edited_at", "deleted_at"},
+    "reactions": {"added_at", "removed_at"},
+    "attachments": {"captured_at", "stored_at"},
+    "message_analysis": {"analyzed_at"},
+}
+
+JSON_COLUMNS = (
+    ("users", "roles_json"),
+    ("messages", "attachments_json"),
+    ("messages", "embeds_json"),
+    ("message_analysis", "issues_json"),
+)
+
+
+def _sqlite_engine(tmp_path):
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'schema.db'}")
+    metadata.create_all(engine)
+    return engine
+
+
+def _column_type_token(table, column_name, dialect):
+    """Return the rendered type token of one column in that dialect's DDL."""
+    ddl = str(CreateTable(table).compile(dialect=dialect))
+    prefix = f"{column_name} "
+    for line in ddl.splitlines():
+        stripped = line.strip().rstrip(",")
+        if stripped.startswith(prefix):
+            return stripped.split()[1]
+    raise AssertionError(f"column {column_name!r} not found in DDL:\n{ddl}")
+
+
+def test_metadata_registers_every_table():
+    assert set(metadata.tables) == {table.name for table in ALL_TABLES}
+
+
+def test_reactions_unique_constraint_is_named_uq_reactions_target():
+    named = {
+        constraint.name: list(constraint.columns.keys())
+        for constraint in reactions.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert named == {"uq_reactions_target": ["message_id", "user_id", "emoji"]}
+
+
+def test_reactions_unique_constraint_keeps_its_name_in_the_created_schema(tmp_path):
+    engine = _sqlite_engine(tmp_path)
+    inspector = sa.inspect(engine)
+    unique = {
+        constraint["name"]: constraint["column_names"]
+        for constraint in inspector.get_unique_constraints("reactions")
+    }
+    assert unique == {"uq_reactions_target": ["message_id", "user_id", "emoji"]}
+
+
+def test_reactions_declares_no_foreign_key():
+    assert reactions.foreign_keys == set()
+
+
+def test_attachments_declares_no_foreign_key():
+    assert attachments.foreign_keys == set()
+
+
+def test_created_schema_has_no_foreign_keys_on_reactions_or_attachments(tmp_path):
+    engine = _sqlite_engine(tmp_path)
+    inspector = sa.inspect(engine)
+    assert inspector.get_foreign_keys("reactions") == []
+    assert inspector.get_foreign_keys("attachments") == []
+
+
+def test_reactions_autoincrement_ids_start_at_one(tmp_path):
+    engine = _sqlite_engine(tmp_path)
+    with engine.begin() as connection:
+        connection.execute(
+            reactions.insert(),
+            [
+                {
+                    "message_id": 1,
+                    "user_id": 2,
+                    "emoji": ":thumbsup:",
+                    "added_at": "2026-11-11T00:00:00+00:00",
+                },
+                {
+                    "message_id": 1,
+                    "user_id": 3,
+                    "emoji": ":thumbsup:",
+                    "added_at": "2026-11-11T00:00:00+00:00",
+                },
+            ],
+        )
+        ids = connection.execute(sa.select(reactions.c.id).order_by(reactions.c.id)).scalars().all()
+    assert list(ids) == [1, 2]
+
+
+def test_attachments_autoincrement_ids_start_at_one(tmp_path):
+    engine = _sqlite_engine(tmp_path)
+    rows = [
+        {
+            "message_id": 1,
+            "attachment_id": 10,
+            "url": "https://cdn.example/a.png",
+            "captured_at": "2026-11-11T00:00:00+00:00",
+        },
+        {
+            "message_id": 1,
+            "attachment_id": 11,
+            "url": "https://cdn.example/b.png",
+            "captured_at": "2026-11-11T00:00:00+00:00",
+        },
+    ]
+    with engine.begin() as connection:
+        connection.execute(attachments.insert(), rows)
+        ids = connection.execute(
+            sa.select(attachments.c.id).order_by(attachments.c.id)
+        ).scalars().all()
+    assert list(ids) == [1, 2]
+
+
+def test_every_timestamp_column_is_text():
+    for table in ALL_TABLES:
+        timestamps = {name for name in table.c.keys() if name.endswith("_at")}
+        assert timestamps == EXPECTED_TIMESTAMP_COLUMNS[table.name], (
+            f"{table.name} timestamp columns changed: "
+            f"expected {sorted(EXPECTED_TIMESTAMP_COLUMNS[table.name])}, "
+            f"got {sorted(timestamps)}"
+        )
+        for name in sorted(timestamps):
+            column = table.c[name]
+            assert isinstance(column.type, sa.Text), f"{table.name}.{name} is not TEXT"
+            assert not isinstance(column.type, sa.DateTime), (
+                f"{table.name}.{name} must not be a DateTime column"
+            )
+            assert not isinstance(column.type, sa.Date), (
+                f"{table.name}.{name} must not be a Date column"
+            )
+
+
+def test_every_json_column_is_text():
+    for table_name, column_name in JSON_COLUMNS:
+        column = metadata.tables[table_name].c[column_name]
+        assert isinstance(column.type, sa.Text), f"{table_name}.{column_name} is not TEXT"
+        assert not isinstance(column.type, sa.JSON), (
+            f"{table_name}.{column_name} must not use a dialect-specific JSON type"
+        )
+        assert column.type.python_type is str
+
+
+def test_no_column_uses_a_dialect_specific_json_type():
+    for table in ALL_TABLES:
+        for column in table.c:
+            assert not isinstance(column.type, sa.JSON), (
+                f"{table.name}.{column.name} uses a dialect-specific JSON type"
+            )
+
+
+def test_json_columns_use_longtext_on_mysql():
+    for table_name, column_name in JSON_COLUMNS:
+        token = _column_type_token(metadata.tables[table_name], column_name, mysql.dialect())
+        assert token == "LONGTEXT", (
+            f"{table_name}.{column_name} must be LONGTEXT on MySQL, got {token}"
+        )
+
+
+def test_json_columns_use_text_on_sqlite_and_postgresql():
+    for dialect in (sqlite.dialect(), postgresql.dialect()):
+        for table_name, column_name in JSON_COLUMNS:
+            token = _column_type_token(
+                metadata.tables[table_name], column_name, dialect
+            )
+            assert token == "TEXT", (
+                f"{table_name}.{column_name} must be TEXT on {dialect.name}, got {token}"
+            )
+
+
+def test_expected_indexes_exist_with_documented_names():
+    actual = {
+        index.name: (index.table.name, [column.name for column in index.columns])
+        for table in ALL_TABLES
+        for index in table.indexes
+    }
+    assert actual == EXPECTED_INDEXES
+
+
+def test_expected_indexes_exist_in_the_created_schema(tmp_path):
+    engine = _sqlite_engine(tmp_path)
+    inspector = sa.inspect(engine)
+    for index_name, (table_name, columns) in EXPECTED_INDEXES.items():
+        indexes = {
+            index["name"]: index["column_names"]
+            for index in inspector.get_indexes(table_name)
+        }
+        assert indexes.get(index_name) == columns, (
+            f"{index_name} missing or wrong on {table_name}: {indexes}"
+        )
+
+
+def test_attachments_unique_constraint_is_named_uq_attachments_target():
+    named = {
+        constraint.name: list(constraint.columns.keys())
+        for constraint in attachments.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert named == {"uq_attachments_target": ["message_id", "attachment_id"]}
+
+
+def test_attachments_unique_constraint_keeps_its_name_in_the_created_schema(tmp_path):
+    engine = _sqlite_engine(tmp_path)
+    inspector = sa.inspect(engine)
+    unique = {
+        constraint["name"]: constraint["column_names"]
+        for constraint in inspector.get_unique_constraints("attachments")
+    }
+    assert unique == {"uq_attachments_target": ["message_id", "attachment_id"]}
+
+
+def _attachment_row(message_id, attachment_id):
+    return {
+        "message_id": message_id,
+        "attachment_id": attachment_id,
+        "url": f"https://cdn.example/{attachment_id}.png",
+        "captured_at": "2026-11-11T00:00:00+00:00",
+    }
+
+
+def test_attachments_rejects_two_rows_with_the_same_message_and_attachment_id(tmp_path):
+    engine = _sqlite_engine(tmp_path)
+    with engine.begin() as connection:
+        connection.execute(attachments.insert(), [_attachment_row(1, 10)])
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(attachments.insert(), [_attachment_row(1, 10)])
+
+
+def test_attachments_accepts_two_rows_with_different_attachment_ids(tmp_path):
+    engine = _sqlite_engine(tmp_path)
+    with engine.begin() as connection:
+        connection.execute(
+            attachments.insert(),
+            [_attachment_row(1, 10), _attachment_row(1, 11)],
+        )
+        count = connection.execute(sa.select(sa.func.count()).select_from(attachments)).scalar_one()
+    assert count == 2

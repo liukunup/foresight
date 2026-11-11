@@ -1,5 +1,21 @@
 from foresight.domain.models import MessageRecord, OpKind, WriteOp
 
+EXPECTED_OP_KINDS = {
+    "MESSAGE": "message",
+    "MESSAGE_INSERT_ONLY": "message_insert_only",
+    "MESSAGE_EDIT": "message_edit",
+    "MESSAGE_DELETE": "message_delete",
+    "REACTION": "reaction",
+    "REACTION_REMOVE": "reaction_remove",
+    "USER": "user",
+    "CHANNEL": "channel",
+    "GUILD": "guild",
+    "ATTACHMENT": "attachment",
+    "ATTACHMENT_STATUS": "attachment_status",
+    "ANALYSIS_STATUS": "analysis_status",
+    "ANALYSIS": "analysis",
+}
+
 
 def test_message_record_defaults():
     record = MessageRecord(
@@ -32,3 +48,12 @@ def test_op_kind_constants_are_unique():
         if not name.startswith("_") and isinstance(value, str)
     ]
     assert len(values) == len(set(values))
+
+
+def test_op_kind_values_are_exactly_the_expected_ones():
+    actual = {
+        name: value
+        for name, value in vars(OpKind).items()
+        if not name.startswith("_") and isinstance(value, str)
+    }
+    assert actual == EXPECTED_OP_KINDS

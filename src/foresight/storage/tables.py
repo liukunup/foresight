@@ -20,8 +20,13 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects import mysql
 
 metadata = MetaData()
+
+# JSON payloads stay TEXT on every backend. MySQL's plain TEXT stops at 65,535
+# bytes, so it gets the unbounded LONGTEXT variant there.
+JSON_TEXT = Text().with_variant(mysql.LONGTEXT, "mysql")
 
 
 def _pk_type() -> BigInteger:
@@ -62,7 +67,7 @@ users = Table(
     Column("is_bot", Boolean, nullable=False, default=False),
     Column("account_created_at", Text),
     Column("guild_joined_at", Text),
-    Column("roles_json", Text, nullable=False, default="[]"),
+    Column("roles_json", JSON_TEXT, nullable=False, default="[]"),
     Column("updated_at", Text, nullable=False),
 )
 
@@ -85,8 +90,8 @@ messages = Table(
     Column("char_count", Integer, nullable=False, default=0),
     Column("word_count", Integer, nullable=False, default=0),
     Column("attachment_count", Integer, nullable=False, default=0),
-    Column("attachments_json", Text),
-    Column("embeds_json", Text),
+    Column("attachments_json", JSON_TEXT),
+    Column("embeds_json", JSON_TEXT),
     Column("is_bot", Boolean, nullable=False, default=False),
     Column("analysis_status", Text, nullable=False, default="pending"),
 )
@@ -123,6 +128,7 @@ attachments = Table(
     Column("error", Text),
     Column("captured_at", Text, nullable=False),
     Column("stored_at", Text),
+    UniqueConstraint("message_id", "attachment_id", name="uq_attachments_target"),
 )
 
 message_analysis = Table(
@@ -132,7 +138,7 @@ message_analysis = Table(
     Column("translated_text", Text),
     Column("sentiment", Text),
     Column("sentiment_score", Float),
-    Column("issues_json", Text),
+    Column("issues_json", JSON_TEXT),
     Column("model", Text),
     Column("prompt_version", Text),
     Column("latency_ms", Integer),
