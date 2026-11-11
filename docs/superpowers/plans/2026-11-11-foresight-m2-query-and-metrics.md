@@ -373,8 +373,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from foresight.api.app import create_app
 from foresight.domain.models import MessageRecord, OpKind, WriteOp
@@ -383,49 +383,53 @@ from foresight.storage.repository import Repository
 
 
 @pytest.fixture
-def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+async def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """HTTP client for the API.
+
+    The engine and the request must live in the SAME event loop, so the
+    client uses httpx's ASGI transport instead of starlette's TestClient
+    (TestClient runs the app in its own loop, which breaks the async
+    engine with "attached to a different loop").
+    """
     monkeypatch.setenv("FORESIGHT_API_TOKEN", "secret-token")
 
-    async def _build():
-        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
-        await init_db(engine)
-        repo = Repository(engine)
-        records = [
-            MessageRecord(
-                message_id=index + 1,
-                guild_id=10,
-                channel_id=20,
-                author_id=30,
-                content=f"message number {index}",
-                message_type=0,
-                created_at=f"2026-11-1{index + 1}T10:00:00+00:00",
-                captured_at="2026-11-11T10:00:00+00:00",
-                char_count=16,
-                word_count=3,
-            )
-            for index in range(4)
-        ]
-        await repo.apply_batch([WriteOp(OpKind.MESSAGE, record) for record in records])
-        config = SimpleNamespace(
-            api=SimpleNamespace(host="127.0.0.1", port=8000, metrics_token=""),
-            database=SimpleNamespace(
-                backend="sqlite",
-                path=str(tmp_path / "test.db"),
-                sqlalchemy_url=f"sqlite+aiosqlite:///{tmp_path / 'test.db'}",
-                readonly_sqlalchemy_url=(
-                    f"sqlite+aiosqlite:///file:{tmp_path / 'test.db'}?mode=ro&uri=true"
-                ),
-            ),
-            media=SimpleNamespace(backend="local"),
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+    await init_db(engine)
+    repo = Repository(engine)
+    records = [
+        MessageRecord(
+            message_id=index + 1,
+            guild_id=10,
+            channel_id=20,
+            author_id=30,
+            content=f"message number {index}",
+            message_type=0,
+            created_at=f"2026-11-1{index + 1}T10:00:00+00:00",
+            captured_at="2026-11-11T10:00:00+00:00",
+            char_count=16,
+            word_count=3,
         )
-        app = create_app(config, engine=engine)
-        return TestClient(app), engine
+        for index in range(4)
+    ]
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, record) for record in records])
 
-    import asyncio
-
-    client, engine = asyncio.run(_build())
-    yield client
-    asyncio.run(engine.dispose())
+    config = SimpleNamespace(
+        api=SimpleNamespace(host="127.0.0.1", port=8000, metrics_token=""),
+        database=SimpleNamespace(
+            backend="sqlite",
+            path=str(tmp_path / "test.db"),
+            sqlalchemy_url=f"sqlite+aiosqlite:///{tmp_path / 'test.db'}",
+            readonly_sqlalchemy_url=(
+                f"sqlite+aiosqlite:///file:{tmp_path / 'test.db'}?mode=ro&uri=true"
+            ),
+        ),
+        media=SimpleNamespace(backend="local"),
+    )
+    app = create_app(config, engine=engine)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        yield client
+    await engine.dispose()
 
 
 @pytest.fixture
@@ -433,26 +437,27 @@ def auth():
     return {"Authorization": "Bearer secret-token"}
 ```
 
+
 - [ ] **Step 2: 写失败测试（续）**
 
 创建 `tests/integration/test_api_messages.py`：
 
 ```python
-def test_health_requires_token(api_client):
-    response = api_client.get("/api/health")
+async def test_health_requires_token(api_client):
+    response = await api_client.get("/api/health")
     assert response.status_code == 401
 
 
-def test_health_returns_counts(api_client, auth):
-    response = api_client.get("/api/health", headers=auth)
+async def test_health_returns_counts(api_client, auth):
+    response = await api_client.get("/api/health", headers=auth)
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
     assert body["total_messages"] == 4
 
 
-def test_messages_are_paginated(api_client, auth):
-    response = api_client.get("/api/messages", headers=auth, params={"limit": 2})
+async def test_messages_are_paginated(api_client, auth):
+    response = await api_client.get("/api/messages", headers=auth, params={"limit": 2})
     assert response.status_code == 200
     body = response.json()
     assert body["total"] == 4
@@ -461,37 +466,37 @@ def test_messages_are_paginated(api_client, auth):
     assert len(body["items"]) == 2
 
 
-def test_messages_limit_is_capped(api_client, auth):
-    response = api_client.get("/api/messages", headers=auth, params={"limit": 5000})
+async def test_messages_limit_is_capped(api_client, auth):
+    response = await api_client.get("/api/messages", headers=auth, params={"limit": 5000})
     assert response.status_code == 200
     assert response.json()["limit"] == 500
 
 
-def test_messages_search_is_case_insensitive(api_client, auth):
-    response = api_client.get(
+async def test_messages_search_is_case_insensitive(api_client, auth):
+    response = await api_client.get(
         "/api/messages", headers=auth, params={"q": "MESSAGE NUMBER 1"}
     )
     assert response.status_code == 200
     assert response.json()["total"] == 1
 
 
-def test_messages_filter_by_channel(api_client, auth):
-    response = api_client.get(
+async def test_messages_filter_by_channel(api_client, auth):
+    response = await api_client.get(
         "/api/messages", headers=auth, params={"channel_id": 999}
     )
     assert response.json()["total"] == 0
 
 
-def test_message_detail(api_client, auth):
-    response = api_client.get("/api/messages/2", headers=auth)
+async def test_message_detail(api_client, auth):
+    response = await api_client.get("/api/messages/2", headers=auth)
     assert response.status_code == 200
     body = response.json()
     assert body["message_id"] == 2
     assert body["analysis"] is None
 
 
-def test_message_detail_not_found(api_client, auth):
-    response = api_client.get("/api/messages/9999", headers=auth)
+async def test_message_detail_not_found(api_client, auth):
+    response = await api_client.get("/api/messages/9999", headers=auth)
     assert response.status_code == 404
 ```
 
@@ -843,8 +848,8 @@ git commit -m "feat: HTTP API with bearer auth and message endpoints"
 创建 `tests/integration/test_api_resources.py`：
 
 ```python
-def test_users_endpoint_lists_speakers(api_client, auth):
-    response = api_client.get("/api/users", headers=auth)
+async def test_users_endpoint_lists_speakers(api_client, auth):
+    response = await api_client.get("/api/users", headers=auth)
     assert response.status_code == 200
     body = response.json()
     assert body["total"] == 1
@@ -852,25 +857,25 @@ def test_users_endpoint_lists_speakers(api_client, auth):
     assert body["items"][0]["message_count"] == 4
 
 
-def test_user_detail(api_client, auth):
-    response = api_client.get("/api/users/30", headers=auth)
+async def test_user_detail(api_client, auth):
+    response = await api_client.get("/api/users/30", headers=auth)
     assert response.status_code == 200
     assert response.json()["author_id"] == 30
 
 
-def test_user_detail_not_found(api_client, auth):
-    assert api_client.get("/api/users/999", headers=auth).status_code == 404
+async def test_user_detail_not_found(api_client, auth):
+    assert (await api_client.get("/api/users/999", headers=auth).status_code) == 404
 
 
-def test_channels_endpoint(api_client, auth):
-    response = api_client.get("/api/channels", headers=auth)
+async def test_channels_endpoint(api_client, auth):
+    response = await api_client.get("/api/channels", headers=auth)
     assert response.status_code == 200
     assert response.json()["total"] == 1
     assert response.json()["items"][0]["channel_id"] == 20
 
 
-def test_reactions_endpoint_is_empty(api_client, auth):
-    response = api_client.get("/api/reactions", headers=auth)
+async def test_reactions_endpoint_is_empty(api_client, auth):
+    response = await api_client.get("/api/reactions", headers=auth)
     assert response.status_code == 200
     assert response.json()["total"] == 0
 ```
@@ -1192,28 +1197,28 @@ git commit -m "feat: user, channel and reaction endpoints"
 创建 `tests/integration/test_api_stats.py`：
 
 ```python
-def test_stats_overview(api_client, auth):
-    response = api_client.get("/api/stats/overview", headers=auth)
+async def test_stats_overview(api_client, auth):
+    response = await api_client.get("/api/stats/overview", headers=auth)
     assert response.status_code == 200
     body = response.json()
     assert body["total_messages"] == 4
     assert body["unique_authors"] == 1
 
 
-def test_stats_top_talkers(api_client, auth):
-    response = api_client.get("/api/stats/top-talkers", headers=auth)
+async def test_stats_top_talkers(api_client, auth):
+    response = await api_client.get("/api/stats/top-talkers", headers=auth)
     assert response.status_code == 200
     assert response.json()["items"][0]["author_id"] == 30
 
 
-def test_stats_activity(api_client, auth):
-    response = api_client.get("/api/stats/activity", headers=auth)
+async def test_stats_activity(api_client, auth):
+    response = await api_client.get("/api/stats/activity", headers=auth)
     assert response.status_code == 200
     assert len(response.json()["items"]) == 4
 
 
-def test_stats_topics(api_client, auth):
-    response = api_client.get("/api/stats/topics", headers=auth)
+async def test_stats_topics(api_client, auth):
+    response = await api_client.get("/api/stats/topics", headers=auth)
     assert response.status_code == 200
     assert "items" in response.json()
 ```
@@ -1329,8 +1334,8 @@ git commit -m "feat: analytics endpoints"
 创建 `tests/integration/test_api_query.py`：
 
 ```python
-def test_query_returns_rows(api_client, auth):
-    response = api_client.post(
+async def test_query_returns_rows(api_client, auth):
+    response = await api_client.post(
         "/api/query",
         headers=auth,
         json={
@@ -1345,8 +1350,8 @@ def test_query_returns_rows(api_client, auth):
     assert body["columns"] == ["message_id", "content"]
 
 
-def test_query_supports_named_params(api_client, auth):
-    response = api_client.post(
+async def test_query_supports_named_params(api_client, auth):
+    response = await api_client.post(
         "/api/query",
         headers=auth,
         json={
@@ -1358,8 +1363,8 @@ def test_query_supports_named_params(api_client, auth):
     assert response.json()["rows"] == [[4]]
 
 
-def test_query_rejects_insert(api_client, auth):
-    response = api_client.post(
+async def test_query_rejects_insert(api_client, auth):
+    response = await api_client.post(
         "/api/query",
         headers=auth,
         json={"sql": "INSERT INTO messages (message_id) VALUES (1)", "params": {}},
@@ -1367,8 +1372,8 @@ def test_query_rejects_insert(api_client, auth):
     assert response.status_code == 400
 
 
-def test_query_rejects_drop(api_client, auth):
-    response = api_client.post(
+async def test_query_rejects_drop(api_client, auth):
+    response = await api_client.post(
         "/api/query",
         headers=auth,
         json={"sql": "DROP TABLE messages", "params": {}},
@@ -1376,8 +1381,8 @@ def test_query_rejects_drop(api_client, auth):
     assert response.status_code == 400
 
 
-def test_query_rejects_multi_statement(api_client, auth):
-    response = api_client.post(
+async def test_query_rejects_multi_statement(api_client, auth):
+    response = await api_client.post(
         "/api/query",
         headers=auth,
         json={"sql": "SELECT 1; DROP TABLE messages", "params": {}},
@@ -1385,8 +1390,8 @@ def test_query_rejects_multi_statement(api_client, auth):
     assert response.status_code == 400
 
 
-def test_query_rejects_write_cte(api_client, auth):
-    response = api_client.post(
+async def test_query_rejects_write_cte(api_client, auth):
+    response = await api_client.post(
         "/api/query",
         headers=auth,
         json={
@@ -1669,53 +1674,53 @@ git commit -m "feat: read-only SQL endpoint with engine level protection"
 创建 `tests/integration/test_api_metrics.py`：
 
 ```python
-def test_metrics_endpoint_exposes_foresight_metrics(api_client):
-    response = api_client.get("/metrics")
+from types import SimpleNamespace
+
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from foresight.api.app import create_app
+from foresight.storage.db import init_db
+
+
+async def test_metrics_endpoint_exposes_foresight_metrics(api_client):
+    response = await api_client.get("/metrics")
     assert response.status_code == 200
-    body = response.text
-    assert "foresight_api_requests_total" in body
-
-
-def test_metrics_records_api_calls(api_client, auth):
-    api_client.get("/api/health", headers=auth)
-    response = api_client.get("/metrics")
     assert "foresight_api_requests_total" in response.text
 
 
-def test_metrics_token_is_enforced_when_configured(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from types import SimpleNamespace
+async def test_metrics_records_api_calls(api_client, auth):
+    await api_client.get("/api/health", headers=auth)
+    response = await api_client.get("/metrics")
+    assert "foresight_api_requests_total" in response.text
 
-    import asyncio
 
-    from foresight.api.app import create_app
-    from foresight.storage.db import init_db
-
+async def test_metrics_token_is_enforced_when_configured(tmp_path, monkeypatch):
     monkeypatch.setenv("FORESIGHT_API_TOKEN", "secret-token")
-
-    async def _build():
-        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'm.db'}")
-        await init_db(engine)
-        config = SimpleNamespace(
-            api=SimpleNamespace(host="127.0.0.1", port=8000, metrics_token="metrics-secret"),
-            database=SimpleNamespace(
-                backend="sqlite",
-                path=str(tmp_path / "m.db"),
-                sqlalchemy_url=f"sqlite+aiosqlite:///{tmp_path / 'm.db'}",
-                readonly_sqlalchemy_url=(
-                    f"sqlite+aiosqlite:///file:{tmp_path / 'm.db'}?mode=ro&uri=true"
-                ),
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'm.db'}")
+    await init_db(engine)
+    config = SimpleNamespace(
+        api=SimpleNamespace(host="127.0.0.1", port=8000, metrics_token="metrics-secret"),
+        database=SimpleNamespace(
+            backend="sqlite",
+            path=str(tmp_path / "m.db"),
+            sqlalchemy_url=f"sqlite+aiosqlite:///{tmp_path / 'm.db'}",
+            readonly_sqlalchemy_url=(
+                f"sqlite+aiosqlite:///file:{tmp_path / 'm.db'}?mode=ro&uri=true"
             ),
-            media=SimpleNamespace(backend="local"),
+        ),
+        media=SimpleNamespace(backend="local"),
+    )
+    app = create_app(config, engine=engine)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        denied = await client.get("/metrics")
+        allowed = await client.get(
+            "/metrics", headers={"X-Metrics-Token": "metrics-secret"}
         )
-        return create_app(config, engine=engine), engine
-
-    app, engine = asyncio.run(_build())
-    with TestClient(app) as client:
-        assert client.get("/metrics").status_code == 401
-        assert client.get("/metrics", headers={"X-Metrics-Token": "metrics-secret"}).status_code == 200
-    asyncio.run(engine.dispose())
+    assert denied.status_code == 401
+    assert allowed.status_code == 200
+    await engine.dispose()
 ```
 
 - [ ] **Step 2: 运行测试确认失败**

@@ -1161,11 +1161,10 @@ from types import SimpleNamespace
 
 import httpx
 import respx
-from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from foresight.adapters.discord_mapper import map_message
 from foresight.analysis.llm import LlmClient
 from foresight.analysis.worker import AnalysisWorker
 from foresight.api.app import create_app
@@ -1301,17 +1300,13 @@ async def test_message_flows_from_event_to_api(tmp_path, monkeypatch):
         media=SimpleNamespace(backend="local"),
     )
     app = create_app(config, engine=engine)
-    with TestClient(app) as client:
-        response = client.get(
-            "/api/messages",
-            headers={"Authorization": "Bearer test-token"},
-            params={"q": "times out"},
-        )
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": "Bearer test-token"}
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/api/messages", headers=headers, params={"q": "times out"})
         assert response.status_code == 200
         assert response.json()["total"] == 1
-        stats = client.get(
-            "/api/stats/overview", headers={"Authorization": "Bearer test-token"}
-        )
+        stats = await client.get("/api/stats/overview", headers=headers)
         assert stats.json()["total_messages"] == 1
     await engine.dispose()
 ```
