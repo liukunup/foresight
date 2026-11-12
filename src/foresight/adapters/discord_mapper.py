@@ -1,6 +1,7 @@
 """Translate Discord SDK objects into domain records.
 
-This is the only module that may mention Discord field names.
+One of the two modules that may mention Discord field names: this one and
+``events.py``.
 """
 
 from __future__ import annotations

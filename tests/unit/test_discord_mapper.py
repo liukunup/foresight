@@ -20,10 +20,10 @@ from foresight.domain.models import ReactionRemove
 
 
 class _MessageType(enum.Enum):
-    """Stand-in for discord.py's ``MessageType``, a plain ``enum.Enum``."""
+    """Stand-in for discord.py 2.7.1's ``MessageType``, a plain ``enum.Enum``."""
 
     default = 0
-    reply = 5
+    reply = 19
 
 
 class _ChannelType(enum.Enum):
@@ -104,7 +104,7 @@ def test_map_message_reads_enum_message_type_value():
 def test_map_message_uses_enum_value_not_the_default():
     message = _message()
     message.type = _MessageType.reply
-    assert map_message(message).message_type == 5
+    assert map_message(message).message_type == 19
 
 
 def test_map_message_serialises_embeds():
