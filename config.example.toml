@@ -1,0 +1,48 @@
+# Copy to config.toml and adjust. Secrets belong in environment variables,
+# never in this file.
+
+[discord]
+# Whitelist of channel IDs to capture.
+channel_ids = [123456789012345678]
+
+[database]
+backend = "sqlite"          # sqlite | postgresql | mysql
+path = "data/foresight.db"
+# host = "localhost"
+# port = 5432
+# database = "foresight"
+# user = "foresight"
+
+[media]
+backend = "local"            # local | s3
+local_root = "data/media"
+max_download_size_mb = 100
+download_concurrency = 3
+
+[media.s3]
+bucket = ""
+endpoint_url = ""
+region = "auto"
+prefix = "foresight"
+use_path_style = true
+
+[api]
+host = "127.0.0.1"
+port = 8000
+metrics_token = ""
+
+[ai]
+enabled = false
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+translation_target = "zh-CN"
+max_concurrency = 2
+timeout_seconds = 30
+
+[writer]
+batch_size = 100
+flush_interval_ms = 50
+queue_maxsize = 10000
+
+[logging]
+level = "INFO"
