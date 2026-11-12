@@ -29,7 +29,13 @@ def build_intents() -> discord.Intents:
     return intents
 
 
-def build_bot(config: Any, handler: EventHandler) -> commands.Bot:
+def build_bot(_config: Any, handler: EventHandler) -> commands.Bot:
+    """Build the bot and register the event callbacks.
+
+    The configuration is taken for symmetry with the rest of the application,
+    but the wiring itself does not need it — the handler is built from the
+    configuration beforehand — hence the underscored parameter name.
+    """
     bot = commands.Bot(command_prefix="!foresight ", intents=build_intents())
 
     @bot.event
