@@ -1,4 +1,24 @@
-"""Bounded queue that batches database writes off the event loop."""
+"""Bounded queue that batches database writes off the event loop.
+
+A batch that cannot be written is handed to a failure file, which is
+replayed on the next start. The failure file comes in two parts, and
+both of them matter to whoever reads the directory:
+
+- The main failure file, `<name>.jsonl` — for example
+  `failed_batch.jsonl`. It holds the records that are still to be
+  written. Every line is one JSON object:
+  `{"kind": ..., "payload": {...}}`. A record leaves the file only when
+  it really reached the database.
+- The rejected sibling file, `<name>.jsonl.rejected` — for example
+  `failed_batch.jsonl.rejected`, next to the main failure file. It
+  holds the records that can never be applied, such as a record with an
+  unknown kind or a payload that does not fit its dataclass. They are
+  kept for inspection only; they are never replayed.
+
+So a reader of `failed_batch.jsonl` sees the operations that are still
+pending, and a reader of `failed_batch.jsonl.rejected` sees the ones
+that are pending nowhere else.
+"""
 
 from __future__ import annotations
 
@@ -39,6 +59,13 @@ _OP_CLASSES = {
     OpKind.ATTACHMENT_STATUS: domain_models.AttachmentStatus,
     OpKind.ANALYSIS: domain_models.MessageAnalysis,
 }
+
+# The kinds a record of the failure file may carry: the ones whose payload
+# is a domain dataclass, plus the one whose payload is a plain pair. A
+# record with any other kind can never be applied — the repository raises
+# on an unknown kind — so it is quarantined instead of failing on every
+# start.
+_REPLAYABLE_KINDS = frozenset(_OP_CLASSES) | {OpKind.ANALYSIS_STATUS}
 
 
 def _rebuild(kind: str, payload: Any) -> Any:
@@ -121,6 +148,28 @@ class Writer:
             logger.warning("write queue is full, dropping operation kind=%s", op.kind)
             return False
 
+    async def apply_ops(self, ops: Sequence[WriteOp]) -> int:
+        """Write operations in one batch, without retrying them.
+
+        This is the entry point for a write that does not go through the
+        queue — the startup replay of the failure file. Like the replay,
+        it writes on the caller's coroutine, so it belongs to the startup
+        and not to the running service.
+
+        It performs a single attempt: the operations that are not written
+        stay in the failure file and are replayed on the next start, so
+        there is no backoff to wait for here.
+
+        Returns the number of operations that reached the database. The
+        repository writes a batch in a single transaction, so either
+        every operation of the batch is written or none of them is.
+        """
+        if not ops:
+            return 0
+        if await self._apply_once(ops):
+            return len(ops)
+        return 0
+
     async def _run(self) -> None:
         while True:
             batch = await self._collect_batch()
@@ -159,14 +208,12 @@ class Writer:
                 break
         return batch
 
-    async def _flush(self, batch: Sequence[WriteOp], *, persist: bool = True) -> bool:
+    async def _flush(self, batch: Sequence[WriteOp]) -> bool:
         """Write a batch. Returns True when the batch reached the database.
 
         A batch that could not be written is retried `MAX_RETRIES` times
-        with the backoff in `RETRY_DELAYS` — one attempt plus three retries
-        — and is then handed to the failure file, unless `persist` is
-        False. The recovery path turns it off: its operations are already
-        on disk and must stay there until they are really written.
+        with the backoff in `RETRY_DELAYS` — one attempt plus three
+        retries — and is then handed to the failure file.
         """
         for attempt in range(MAX_RETRIES + 1):
             if await self._apply_once(batch):
@@ -174,12 +221,11 @@ class Writer:
             if attempt < MAX_RETRIES:
                 logger.warning(
                     "batch write failed, retrying (attempt %d/%d)",
-                    attempt + 1,
+                    attempt + 2,
                     MAX_RETRIES + 1,
                 )
                 await asyncio.sleep(RETRY_DELAYS[attempt])
-        if persist:
-            self._persist_failure(batch)
+        self._persist_failure(batch)
         return False
 
     async def _apply_once(self, batch: Sequence[WriteOp]) -> bool:
@@ -219,6 +265,11 @@ def _parse_record(line: str) -> WriteOp | None:
 
     Returns None when the line cannot be parsed or rebuilt. The caller
     keeps such a line aside instead of replaying it.
+
+    A record is only replayed when it can really be applied: the kind
+    must be one the repository knows, and the payload must have the shape
+    the kind expects. A record that passes both checks but does not fit
+    its dataclass is rejected as well, when the dataclass is built.
     """
     try:
         entry = json.loads(line)
@@ -227,7 +278,17 @@ def _parse_record(line: str) -> WriteOp | None:
         kind = entry.get("kind")
         if not isinstance(kind, str) or not kind:
             raise ValueError("the record carries no kind")
-        payload = _rebuild(kind, entry.get("payload"))
+        if kind not in _REPLAYABLE_KINDS:
+            raise ValueError(f"the record carries the unknown kind {kind!r}")
+        payload = entry.get("payload")
+        if kind == OpKind.ANALYSIS_STATUS:
+            # The only kind whose payload is not a dataclass: the
+            # repository expects a (message_id, status) pair.
+            if not isinstance(payload, (list, tuple)) or len(payload) != 2:
+                raise ValueError("an analysis status record carries no pair")
+        elif not isinstance(payload, dict):
+            raise ValueError(f"a {kind!r} record carries no object payload")
+        payload = _rebuild(kind, payload)
     except Exception as exc:
         logger.warning("could not rebuild a failure record, keeping it aside: %s", exc)
         return None
@@ -265,6 +326,13 @@ def _write_lines(path: Path, lines: Sequence[str]) -> None:
 async def recover_failed_batches(writer: Writer, path: Path | None) -> int:
     """Replay the operations a previous run could not write.
 
+    This is a startup-only operation. It writes to the database on the
+    caller's coroutine and therefore bypasses the write queue on
+    purpose: the queue is drained by the background task, which is not
+    running yet when the replay happens. It must not be called while the
+    writer is live — the background task would race this replay for the
+    database lock.
+
     Every record is parsed and rebuilt on its own, so a record that no
     longer matches its dataclass — or a line that is not a JSON object —
     cannot stop the other records from being replayed. Such a line is
@@ -273,8 +341,11 @@ async def recover_failed_batches(writer: Writer, path: Path | None) -> int:
 
     The records are first applied as one batch. If that fails they are
     applied one by one, so a single record the database rejects cannot
-    block the good ones. The write is idempotent, so a record that is
-    replayed twice is harmless.
+    block the good ones. Every attempt is a single one: the replay does
+    not wait out the retry backoff of the writer, because the failure
+    file already holds the records and replays them on the next start.
+    The write is idempotent, so a record that is replayed twice is
+    harmless.
 
     Only the records that really reached the database are removed from the
     failure file; the others stay there and are replayed on the next
@@ -306,13 +377,13 @@ async def recover_failed_batches(writer: Writer, path: Path | None) -> int:
     recovered = 0
     if records:
         ops = [op for _, op in records]
-        if await writer._flush(ops, persist=False):  # noqa: SLF001
+        if await writer.apply_ops(ops):
             recovered = len(records)
         else:
             # The batch failed: apply the records one by one so that a
             # single bad record cannot block the good ones.
             for index, op in records:
-                if await writer._apply_once([op]):  # noqa: SLF001
+                if await writer.apply_ops([op]):
                     recovered += 1
                 else:
                     kept.add(index)

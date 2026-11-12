@@ -137,11 +137,8 @@ async def test_recover_failed_batches_replays_records(tmp_path):
     assert failure_path.read_text(encoding="utf-8") == ""
 
 
-async def test_recover_failed_batches_keeps_the_file_when_the_replay_fails(
-    tmp_path, monkeypatch
-):
+async def test_recover_failed_batches_keeps_the_file_when_the_replay_fails(tmp_path):
     """A failed replay must not lose the operations it could not write."""
-    monkeypatch.setattr(writer_module, "RETRY_DELAYS", (0.0, 0.0, 0.0))
 
     class BrokenRepository:
         async def apply_batch(self, ops):
@@ -256,6 +253,40 @@ async def test_failed_batch_is_retried_with_one_two_four_second_backoff(
     assert recorder.delays == [1.0, 2.0, 4.0]
 
 
+async def test_the_retry_log_names_the_attempt_that_is_coming(
+    tmp_path, monkeypatch, caplog
+):
+    """The log must number the attempt that comes next, not the failed one."""
+
+    class BrokenRepository:
+        async def apply_batch(self, ops):
+            raise RuntimeError("db is gone")
+
+    recorder = _SleepRecorder(asyncio)
+    monkeypatch.setattr(writer_module, "asyncio", recorder)
+
+    writer = Writer(
+        BrokenRepository(),
+        batch_size=1,
+        flush_interval_ms=10,
+        failure_path=tmp_path / "failed_batch.jsonl",
+    )
+    await writer.start()
+    with caplog.at_level(logging.WARNING, logger="foresight.writer"):
+        writer.submit(WriteOp(OpKind.MESSAGE, _message()))
+        await writer.stop()
+    retries = [
+        record.getMessage()
+        for record in caplog.records
+        if "retrying" in record.getMessage()
+    ]
+    assert retries == [
+        "batch write failed, retrying (attempt 2/4)",
+        "batch write failed, retrying (attempt 3/4)",
+        "batch write failed, retrying (attempt 4/4)",
+    ]
+
+
 def test_op_classes_map_every_kind_to_its_dataclass():
     """Each kind must be mapped to the dataclass its payload carries."""
     assert writer_module._OP_CLASSES == {  # noqa: SLF001
@@ -354,11 +385,74 @@ async def test_the_flush_loop_always_awaits(monkeypatch):
     assert recorder.waits > 0
 
 
-async def test_recover_failed_batches_replays_the_good_record_of_a_malformed_file(
+async def test_apply_ops_writes_the_operations_and_reports_the_count(tmp_path):
+    """The public entry point for a write outside the queue."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+    await init_db(engine)
+    writer = Writer(Repository(engine), batch_size=1, flush_interval_ms=10)
+    written = await writer.apply_ops([WriteOp(OpKind.MESSAGE, _message())])
+    assert written == 1
+    async with engine.connect() as conn:
+        rows = (await conn.execute(select(messages))).all()
+    assert len(rows) == 1
+
+
+async def test_apply_ops_reports_nothing_when_the_write_fails(tmp_path):
+    """A failed write must not be reported as a written one."""
+
+    class BrokenRepository:
+        async def apply_batch(self, ops):
+            raise RuntimeError("db is gone")
+
+    writer = Writer(BrokenRepository(), batch_size=1, flush_interval_ms=10)
+    assert await writer.apply_ops([WriteOp(OpKind.MESSAGE, _message())]) == 0
+
+
+async def test_recover_failed_batches_does_not_wait_out_the_retry_backoff(
     tmp_path, monkeypatch
 ):
+    """The startup replay must not delay the boot by the production backoff."""
+    recorder = _SleepRecorder(asyncio)
+    monkeypatch.setattr(writer_module, "asyncio", recorder)
+
+    class BrokenRepository:
+        def __init__(self):
+            self.calls = 0
+
+        async def apply_batch(self, ops):
+            self.calls += 1
+            raise RuntimeError("db is gone")
+
+    failure_path = tmp_path / "failed_batch.jsonl"
+    failure_path.write_text(
+        json.dumps({"kind": OpKind.MESSAGE, "payload": asdict(_message("stuck"))})
+        + "\n",
+        encoding="utf-8",
+    )
+    repo = BrokenRepository()
+    writer = Writer(
+        repo,
+        batch_size=1,
+        flush_interval_ms=10,
+        failure_path=failure_path,
+    )
+    await writer.start()
+    recovered = await recover_failed_batches(writer, failure_path)
+    await writer.stop()
+    # The record stays in the failure file: the file is the retry that the
+    # next start performs.
+    assert recovered == 0
+    assert len([line for line in failure_path.read_text().splitlines() if line]) == 1
+    # One attempt for the batch, one for the single record of the
+    # per-record fallback — and no backoff sleep at all.
+    assert repo.calls == 2
+    assert recorder.delays == []
+
+
+async def test_recover_failed_batches_replays_the_good_record_of_a_malformed_file(
+    tmp_path,
+):
     """One malformed line must not stop the other records from being replayed."""
-    monkeypatch.setattr(writer_module, "RETRY_DELAYS", (0.0, 0.0, 0.0))
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
     await init_db(engine)
@@ -384,11 +478,8 @@ async def test_recover_failed_batches_replays_the_good_record_of_a_malformed_fil
     assert "good" not in failure_path.read_text(encoding="utf-8")
 
 
-async def test_recover_failed_batches_keeps_a_record_the_database_rejects(
-    tmp_path, monkeypatch
-):
+async def test_recover_failed_batches_keeps_a_record_the_database_rejects(tmp_path):
     """One record the database rejects must not block the good ones."""
-    monkeypatch.setattr(writer_module, "RETRY_DELAYS", (0.0, 0.0, 0.0))
 
     class SelectiveRepository:
         """Accepts every record but the one that is marked as poison."""
@@ -428,11 +519,8 @@ async def test_recover_failed_batches_keeps_a_record_the_database_rejects(
     assert "good" not in remaining
 
 
-async def test_recover_failed_batches_survives_a_record_it_cannot_rebuild(
-    tmp_path, monkeypatch
-):
+async def test_recover_failed_batches_survives_a_record_it_cannot_rebuild(tmp_path):
     """A record that no longer matches its dataclass must not crash the start."""
-    monkeypatch.setattr(writer_module, "RETRY_DELAYS", (0.0, 0.0, 0.0))
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
     await init_db(engine)
@@ -451,6 +539,60 @@ async def test_recover_failed_batches_survives_a_record_it_cannot_rebuild(
     rejected = (tmp_path / "failed_batch.jsonl.rejected").read_text(encoding="utf-8")
     assert "unknown_field" in rejected
     assert "[1, 2, 3]" in rejected
+
+
+async def test_recover_failed_batches_quarantines_a_record_with_an_unknown_kind(
+    tmp_path,
+):
+    """A record the repository can never handle must not block every start."""
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+    await init_db(engine)
+    writer = Writer(Repository(engine), batch_size=1, flush_interval_ms=10)
+    failure_path = tmp_path / "failed_batch.jsonl"
+    failure_path.write_text(
+        json.dumps({"kind": OpKind.MESSAGE, "payload": asdict(_message("good"))})
+        + "\n"
+        + json.dumps({"kind": "not_a_kind", "payload": {"message_id": 1}})
+        + "\n",
+        encoding="utf-8",
+    )
+    await writer.start()
+    recovered = await recover_failed_batches(writer, failure_path)
+    await writer.stop()
+    assert recovered == 1
+    async with engine.connect() as conn:
+        rows = (await conn.execute(select(messages))).all()
+    assert [row.content for row in rows] == ["good"]
+    # The unknown kind is kept next to the failure file and does not stay
+    # in it, where it would fail again on every start.
+    remaining = failure_path.read_text(encoding="utf-8")
+    assert "not_a_kind" not in remaining
+    rejected = (tmp_path / "failed_batch.jsonl.rejected").read_text(encoding="utf-8")
+    assert "not_a_kind" in rejected
+
+
+async def test_recover_failed_batches_quarantines_a_record_without_an_object_payload(
+    tmp_path,
+):
+    """A record whose payload is not a dataclass payload can never be used."""
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+    await init_db(engine)
+    writer = Writer(Repository(engine), batch_size=1, flush_interval_ms=10)
+    failure_path = tmp_path / "failed_batch.jsonl"
+    failure_path.write_text(
+        json.dumps({"kind": OpKind.MESSAGE, "payload": "not an object"})
+        + "\n",
+        encoding="utf-8",
+    )
+    await writer.start()
+    recovered = await recover_failed_batches(writer, failure_path)
+    await writer.stop()
+    assert recovered == 0
+    assert failure_path.read_text(encoding="utf-8") == ""
+    rejected = (tmp_path / "failed_batch.jsonl.rejected").read_text(encoding="utf-8")
+    assert "not an object" in rejected
 
 
 async def test_writer_keeps_writing_after_it_was_restarted(tmp_path):
