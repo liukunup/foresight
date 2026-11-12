@@ -16,6 +16,7 @@ from foresight.domain.models import (
     GuildSnapshot,
     MessageRecord,
     ReactionRecord,
+    ReactionRemove,
     UserSnapshot,
 )
 
@@ -132,7 +133,7 @@ def map_message(message: Any, captured_at: datetime | None = None) -> MessageRec
         channel_id=channel.id,
         author_id=author.id,
         content=content,
-        message_type=int(message_type or 0),
+        message_type=int(getattr(message_type, "value", message_type) or 0),
         created_at=iso(message.created_at),
         captured_at=iso(now),
         edited_at=iso(getattr(message, "edited_at", None)),
@@ -188,7 +189,13 @@ def _emoji_info(emoji: Any) -> tuple[str, int | None, bool]:
     return str(name), emoji_id, is_custom
 
 
-def map_reaction(payload: Any, removed: bool = False) -> ReactionRecord:
+def map_reaction(payload: Any) -> ReactionRecord:
+    """Map a reaction *add* event for the ``OpKind.REACTION`` upsert.
+
+    The upsert's conflict-update columns include ``added_at``, so this function
+    must only ever describe an addition: ``added_at`` is stamped now and
+    ``removed_at`` stays ``None``. Removals go through :func:`map_reaction_remove`.
+    """
     name, emoji_id, is_custom = _emoji_info(payload.emoji)
     now = _now()
     return ReactionRecord(
@@ -198,5 +205,21 @@ def map_reaction(payload: Any, removed: bool = False) -> ReactionRecord:
         emoji_id=emoji_id,
         is_custom=is_custom,
         added_at=iso(now),
-        removed_at=iso(now) if removed else None,
+        removed_at=None,
+    )
+
+
+def map_reaction_remove(payload: Any) -> ReactionRemove:
+    """Map a reaction *removal* event for the ``OpKind.REACTION_REMOVE`` op.
+
+    That op updates ``removed_at`` only, so the ``added_at`` written by
+    :func:`map_reaction` survives the removal instead of being overwritten.
+    """
+    name, _emoji_id, _is_custom = _emoji_info(payload.emoji)
+    now = _now()
+    return ReactionRemove(
+        message_id=payload.message_id,
+        user_id=payload.user_id,
+        emoji=name,
+        removed_at=iso(now),
     )
