@@ -42,7 +42,10 @@ from foresight.storage.tables import (
 # Spec §7.1: the realtime path may only refresh these four columns. It must
 # never touch `analysis_status` (owned by the AI worker) or `captured_at`
 # (records when the message was first dumped), and it must not overwrite the
-# counters a fresh record happens to carry.
+# counters a fresh record happens to carry. The conflict update writes these
+# four columns from the incoming record unconditionally, so a message that is
+# re-reported without `edited_at` or `deleted_at` clears the soft-delete
+# timestamp a previous report had set.
 MESSAGE_UPDATABLE = (
     "content",
     "edited_at",
@@ -111,7 +114,8 @@ class Repository:
             if op.kind not in self._handlers:
                 raise ValueError(
                     f"unknown op kind {op.kind!r}; "
-                    f"valid kinds are: {', '.join(sorted(self._handlers))}"
+                    f"valid kinds are: "
+                    f"{', '.join(repr(kind) for kind in sorted(self._handlers))}"
                 )
             groups[op.kind].append(op.payload)
         async with self._engine.begin() as conn:
@@ -169,23 +173,36 @@ class Repository:
     ) -> SQLiteInsert | PGInsert | MySQLInsert:
         """Build an insert that keeps rows which already exist.
 
-        On MySQL this is `ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)` —
-        a true no-op: the conflicting row keeps its surrogate key and the
-        connection's last insert id stays usable. Writing `id = VALUES(id)`
-        instead would copy the freshly allocated auto-increment value onto
-        the existing row and rewrite its key.
+        On MySQL this is `ON DUPLICATE KEY UPDATE <pk> = ...` — a true no-op:
+        the conflicting row keeps its key and the connection's last insert id
+        stays usable. Writing `<pk> = VALUES(<pk>)` instead would copy the
+        freshly allocated value onto the existing row and rewrite its key.
+
+        The right hand side depends on who allocated the key. A table with an
+        auto-increment surrogate (`autoincrement=True`) uses
+        `LAST_INSERT_ID(<pk>)`, the documented MySQL idiom that keeps the last
+        insert id pointing at the existing row. A table whose key the
+        application generated — a snowflake, for instance — uses a plain
+        self-assignment (`<pk> = <pk>`): `LAST_INSERT_ID(<pk>)` would set the
+        session's last insert id to a value the database never handed out,
+        and every caller reading `cursor.lastrowid` would misread it.
         """
         stmt = self._insert(table).values(values)
         if isinstance(stmt, MySQLInsert):
             # MySQL has no "do nothing": a no-op update on the primary key
-            # leaves the conflicting row as it is.
+            # leaves the conflicting row as it is. Only a key the database
+            # allocates may use the LAST_INSERT_ID idiom.
             primary_key = list(table.primary_key.columns)[0]
+            if primary_key.autoincrement is True:
+                return stmt.on_duplicate_key_update(
+                    **{
+                        primary_key.name: func.last_insert_id(
+                            literal_column(primary_key.name)
+                        )
+                    }
+                )
             return stmt.on_duplicate_key_update(
-                **{
-                    primary_key.name: func.last_insert_id(
-                        literal_column(primary_key.name)
-                    )
-                }
+                **{primary_key.name: literal_column(primary_key.name)}
             )
         return stmt.on_conflict_do_nothing()
 

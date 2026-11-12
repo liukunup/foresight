@@ -8,6 +8,7 @@ one statement per operation kind.
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
@@ -101,6 +102,22 @@ def _attachment(message_id: int = 1, attachment_id: int = 555) -> AttachmentReco
         storage_backend="local",
         status="pending",
         captured_at="2026-11-11T00:00:00+00:00",
+    )
+
+
+def _user(username: str = "alice") -> UserSnapshot:
+    return UserSnapshot(
+        user_id=30,
+        username=username,
+        global_name="Alice",
+        display_name="alice#1",
+        discriminator="0",
+        avatar_url=None,
+        is_bot=False,
+        account_created_at=None,
+        guild_joined_at=None,
+        roles_json="[]",
+        updated_at="2026-11-11T00:00:00+00:00",
     )
 
 
@@ -237,21 +254,9 @@ async def test_reaction_upsert_clears_removed_at(repo_and_engine):
 
 async def test_user_snapshot_is_upserted(repo_and_engine):
     repo, engine = repo_and_engine
-    snapshot = UserSnapshot(
-        user_id=30,
-        username="alice",
-        global_name="Alice",
-        display_name="alice#1",
-        discriminator="0",
-        avatar_url=None,
-        is_bot=False,
-        account_created_at=None,
-        guild_joined_at=None,
-        roles_json="[]",
-        updated_at="2026-11-11T00:00:00+00:00",
-    )
+    snapshot = _user()
     await repo.apply_batch([WriteOp(OpKind.USER, snapshot)])
-    renamed = UserSnapshot(**{**snapshot.__dict__, "username": "alice2"})
+    renamed = _user(username="alice2")
     await repo.apply_batch([WriteOp(OpKind.USER, renamed)])
     async with engine.connect() as conn:
         rows = (await conn.execute(select(users))).all()
@@ -398,6 +403,32 @@ async def test_mysql_insert_only_is_a_no_op():
     assert "last_insert_id" in sql.lower()
     assert "values(id)" not in sql.lower()
     set_clause = sql.lower().split("on duplicate key update", 1)[1]
+    assert "values(" not in set_clause
+
+
+async def test_mysql_insert_only_only_sets_the_last_insert_id_for_auto_increment_keys():
+    """Only an auto-increment key may use the `LAST_INSERT_ID` idiom.
+
+    `attachments.id` is an auto-increment surrogate the database allocates,
+    so the no-op update reads `LAST_INSERT_ID(id)` and the connection's last
+    insert id keeps pointing at the existing row. `messages.message_id` is a
+    snowflake the application generates: `LAST_INSERT_ID(message_id)` would
+    set the session's last insert id to a key the database never allocated,
+    and every caller reading `cursor.lastrowid` would misread it. That table
+    therefore gets a plain self-assignment, the true no-op.
+    """
+    attachment_sql = await _compiled_for(
+        "mysql",
+        lambda repo: repo._insert_only(attachments, [_ATTACHMENT_VALUES]),
+    )
+    message_sql = await _compiled_for(
+        "mysql",
+        lambda repo: repo._insert_only(messages, [_message_values()]),
+    )
+    assert "last_insert_id" in attachment_sql.lower()
+    assert "last_insert_id" not in message_sql.lower()
+    assert "message_id = message_id" in message_sql
+    set_clause = message_sql.lower().split("on duplicate key update", 1)[1]
     assert "values(" not in set_clause
 
 
@@ -626,13 +657,16 @@ def test_op_order_covers_every_kind():
 def test_no_module_references_insert_attachment():
     module_file = repository_module.__file__
     assert module_file is not None
-    package_dir = Path(module_file).parent
+    package_dir = Path(module_file).parent.parent
     offenders = [
-        path.name
+        str(path.relative_to(package_dir))
         for path in sorted(package_dir.rglob("*.py"))
         if "insert_attachment" in path.read_text(encoding="utf-8")
     ]
-    assert offenders == []
+    assert offenders == [], (
+        "these modules still reference the removed insert_attachment: "
+        + ", ".join(offenders)
+    )
 
 
 async def test_realtime_upsert_keeps_the_char_count(repo_and_engine):
@@ -675,6 +709,44 @@ async def test_unknown_op_kind_raises_value_error(repo_and_engine):
     with pytest.raises(ValueError) as excinfo:
         await repo.apply_batch([WriteOp("not_a_kind", _message())])
     message = str(excinfo.value)
-    assert "not_a_kind" in message
-    assert OpKind.MESSAGE in message
+    assert "'not_a_kind'" in message
+
+
+async def test_unknown_op_kind_names_the_full_valid_kind_set(repo_and_engine):
+    """The error names the offending kind and every valid kind.
+
+    A substring check would pass on a truncated list of valid kinds, so the
+    kinds are read back as quoted tokens: the message must name the
+    offending kind and exactly the kinds the repository accepts.
+    """
+    repo, _ = repo_and_engine
+    with pytest.raises(ValueError) as excinfo:
+        await repo.apply_batch(
+            [
+                WriteOp(OpKind.MESSAGE, _message()),
+                WriteOp("not_a_kind", _message()),
+            ]
+        )
+    message = str(excinfo.value)
+    assert "'not_a_kind'" in message
+    named_kinds = set(re.findall(r"'([^']*)'", message))
+    assert named_kinds == {"not_a_kind", *OP_ORDER}
+
+
+async def test_unknown_op_kind_writes_nothing_of_the_batch(repo_and_engine):
+    """A batch with an unknown kind is rejected before anything is written."""
+    repo, engine = repo_and_engine
+    with pytest.raises(ValueError):
+        await repo.apply_batch(
+            [
+                WriteOp(OpKind.MESSAGE, _message()),
+                WriteOp(OpKind.USER, _user()),
+                WriteOp("not_a_kind", _message()),
+            ]
+        )
+    async with engine.connect() as conn:
+        message_rows = (await conn.execute(select(messages))).all()
+        user_rows = (await conn.execute(select(users))).all()
+    assert message_rows == []
+    assert user_rows == []
 
