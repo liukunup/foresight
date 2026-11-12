@@ -1549,7 +1549,8 @@ git commit -m "feat: async engine and batched repository"
   - `map_user(author: Any, updated_at: datetime | None = None) -> UserSnapshot`
   - `map_channel(channel: Any, captured_at: datetime | None = None) -> ChannelSnapshot`
   - `map_guild(guild: Any, captured_at: datetime | None = None) -> GuildSnapshot`
-  - `map_reaction(payload: Any, removed: bool = False) -> ReactionRecord`
+  - `map_reaction(payload: Any) -> ReactionRecord`（只处理"加表情"，写 `OpKind.REACTION`）
+  - `map_reaction_remove(payload: Any) -> ReactionRemove`（只处理"移除表情"，写 `OpKind.REACTION_REMOVE`，只更新 `removed_at`）
   - `map_attachments(message: Any, captured_at: datetime | None = None) -> list[AttachmentRecord]`
   - `count_words(text: str) -> int`
   - `iso(dt: datetime | None) -> str | None`
@@ -1748,6 +1749,7 @@ from foresight.domain.models import (
     GuildSnapshot,
     MessageRecord,
     ReactionRecord,
+    ReactionRemove,
     UserSnapshot,
 )
 
@@ -1858,13 +1860,15 @@ def map_message(message: Any, captured_at: datetime | None = None) -> MessageRec
     attachments = list(getattr(message, "attachments", None) or [])
     embeds = list(getattr(message, "embeds", None) or [])
     message_type = getattr(message, "type", 0)
+    # discord.MessageType 是普通 Enum（不是 IntEnum），必须取 .value
+    message_type = int(getattr(message_type, "value", message_type) or 0)
     return MessageRecord(
         message_id=message.id,
         guild_id=getattr(guild, "id", None),
         channel_id=channel.id,
         author_id=author.id,
         content=content,
-        message_type=int(message_type or 0),
+        message_type=message_type,
         created_at=iso(message.created_at),
         captured_at=iso(now),
         edited_at=iso(getattr(message, "edited_at", None)),
@@ -1920,7 +1924,8 @@ def _emoji_info(emoji: Any) -> tuple[str, int | None, bool]:
     return str(name), emoji_id, is_custom
 
 
-def map_reaction(payload: Any, removed: bool = False) -> ReactionRecord:
+def map_reaction(payload: Any) -> ReactionRecord:
+    """Map a reaction-add payload. Write it with `OpKind.REACTION`."""
     name, emoji_id, is_custom = _emoji_info(payload.emoji)
     now = _now()
     return ReactionRecord(
@@ -1930,7 +1935,22 @@ def map_reaction(payload: Any, removed: bool = False) -> ReactionRecord:
         emoji_id=emoji_id,
         is_custom=is_custom,
         added_at=iso(now),
-        removed_at=iso(now) if removed else None,
+        removed_at=None,
+    )
+
+
+def map_reaction_remove(payload: Any) -> ReactionRemove:
+    """Map a reaction-remove payload. Write it with `OpKind.REACTION_REMOVE`.
+
+    `OpKind.REACTION_REMOVE` only updates `removed_at`, so the original
+    `added_at` of the row is preserved.
+    """
+    name, _, _ = _emoji_info(payload.emoji)
+    return ReactionRemove(
+        message_id=payload.message_id,
+        user_id=payload.user_id,
+        emoji=name,
+        removed_at=iso(_now()),
     )
 ```
 
@@ -2463,6 +2483,7 @@ from foresight.adapters.discord_mapper import (
     map_guild,
     map_message,
     map_reaction,
+    map_reaction_remove,
     map_user,
 )
 from foresight.domain.models import (
@@ -2470,7 +2491,6 @@ from foresight.domain.models import (
     MessageDelete,
     MessageEdit,
     OpKind,
-    ReactionRemove,
     WriteOp,
 )
 
@@ -2572,17 +2592,9 @@ class EventHandler:
         try:
             if not self._allowed(getattr(payload, "channel_id", None)):
                 return
-            record = map_reaction(payload, removed=False)
+            # REACTION_REMOVE 只更新 removed_at，不覆盖 added_at
             self._writer.submit(
-                WriteOp(
-                    OpKind.REACTION_REMOVE,
-                    ReactionRemove(
-                        record.message_id,
-                        record.user_id,
-                        record.emoji,
-                        record.removed_at or iso(datetime.now(timezone.utc)),
-                    ),
-                )
+                WriteOp(OpKind.REACTION_REMOVE, map_reaction_remove(payload))
             )
         except Exception:
             logger.exception("failed to handle reaction remove")
