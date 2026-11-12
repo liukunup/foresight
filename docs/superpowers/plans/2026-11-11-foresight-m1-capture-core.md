@@ -2125,7 +2125,7 @@ from foresight.domain.models import OpKind, WriteOp
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 3
+MAX_RETRIES = 3          # 重试次数（总尝试次数 = MAX_RETRIES + 1）
 RETRY_DELAYS = (1.0, 2.0, 4.0)
 
 _OP_CLASSES = {
@@ -2216,15 +2216,15 @@ class Writer:
                 return
 
     async def _flush(self, batch: Sequence[WriteOp]) -> None:
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(MAX_RETRIES + 1):
             try:
                 await self._repo.apply_batch(list(batch))
                 return
             except Exception:
                 logger.exception(
-                    "batch write failed (attempt %d/%d)", attempt + 1, MAX_RETRIES
+                    "batch write failed (attempt %d/%d)", attempt + 1, MAX_RETRIES + 1
                 )
-                if attempt == MAX_RETRIES - 1:
+                if attempt == MAX_RETRIES:
                     break
                 await asyncio.sleep(RETRY_DELAYS[attempt])
         self._persist_failure(batch)
