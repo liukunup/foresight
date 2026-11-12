@@ -2606,7 +2606,13 @@ class EventHandler:
 创建 `src/foresight/bot.py`：
 
 ```python
-"""discord.py wiring: intents, event registration, startup."""
+"""discord.py wiring: intents, event registration, startup.
+
+The callbacks below are the only place that talks to discord.py. They hand
+the payload to the :class:`~foresight.events.EventHandler`, whose methods are
+synchronous: they only map an event and queue a write operation, so there is
+nothing to await.
+"""
 
 from __future__ import annotations
 
@@ -2638,23 +2644,23 @@ def build_bot(config: Any, handler: EventHandler) -> commands.Bot:
     async def on_message(message: discord.Message) -> None:
         if bot.user is not None and message.author.id == bot.user.id:
             return
-        await handler.handle_message(message)
+        handler.handle_message(message)
 
     @bot.event
     async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
-        await handler.handle_raw_edit(payload)
+        handler.handle_raw_edit(payload)
 
     @bot.event
     async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
-        await handler.handle_raw_delete(payload)
+        handler.handle_raw_delete(payload)
 
     @bot.event
     async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
-        await handler.handle_raw_reaction_add(payload)
+        handler.handle_raw_reaction_add(payload)
 
     @bot.event
     async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent) -> None:
-        await handler.handle_raw_reaction_remove(payload)
+        handler.handle_raw_reaction_remove(payload)
 
     return bot
 
