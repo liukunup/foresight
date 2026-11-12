@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-from sqlalchemy import bindparam, update
+from sqlalchemy import Table, bindparam, func, literal_column, update
+from sqlalchemy.dialects.mysql import Insert as MySQLInsert
 from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import Insert as PGInsert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import Insert as SQLiteInsert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -36,22 +39,36 @@ from foresight.storage.tables import (
     users,
 )
 
-# The realtime path may refresh the message body but must never touch the
-# columns owned by other writers: `analysis_status` belongs to the AI worker
-# and `captured_at` records when the message was first dumped.
+# Spec §7.1: the realtime path may only refresh these four columns. It must
+# never touch `analysis_status` (owned by the AI worker) or `captured_at`
+# (records when the message was first dumped), and it must not overwrite the
+# counters a fresh record happens to carry.
 MESSAGE_UPDATABLE = (
     "content",
     "edited_at",
     "edit_count",
     "deleted_at",
-    "mentions_count",
-    "char_count",
-    "word_count",
-    "attachment_count",
-    "attachments_json",
-    "embeds_json",
-    "message_type",
-    "reply_to_message_id",
+)
+
+# The order in which the groups of a batch are applied. A batch can report a
+# message, an edit and a delete for the same `message_id`; the message is
+# written first, then its edit, then its delete, so the freshest information
+# wins no matter in which order the operations arrived. Every kind the
+# repository handles must appear here.
+OP_ORDER: tuple[str, ...] = (
+    OpKind.MESSAGE,
+    OpKind.MESSAGE_INSERT_ONLY,
+    OpKind.MESSAGE_EDIT,
+    OpKind.MESSAGE_DELETE,
+    OpKind.REACTION,
+    OpKind.REACTION_REMOVE,
+    OpKind.USER,
+    OpKind.CHANNEL,
+    OpKind.GUILD,
+    OpKind.ATTACHMENT,
+    OpKind.ATTACHMENT_STATUS,
+    OpKind.ANALYSIS_STATUS,
+    OpKind.ANALYSIS,
 )
 
 
@@ -78,19 +95,49 @@ class Repository:
         }
 
     async def apply_batch(self, ops: Sequence[WriteOp]) -> None:
-        """Apply a batch of operations inside a single transaction."""
+        """Apply a batch of operations inside a single transaction.
+
+        The operations are grouped by kind and every group is applied with a
+        single statement. The groups are applied in the order given by
+        `OP_ORDER`: a message is written before its edit and before its
+        delete, so a batch that reports the same `message_id` more than once
+        ends with the freshest information. The result therefore does not
+        depend on the order in which the operations arrived.
+        """
         if not ops:
             return
         groups: dict[str, list[Any]] = defaultdict(list)
         for op in ops:
+            if op.kind not in self._handlers:
+                raise ValueError(
+                    f"unknown op kind {op.kind!r}; "
+                    f"valid kinds are: {', '.join(sorted(self._handlers))}"
+                )
             groups[op.kind].append(op.payload)
         async with self._engine.begin() as conn:
-            for kind, payloads in groups.items():
-                await self._handlers[kind](conn, payloads)
+            for kind in self._ordered_kinds(groups):
+                await self._handlers[kind](conn, groups[kind])
+
+    @staticmethod
+    def _ordered_kinds(groups: Mapping[str, list[Any]]) -> list[str]:
+        """The kinds of a batch, in the order in which they are applied.
+
+        `OP_ORDER` is the canonical order. A kind that is missing from it
+        (a programming error, guarded by a test) is applied last, so that
+        no operation of a batch is ever silently dropped.
+        """
+        ordered = [kind for kind in OP_ORDER if kind in groups]
+        return ordered + [kind for kind in groups if kind not in OP_ORDER]
 
     # -- insert helpers -------------------------------------------------
 
-    def _insert(self, table):  # noqa: ANN001, ANN202
+    def _insert(self, table: Table) -> SQLiteInsert | PGInsert | MySQLInsert:
+        """Return the insert statement builder of the current dialect.
+
+        The concrete class carries the dialect specific API: MySQL offers
+        `on_duplicate_key_update` and `inserted`, SQLite and PostgreSQL offer
+        `on_conflict_do_update`, `on_conflict_do_nothing` and `excluded`.
+        """
         if self._dialect == "postgresql":
             return pg_insert(table)
         if self._dialect == "mysql":
@@ -99,13 +146,14 @@ class Repository:
 
     def _upsert(
         self,
-        table,  # noqa: ANN001
+        table: Table,
         values: list[dict[str, Any]],
         conflict_columns: list[str],
         update_columns: tuple[str, ...],
-    ):  # noqa: ANN202
+    ) -> SQLiteInsert | PGInsert | MySQLInsert:
+        """Build an upsert that refreshes `update_columns` on conflict."""
         stmt = self._insert(table).values(values)
-        if self._dialect == "mysql":
+        if isinstance(stmt, MySQLInsert):
             # MySQL names the row that would have been inserted with
             # VALUES(col), SQLite and PostgreSQL with the excluded table.
             return stmt.on_duplicate_key_update(
@@ -116,14 +164,28 @@ class Repository:
             set_={col: stmt.excluded[col] for col in update_columns},
         )
 
-    def _insert_only(self, table, values: list[dict[str, Any]]):  # noqa: ANN001, ANN202
+    def _insert_only(
+        self, table: Table, values: list[dict[str, Any]]
+    ) -> SQLiteInsert | PGInsert | MySQLInsert:
+        """Build an insert that keeps rows which already exist.
+
+        On MySQL this is `ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)` —
+        a true no-op: the conflicting row keeps its surrogate key and the
+        connection's last insert id stays usable. Writing `id = VALUES(id)`
+        instead would copy the freshly allocated auto-increment value onto
+        the existing row and rewrite its key.
+        """
         stmt = self._insert(table).values(values)
-        if self._dialect == "mysql":
+        if isinstance(stmt, MySQLInsert):
             # MySQL has no "do nothing": a no-op update on the primary key
             # leaves the conflicting row as it is.
             primary_key = list(table.primary_key.columns)[0]
             return stmt.on_duplicate_key_update(
-                **{primary_key.name: stmt.inserted[primary_key.name]}
+                **{
+                    primary_key.name: func.last_insert_id(
+                        literal_column(primary_key.name)
+                    )
+                }
             )
         return stmt.on_conflict_do_nothing()
 
@@ -338,6 +400,14 @@ class Repository:
     async def _handle_attachment_status(
         self, conn: AsyncConnection, records: list[AttachmentStatus]
     ) -> None:
+        """Write a complete status snapshot to the matching attachment row.
+
+        `AttachmentStatus` is a snapshot of the status of one attachment:
+        every status column is written unconditionally, so a payload that
+        omits a field clears it. That is deliberate — an attachment row is
+        either stored or failed, never both — so a row that ends up
+        `skipped` must not keep the file columns of an earlier attempt.
+        """
         stmt = (
             update(attachments)
             .where(

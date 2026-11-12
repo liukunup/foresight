@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -28,7 +29,7 @@ def _apply_sqlite_pragmas(engine: AsyncEngine) -> None:
     """Tune SQLite for concurrent readers and a busy writer."""
 
     @event.listens_for(engine.sync_engine, "connect")
-    def _set_pragmas(dbapi_connection, connection_record):  # noqa: ANN001
+    def _set_pragmas(dbapi_connection: Any, connection_record: Any) -> None:
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA synchronous=NORMAL")
