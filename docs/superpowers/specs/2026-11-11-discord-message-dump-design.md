@@ -150,7 +150,7 @@ foresight/
 
 ### 4.2 为什么这样分层
 
-- **Discord SDK 字段名只出现在 `adapters/discord_mapper.py`**。领域模型用中性命名（`author_id`、`attachment_count`、`attachments_json`），换平台（Slack/Telegram）或写单测时不需要 discord.py 对象。
+- **Discord SDK 字段名只出现在 Discord 适配层**：`adapters/discord_mapper.py`（对象 → 领域对象）、`events.py`（事件分发）、`bot.py`（discord.py 客户端与回调注册）。领域层用中性命名（`author_id`、`attachment_count`、`attachments_json`），换平台（Slack/Telegram）或写单测时不需要 discord.py 对象。
 - **`repository` 是唯一懂 SQL 的地方**。CLI（给人用）与 API（给 AI 用）都走它，两条路径不会出现统计口径不一致。
 - **写库不阻塞事件循环**。Discord 回调里同步写库会让磁盘 IO 阻塞其它事件处理，队列把写入移出回调路径。
 

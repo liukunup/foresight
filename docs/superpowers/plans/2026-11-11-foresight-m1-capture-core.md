@@ -16,7 +16,7 @@
 
 - Python `>=3.13`，包布局 `src/foresight/`，构建后端 `hatchling`，console script 为 `foresight`
 - 领域模型（`domain/models.py`）**零依赖**，不得 import discord / sqlalchemy / fastapi
-- Discord SDK 字段名只允许出现在 `adapters/discord_mapper.py` 与 `events.py` 中
+- Discord SDK 字段名只允许出现在 Discord 适配层：`adapters/discord_mapper.py`、`events.py`、`bot.py`
 - 所有时间戳存 **UTC ISO-8601 TEXT**（例 `2026-11-11T13:45:00+00:00`）
 - 所有 JSON 字段存 **TEXT**（JSON 字符串），三方言一致
 - Discord 雪花 ID 存 `BIGINT`
