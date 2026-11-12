@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import NoReturn, Optional
 
 import typer
 
@@ -23,6 +23,14 @@ def _load(config_path: Optional[str]) -> Config:
     return config
 
 
+def _fail(message: str) -> NoReturn:
+    """Report a failure as one line on stderr and stop the command."""
+    # The message of the original exception can span several lines — the
+    # ones of SQLAlchemy do — but the report stays a single line.
+    typer.secho(f"error: {' '.join(message.split())}", fg=typer.colors.RED, err=True)
+    raise typer.Exit(code=1)
+
+
 @app.command()
 def init_db(
     config: Optional[str] = typer.Option(None, "--config", help="Path to config.toml"),
@@ -33,9 +41,17 @@ def init_db(
     settings = _load(config)
 
     async def _create_schema() -> None:
-        engine = create_engine(settings.database)
+        try:
+            engine = create_engine(settings.database)
+        except Exception as exc:
+            # A directory that cannot be created, an unwritable path, a
+            # backend that is not there: the operator gets the cause, not a
+            # traceback.
+            _fail(f"cannot open the database: {exc}")
         try:
             await create_tables(engine)
+        except Exception as exc:
+            _fail(f"cannot open the database: {exc}")
         finally:
             # The command is done with the database: the connection is
             # closed, so the write-ahead log is checkpointed and no
@@ -59,20 +75,28 @@ def run(
 
     settings = _load(config)
     if not settings.discord.channel_ids:
-        raise typer.BadParameter("[discord].channel_ids must not be empty")
+        # The same shape as every other configuration problem: the message
+        # names the key that has to be fixed.
+        raise ConfigError("[discord].channel_ids must not be empty")
     try:
         token = require_token()
     except RuntimeError as exc:
-        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1) from exc
+        _fail(str(exc))
 
     # The failure file lives next to the database, so that a database and
     # its pending writes are always found together.
     failure_path = Path(settings.database.path).parent / "failed_batch.jsonl"
 
     async def _run() -> None:
-        engine = create_engine(settings.database)
-        await create_tables(engine)
+        try:
+            engine = create_engine(settings.database)
+        except Exception as exc:
+            _fail(f"cannot open the database: {exc}")
+        try:
+            await create_tables(engine)
+        except Exception as exc:
+            await engine.dispose()
+            _fail(f"cannot open the database: {exc}")
         repo = Repository(engine)
         writer = Writer(
             repo,
@@ -81,16 +105,26 @@ def run(
             queue_maxsize=settings.writer.queue_maxsize,
             failure_path=failure_path,
         )
-        await writer.start()
         # The replay writes on this coroutine and bypasses the queue, so it
-        # belongs to the startup: the queue is still empty here, so the
-        # writer cannot race the replay for the database lock.
+        # belongs to the startup: the background task of the writer is not
+        # running yet, so it cannot race the replay for the database lock.
         await recover_failed_batches(writer, failure_path)
+        await writer.start()
         handler = EventHandler(settings, writer)
         bot = build_bot(settings, handler)
+        logger.info(
+            "collector starting: channels=%s database=%s",
+            ", ".join(str(cid) for cid in settings.discord.channel_ids),
+            settings.database.path,
+        )
         try:
             await bot.start(token)
         finally:
+            logger.info("collector stopping")
+            # The bot is closed first: it stops the gateway and closes the
+            # HTTP session. An event that arrives after the writer was
+            # stopped would be dropped by the writer.
+            await bot.close()
             await writer.stop()
             await engine.dispose()
 
