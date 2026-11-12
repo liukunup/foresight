@@ -1560,6 +1560,7 @@ git commit -m "feat: async engine and batched repository"
 创建 `tests/unit/test_discord_mapper.py`：
 
 ```python
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -1651,7 +1652,7 @@ def test_map_user_snapshot():
     assert snapshot.global_name == "Alice"
     assert snapshot.avatar_url == "https://cdn/avatar.png"
     assert snapshot.guild_joined_at == "2021-01-01T00:00:00+00:00"
-    assert '"5"' in snapshot.roles_json
+    assert json.loads(snapshot.roles_json) == ["5", "6"]
 
 
 def test_map_channel_and_guild():
@@ -1957,7 +1958,7 @@ def map_reaction_remove(payload: Any) -> ReactionRemove:
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `uv run pytest tests/unit/test_discord_mapper.py -v`
-Expected: PASS —— 9 passed
+Expected: PASS —— 21 passed
 
 - [ ] **Step 5: 提交**
 
@@ -2583,7 +2584,7 @@ class EventHandler:
             if not self._allowed(getattr(payload, "channel_id", None)):
                 return
             self._writer.submit(
-                WriteOp(OpKind.REACTION, map_reaction(payload, removed=False))
+                WriteOp(OpKind.REACTION, map_reaction(payload))
             )
         except Exception:
             logger.exception("failed to handle reaction add")
