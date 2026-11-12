@@ -910,7 +910,7 @@ git commit -m "feat: domain models and SQLAlchemy table definitions"
   - `foresight.storage.db.init_db(engine: AsyncEngine) -> None`
   - `foresight.storage.repository.Repository(engine: AsyncEngine)`
   - `Repository.apply_batch(ops: Sequence[WriteOp]) -> None`
-  - `Repository.insert_attachment(a: AttachmentRecord) -> int`（返回新行 id，附件行以 `(message_id, attachment_id)` 定位更新）
+  - 附件行以 `(message_id, attachment_id)` 定位更新（唯一约束 `uq_attachments_target`）。**不提供** `insert_attachment`：附件行由 `apply_batch` 批量插入（幂等 insert-only），没有任何调用方需要"返回新行 id"这个语义
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1155,19 +1155,12 @@ from foresight.storage.tables import (
     users,
 )
 
+# 规格 §7.1：实时 upsert 只更新这四列，绝不触碰 analysis_status / captured_at
 MESSAGE_UPDATABLE = (
     "content",
     "edited_at",
     "edit_count",
     "deleted_at",
-    "mentions_count",
-    "char_count",
-    "word_count",
-    "attachment_count",
-    "attachments_json",
-    "embeds_json",
-    "message_type",
-    "reply_to_message_id",
 )
 
 
@@ -1194,33 +1187,27 @@ class Repository:
         }
 
     async def apply_batch(self, ops: Sequence[WriteOp]) -> None:
-        """Apply a batch of operations inside a single transaction."""
+        """Apply a batch of operations inside a single transaction.
+
+        The operations are grouped by kind and every group is applied with a
+        single statement. The groups are applied in the order given by
+        `OP_ORDER`: a message is written before its edit and before its
+        delete, so the result does not depend on the order in which the
+        operations arrived.
+        """
         if not ops:
             return
         groups: dict[str, list[Any]] = defaultdict(list)
         for op in ops:
+            if op.kind not in self._handlers:
+                raise ValueError(
+                    f"unknown op kind {op.kind!r}; "
+                    f"valid kinds are: {', '.join(sorted(self._handlers))}"
+                )
             groups[op.kind].append(op.payload)
         async with self._engine.begin() as conn:
-            for kind, payloads in groups.items():
-                await self._handlers[kind](conn, payloads)
-
-    async def insert_attachment(self, record: AttachmentRecord) -> int:
-        """Insert one attachment row and return its primary key."""
-        async with self._engine.begin() as conn:
-            result = await conn.execute(
-                attachments.insert().values(
-                    message_id=record.message_id,
-                    attachment_id=record.attachment_id,
-                    filename=record.filename,
-                    content_type=record.content_type,
-                    size=record.size,
-                    url=record.url,
-                    storage_backend=record.storage_backend,
-                    status=record.status,
-                    captured_at=record.captured_at,
-                )
-            )
-            return int(result.inserted_primary_key[0])
+            for kind in self._ordered_kinds(groups):
+                await self._handlers[kind](conn, groups[kind])
 
     # -- insert helpers -------------------------------------------------
 
@@ -1248,12 +1235,18 @@ class Repository:
             set_={col: stmt.inserted[col] for col in update_columns},
         )
 
-    def _insert_only(self, table, values: list[dict[str, Any]]):  # noqa: ANN001, ANN202
+    def _insert_only(self, table, values: list[dict[str, Any]]):
+        """Insert rows, ignoring rows that already exist.
+
+        On MySQL this is `ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)` —
+        a true no-op that keeps the existing surrogate key and leaves the
+        connection's last insert id usable.
+        """
         stmt = self._insert(table).values(values)
         if self._dialect == "mysql":
             primary_key = list(table.primary_key.columns)[0]
             return stmt.on_duplicate_key_update(
-                **{primary_key.name: stmt.inserted[primary_key.name]}
+                **{primary_key.name: func.last_insert_id(primary_key)}
             )
         return stmt.on_conflict_do_nothing()
 
@@ -1416,6 +1409,8 @@ class Repository:
     async def _handle_attachment(
         self, conn: AsyncConnection, records: list[AttachmentRecord]
     ) -> None:
+        # 附件写入必须幂等：(message_id, attachment_id) 上有唯一约束，
+        # 重复写入用 insert-only 而不是普通 INSERT。
         values = [
             {
                 "message_id": r.message_id,
@@ -1430,7 +1425,7 @@ class Repository:
             }
             for r in records
         ]
-        await conn.execute(attachments.insert().values(values))
+        await conn.execute(self._insert_only(attachments, values))
 
     async def _handle_attachment_status(
         self, conn: AsyncConnection, records: list[AttachmentStatus]
