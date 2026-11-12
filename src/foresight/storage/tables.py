@@ -4,6 +4,11 @@ JSON payloads are stored as TEXT so that SQLite, PostgreSQL and MySQL all
 behave identically. `reactions` and `attachments` deliberately declare no
 foreign key to `messages`: a reaction may arrive for a message that was sent
 before the service started and therefore has no row in `messages`.
+
+Primary keys that hold a Discord snowflake are supplied by the application and
+declare `autoincrement=False`. SQLAlchemy's default of `"auto"` would render
+them as `AUTO_INCREMENT` on MySQL, where the server would allocate a value on
+every insert even though the application always provides the key.
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ def _pk_type() -> BigInteger:
 guilds = Table(
     "guilds",
     metadata,
-    Column("guild_id", BigInteger, primary_key=True),
+    Column("guild_id", BigInteger, primary_key=True, autoincrement=False),
     Column("name", Text),
     Column("member_count", Integer),
     Column("captured_at", Text, nullable=False),
@@ -46,7 +51,7 @@ guilds = Table(
 channels = Table(
     "channels",
     metadata,
-    Column("channel_id", BigInteger, primary_key=True),
+    Column("channel_id", BigInteger, primary_key=True, autoincrement=False),
     Column("guild_id", BigInteger),
     Column("name", Text),
     Column("topic", Text),
@@ -58,7 +63,7 @@ channels = Table(
 users = Table(
     "users",
     metadata,
-    Column("user_id", BigInteger, primary_key=True),
+    Column("user_id", BigInteger, primary_key=True, autoincrement=False),
     Column("username", Text, nullable=False),
     Column("global_name", Text),
     Column("display_name", Text),
@@ -74,7 +79,7 @@ users = Table(
 messages = Table(
     "messages",
     metadata,
-    Column("message_id", BigInteger, primary_key=True),
+    Column("message_id", BigInteger, primary_key=True, autoincrement=False),
     Column("guild_id", BigInteger),
     Column("channel_id", BigInteger, nullable=False),
     Column("author_id", BigInteger, nullable=False),
@@ -134,7 +139,7 @@ attachments = Table(
 message_analysis = Table(
     "message_analysis",
     metadata,
-    Column("message_id", BigInteger, primary_key=True),
+    Column("message_id", BigInteger, primary_key=True, autoincrement=False),
     Column("translated_text", Text),
     Column("sentiment", Text),
     Column("sentiment_score", Float),
