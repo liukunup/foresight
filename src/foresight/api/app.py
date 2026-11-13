@@ -9,10 +9,12 @@ from fastapi import APIRouter, Depends, FastAPI
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from foresight.api.deps import require_token
+from foresight.api.query import build_query_runner
 from foresight.api.routers import (
     channels,
     health,
     messages,
+    query,
     reactions,
     stats,
     users,
@@ -70,10 +72,15 @@ def create_app(config: Config, engine: AsyncEngine | None = None) -> FastAPI:
     app.state.engine = engine
     app.state.owns_engine = owns_engine
     app.state.config = config
+    # The free-form SQL endpoint runs on a runner of its own: the
+    # SQLite runner opens a read-only connection with an authorizer
+    # that denies every write, which the async engine cannot do.
+    app.state.query_runner = build_query_runner(config.database)
     include_api_router(app, health.router, tags=["health"])
     include_api_router(app, messages.router, tags=["messages"])
     include_api_router(app, users.router, tags=["users"])
     include_api_router(app, channels.router, tags=["channels"])
     include_api_router(app, reactions.router, tags=["reactions"])
     include_api_router(app, stats.router, tags=["stats"])
+    include_api_router(app, query.router, tags=["query"])
     return app
