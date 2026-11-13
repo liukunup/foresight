@@ -90,6 +90,13 @@ def _route_path(request: Request) -> str:
     return "/".join(segments)
 
 
+def _observe_request(request: Request, status: str, elapsed: float) -> None:
+    """Count one request and record how long it took."""
+    path = _route_path(request)
+    api_requests_total.labels(method=request.method, path=path, status=status).inc()
+    api_request_duration_seconds.labels(method=request.method, path=path).observe(elapsed)
+
+
 def create_app(config: Config, engine: AsyncEngine | None = None) -> FastAPI:
     """Build the read-only API application.
 
@@ -133,15 +140,14 @@ def create_app(config: Config, engine: AsyncEngine | None = None) -> FastAPI:
         that was asked a question.
         """
         started = time.perf_counter()
-        response = await call_next(request)
-        elapsed = time.perf_counter() - started
-        path = _route_path(request)
-        api_requests_total.labels(
-            method=request.method, path=path, status=str(response.status_code)
-        ).inc()
-        api_request_duration_seconds.labels(method=request.method, path=path).observe(
-            elapsed
-        )
+        try:
+            response = await call_next(request)
+        except Exception:
+            # The request failed: the server answers 500, and a request
+            # that failed is a request that was made.
+            _observe_request(request, "500", time.perf_counter() - started)
+            raise
+        _observe_request(request, str(response.status_code), time.perf_counter() - started)
         return response
 
     @app.get("/metrics", include_in_schema=False)

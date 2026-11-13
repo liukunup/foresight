@@ -60,6 +60,40 @@ async def test_metrics_label_an_unmatched_path_without_its_value(api_client):
     assert 'path="/api/nothing-here"' not in response.text
 
 
+async def test_metrics_records_a_request_that_failed(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'm.db'}")
+    await init_db(engine)
+    config = SimpleNamespace(
+        api=SimpleNamespace(host="127.0.0.1", port=8000, metrics_token=""),
+        database=SimpleNamespace(
+            backend="sqlite",
+            path=str(tmp_path / "m.db"),
+            sqlalchemy_url=f"sqlite+aiosqlite:///{tmp_path / 'm.db'}",
+            readonly_sqlalchemy_url=(
+                f"sqlite+aiosqlite:///file:{tmp_path / 'm.db'}?mode=ro&uri=true"
+            ),
+        ),
+        media=SimpleNamespace(backend="local"),
+    )
+    app = create_app(config, engine=engine)
+
+    @app.get("/api/boom")
+    async def boom() -> None:
+        raise RuntimeError("the endpoint failed")
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        failed = await client.get("/api/boom")
+        response = await client.get("/metrics")
+    assert failed.status_code == 500
+    # A request that failed is a request that was made.
+    assert (
+        'foresight_api_requests_total{method="GET",path="/api/boom",status="500"}'
+        in response.text
+    )
+    await engine.dispose()
+
+
 async def test_health_updates_the_database_gauges(api_client, auth):
     await api_client.get("/api/health", headers=auth)
     response = await api_client.get("/metrics")
