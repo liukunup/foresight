@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import NoReturn, Optional
+from typing import Any, NoReturn, Optional
 
 import typer
 
@@ -36,6 +36,8 @@ def init_db(
     config: Optional[str] = typer.Option(None, "--config", help="Path to config.toml"),
 ) -> None:
     """Create the database schema."""
+    from sqlalchemy.exc import SQLAlchemyError
+
     from foresight.storage.db import create_engine, init_db as create_tables
 
     settings = _load(config)
@@ -43,14 +45,14 @@ def init_db(
     async def _create_schema() -> None:
         try:
             engine = create_engine(settings.database)
-        except Exception as exc:
+        except (OSError, SQLAlchemyError) as exc:
             # A directory that cannot be created, an unwritable path, a
             # backend that is not there: the operator gets the cause, not a
-            # traceback.
+            # traceback. Anything else is a bug and stays a bug.
             _fail(f"cannot open the database: {exc}")
         try:
             await create_tables(engine)
-        except Exception as exc:
+        except (OSError, SQLAlchemyError) as exc:
             _fail(f"cannot open the database: {exc}")
         finally:
             # The command is done with the database: the connection is
@@ -67,6 +69,8 @@ def run(
     config: Optional[str] = typer.Option(None, "--config", help="Path to config.toml"),
 ) -> None:
     """Start the Discord collector."""
+    from sqlalchemy.exc import SQLAlchemyError
+
     from foresight.bot import build_bot, require_token
     from foresight.events import EventHandler
     from foresight.storage.db import create_engine, init_db as create_tables
@@ -88,45 +92,65 @@ def run(
     failure_path = Path(settings.database.path).parent / "failed_batch.jsonl"
 
     async def _run() -> None:
+        # Every resource that was created is released again, even when the
+        # step before it failed.
+        engine: Any = None
+        writer: Any = None
+        bot: Any = None
         try:
-            engine = create_engine(settings.database)
-        except Exception as exc:
-            _fail(f"cannot open the database: {exc}")
-        try:
-            await create_tables(engine)
-        except Exception as exc:
-            await engine.dispose()
-            _fail(f"cannot open the database: {exc}")
-        repo = Repository(engine)
-        writer = Writer(
-            repo,
-            batch_size=settings.writer.batch_size,
-            flush_interval_ms=settings.writer.flush_interval_ms,
-            queue_maxsize=settings.writer.queue_maxsize,
-            failure_path=failure_path,
-        )
-        # The replay writes on this coroutine and bypasses the queue, so it
-        # belongs to the startup: the background task of the writer is not
-        # running yet, so it cannot race the replay for the database lock.
-        await recover_failed_batches(writer, failure_path)
-        await writer.start()
-        handler = EventHandler(settings, writer)
-        bot = build_bot(settings, handler)
-        logger.info(
-            "collector starting: channels=%s database=%s",
-            ", ".join(str(cid) for cid in settings.discord.channel_ids),
-            settings.database.path,
-        )
-        try:
+            try:
+                engine = create_engine(settings.database)
+            except (OSError, SQLAlchemyError) as exc:
+                # A directory that cannot be created, an unwritable path, a
+                # backend that is not there: the operator gets the cause,
+                # not a traceback. Anything else is a bug and stays a bug.
+                _fail(f"cannot open the database: {exc}")
+            try:
+                await create_tables(engine)
+            except (OSError, SQLAlchemyError) as exc:
+                _fail(f"cannot open the database: {exc}")
+            repo = Repository(engine)
+            writer = Writer(
+                repo,
+                batch_size=settings.writer.batch_size,
+                flush_interval_ms=settings.writer.flush_interval_ms,
+                queue_maxsize=settings.writer.queue_maxsize,
+                failure_path=failure_path,
+            )
+            try:
+                # The replay writes on this coroutine and bypasses the
+                # queue, so it belongs to the startup: the background task
+                # of the writer is not running yet, so it cannot race the
+                # replay for the database lock.
+                await recover_failed_batches(writer, failure_path)
+            except Exception as exc:
+                # A failure file that cannot be read or parsed is a problem
+                # of the operator, not a crash of the collector.
+                _fail(f"cannot replay the failure file {failure_path}: {exc}")
+            await writer.start()
+            handler = EventHandler(settings, writer)
+            bot = build_bot(settings, handler)
+            logger.info(
+                "collector starting: channels=%s database=%s",
+                ", ".join(str(cid) for cid in settings.discord.channel_ids),
+                settings.database.path,
+            )
             await bot.start(token)
         finally:
             logger.info("collector stopping")
-            # The bot is closed first: it stops the gateway and closes the
-            # HTTP session. An event that arrives after the writer was
-            # stopped would be dropped by the writer.
-            await bot.close()
-            await writer.stop()
-            await engine.dispose()
+            # Every step runs, even when the one before it failed: the bot
+            # is closed first, then the writer is stopped, then the engine
+            # is disposed.
+            try:
+                if bot is not None:
+                    await bot.close()
+            finally:
+                try:
+                    if writer is not None:
+                        await writer.stop()
+                finally:
+                    if engine is not None:
+                        await engine.dispose()
 
     asyncio.run(_run())
 

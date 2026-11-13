@@ -328,3 +328,62 @@ def test_run_logs_that_the_collector_starts_and_stops(collector: _Collector, cap
     messages = [record.getMessage() for record in caplog.records]
     assert any("starting" in message for message in messages)
     assert any("stopping" in message for message in messages)
+
+
+def test_run_stops_the_writer_even_when_the_bot_cannot_be_closed(
+    collector: _Collector, monkeypatch: pytest.MonkeyPatch
+):
+    async def failing_close() -> None:
+        collector.events.append("bot.close")
+        raise RuntimeError("the bot could not be closed")
+
+    monkeypatch.setattr(collector.bot, "close", failing_close)
+    result = collector.run()
+    assert result.exit_code != 0
+    # The bot could not be closed, but the writer and the engine are
+    # released anyway, and in the documented order.
+    assert collector.events[-2:] == ["writer.stop", "engine.dispose"]
+
+
+def test_run_reports_a_failing_replay_and_releases_the_engine(
+    collector: _Collector, monkeypatch: pytest.MonkeyPatch
+):
+    async def failing_recover(writer: Any, path: Path | None) -> int:
+        raise OSError("the failure file cannot be read")
+
+    monkeypatch.setattr("foresight.writer.recover_failed_batches", failing_recover)
+    result = collector.run()
+    assert result.exit_code != 0
+    # The operator gets a message, not a traceback.
+    assert "Traceback" not in result.output
+    assert "error:" in result.stderr
+    # The engine that was already created is released.
+    assert "engine.dispose" in collector.events
+
+
+def test_run_does_not_disguise_an_unrelated_schema_error(
+    collector: _Collector, monkeypatch: pytest.MonkeyPatch
+):
+    async def failing_init_db(engine: Any) -> None:
+        raise RuntimeError("a bug in the schema creation")
+
+    monkeypatch.setattr("foresight.storage.db.init_db", failing_init_db)
+    result = collector.run()
+    # A bug is not reported as a database that cannot be opened: it
+    # propagates.
+    assert isinstance(result.exception, RuntimeError)
+    assert "cannot open the database" not in result.output
+    # The engine that was already created is still released.
+    assert "engine.dispose" in collector.events
+
+
+def test_init_db_does_not_disguise_an_unrelated_schema_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    async def failing_init_db(engine: Any) -> None:
+        raise RuntimeError("a bug in the schema creation")
+
+    monkeypatch.setattr("foresight.storage.db.init_db", failing_init_db)
+    result = runner.invoke(app, ["init-db", "--config", str(_write_config(tmp_path))])
+    assert isinstance(result.exception, RuntimeError)
+    assert "cannot open the database" not in result.output
