@@ -86,12 +86,6 @@ SURROGATE_PRIMARY_KEYS = {
 AUTO_INCREMENT = re.compile(r"\bAUTO_INCREMENT\b")
 
 
-def _sqlite_engine(tmp_path):
-    engine = sa.create_engine(f"sqlite:///{tmp_path / 'schema.db'}")
-    metadata.create_all(engine)
-    return engine
-
-
 def _column_type_token(table, column_name, dialect):
     """Return the rendered type token of one column in that dialect's DDL."""
     ddl = str(CreateTable(table).compile(dialect=dialect))
@@ -127,9 +121,10 @@ def test_reactions_unique_constraint_is_named_uq_reactions_target():
     assert named == {"uq_reactions_target": ["message_id", "user_id", "emoji"]}
 
 
-def test_reactions_unique_constraint_keeps_its_name_in_the_created_schema(tmp_path):
-    engine = _sqlite_engine(tmp_path)
-    inspector = sa.inspect(engine)
+def test_reactions_unique_constraint_keeps_its_name_in_the_created_schema(
+    schema_engine,
+):
+    inspector = sa.inspect(schema_engine)
     unique = {
         constraint["name"]: constraint["column_names"]
         for constraint in inspector.get_unique_constraints("reactions")
@@ -145,16 +140,16 @@ def test_attachments_declares_no_foreign_key():
     assert attachments.foreign_keys == set()
 
 
-def test_created_schema_has_no_foreign_keys_on_reactions_or_attachments(tmp_path):
-    engine = _sqlite_engine(tmp_path)
-    inspector = sa.inspect(engine)
+def test_created_schema_has_no_foreign_keys_on_reactions_or_attachments(
+    schema_engine,
+):
+    inspector = sa.inspect(schema_engine)
     assert inspector.get_foreign_keys("reactions") == []
     assert inspector.get_foreign_keys("attachments") == []
 
 
-def test_reactions_autoincrement_ids_start_at_one(tmp_path):
-    engine = _sqlite_engine(tmp_path)
-    with engine.begin() as connection:
+def test_reactions_autoincrement_ids_start_at_one(schema_engine):
+    with schema_engine.begin() as connection:
         connection.execute(
             reactions.insert(),
             [
@@ -176,8 +171,7 @@ def test_reactions_autoincrement_ids_start_at_one(tmp_path):
     assert list(ids) == [1, 2]
 
 
-def test_attachments_autoincrement_ids_start_at_one(tmp_path):
-    engine = _sqlite_engine(tmp_path)
+def test_attachments_autoincrement_ids_start_at_one(schema_engine):
     rows = [
         {
             "message_id": 1,
@@ -192,7 +186,7 @@ def test_attachments_autoincrement_ids_start_at_one(tmp_path):
             "captured_at": "2026-11-11T00:00:00+00:00",
         },
     ]
-    with engine.begin() as connection:
+    with schema_engine.begin() as connection:
         connection.execute(attachments.insert(), rows)
         ids = connection.execute(
             sa.select(attachments.c.id).order_by(attachments.c.id)
@@ -265,9 +259,8 @@ def test_expected_indexes_exist_with_documented_names():
     assert actual == EXPECTED_INDEXES
 
 
-def test_expected_indexes_exist_in_the_created_schema(tmp_path):
-    engine = _sqlite_engine(tmp_path)
-    inspector = sa.inspect(engine)
+def test_expected_indexes_exist_in_the_created_schema(schema_engine):
+    inspector = sa.inspect(schema_engine)
     for index_name, (table_name, columns) in EXPECTED_INDEXES.items():
         indexes = {
             index["name"]: index["column_names"]
@@ -287,9 +280,10 @@ def test_attachments_unique_constraint_is_named_uq_attachments_target():
     assert named == {"uq_attachments_target": ["message_id", "attachment_id"]}
 
 
-def test_attachments_unique_constraint_keeps_its_name_in_the_created_schema(tmp_path):
-    engine = _sqlite_engine(tmp_path)
-    inspector = sa.inspect(engine)
+def test_attachments_unique_constraint_keeps_its_name_in_the_created_schema(
+    schema_engine,
+):
+    inspector = sa.inspect(schema_engine)
     unique = {
         constraint["name"]: constraint["column_names"]
         for constraint in inspector.get_unique_constraints("attachments")
@@ -306,18 +300,18 @@ def _attachment_row(message_id, attachment_id):
     }
 
 
-def test_attachments_rejects_two_rows_with_the_same_message_and_attachment_id(tmp_path):
-    engine = _sqlite_engine(tmp_path)
-    with engine.begin() as connection:
+def test_attachments_rejects_two_rows_with_the_same_message_and_attachment_id(
+    schema_engine,
+):
+    with schema_engine.begin() as connection:
         connection.execute(attachments.insert(), [_attachment_row(1, 10)])
     with pytest.raises(IntegrityError):
-        with engine.begin() as connection:
+        with schema_engine.begin() as connection:
             connection.execute(attachments.insert(), [_attachment_row(1, 10)])
 
 
-def test_attachments_accepts_two_rows_with_different_attachment_ids(tmp_path):
-    engine = _sqlite_engine(tmp_path)
-    with engine.begin() as connection:
+def test_attachments_accepts_two_rows_with_different_attachment_ids(schema_engine):
+    with schema_engine.begin() as connection:
         connection.execute(
             attachments.insert(),
             [_attachment_row(1, 10), _attachment_row(1, 11)],

@@ -16,12 +16,10 @@ from dataclasses import asdict
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import create_async_engine
 
 import foresight.writer as writer_module
 from foresight.domain import models as domain_models
 from foresight.domain.models import MessageRecord, OpKind, WriteOp
-from foresight.storage.db import init_db
 from foresight.storage.repository import Repository
 from foresight.storage.tables import messages
 from foresight.writer import Writer, recover_failed_batches
@@ -67,56 +65,53 @@ def _message(content: str = "hello") -> MessageRecord:
     )
 
 
-async def _make_writer(tmp_path, repo=None, queue_maxsize: int | None = None):
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
-    await init_db(engine)
+async def _make_writer(engine, repo=None, queue_maxsize: int | None = None):
+    """A started writer on `engine`, which the caller owns."""
     repository = repo or Repository(engine)
     kwargs = {} if queue_maxsize is None else {"queue_maxsize": queue_maxsize}
     writer = Writer(repository, batch_size=2, flush_interval_ms=10, **kwargs)
     await writer.start()
-    return writer, engine
+    return writer
 
 
-async def test_writer_flushes_submitted_ops(tmp_path):
-    writer, engine = await _make_writer(tmp_path)
+async def test_writer_flushes_submitted_ops(db_engine):
+    writer = await _make_writer(db_engine)
     assert writer.submit(WriteOp(OpKind.MESSAGE, _message())) is True
     await writer.stop()
-    async with engine.connect() as conn:
+    async with db_engine.connect() as conn:
         rows = (await conn.execute(select(messages))).all()
     assert len(rows) == 1
 
 
-async def test_writer_drains_queue_on_stop(tmp_path):
-    writer, engine = await _make_writer(tmp_path)
+async def test_writer_drains_queue_on_stop(db_engine):
+    writer = await _make_writer(db_engine)
     for index in range(5):
         record = _message()
         record.message_id = index + 1
         writer.submit(WriteOp(OpKind.MESSAGE, record))
     await writer.stop()
-    async with engine.connect() as conn:
+    async with db_engine.connect() as conn:
         rows = (await conn.execute(select(messages))).all()
     assert len(rows) == 5
 
 
-async def test_writer_returns_false_when_queue_is_full(tmp_path):
-    writer, _ = await _make_writer(tmp_path, queue_maxsize=1)
+async def test_writer_returns_false_when_queue_is_full(db_engine):
+    writer = await _make_writer(db_engine, queue_maxsize=1)
     writer.submit(WriteOp(OpKind.MESSAGE, _message()))
     assert writer.submit(WriteOp(OpKind.MESSAGE, _message())) is False
     await writer.stop()
 
 
-async def test_writer_reports_the_queue_depth(tmp_path):
-    writer, _ = await _make_writer(tmp_path)
+async def test_writer_reports_the_queue_depth(db_engine):
+    writer = await _make_writer(db_engine)
     assert writer.queue_depth == 0
     writer.submit(WriteOp(OpKind.MESSAGE, _message()))
     assert writer.queue_depth == 1
     await writer.stop()
 
 
-async def test_recover_failed_batches_replays_records(tmp_path):
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
-    await init_db(engine)
-    repo = Repository(engine)
+async def test_recover_failed_batches_replays_records(tmp_path, db_engine):
+    repo = Repository(db_engine)
     writer = Writer(repo, batch_size=1, flush_interval_ms=10)
     failure_path = tmp_path / "failed_batch.jsonl"
     failure_path.write_text(
@@ -130,7 +125,7 @@ async def test_recover_failed_batches_replays_records(tmp_path):
     recovered = await recover_failed_batches(writer, failure_path)
     await writer.stop()
     assert recovered == 1
-    async with engine.connect() as conn:
+    async with db_engine.connect() as conn:
         rows = (await conn.execute(select(messages))).all()
     assert len(rows) == 1
     assert rows[0].content == "recovered"
@@ -385,14 +380,12 @@ async def test_the_flush_loop_always_awaits(monkeypatch):
     assert recorder.waits > 0
 
 
-async def test_apply_ops_writes_the_operations_and_reports_the_count(tmp_path):
+async def test_apply_ops_writes_the_operations_and_reports_the_count(db_engine):
     """The public entry point for a write outside the queue."""
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
-    await init_db(engine)
-    writer = Writer(Repository(engine), batch_size=1, flush_interval_ms=10)
+    writer = Writer(Repository(db_engine), batch_size=1, flush_interval_ms=10)
     written = await writer.apply_ops([WriteOp(OpKind.MESSAGE, _message())])
     assert written == 1
-    async with engine.connect() as conn:
+    async with db_engine.connect() as conn:
         rows = (await conn.execute(select(messages))).all()
     assert len(rows) == 1
 
@@ -451,12 +444,11 @@ async def test_recover_failed_batches_does_not_wait_out_the_retry_backoff(
 
 async def test_recover_failed_batches_replays_the_good_record_of_a_malformed_file(
     tmp_path,
+    db_engine,
 ):
     """One malformed line must not stop the other records from being replayed."""
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
-    await init_db(engine)
-    writer = Writer(Repository(engine), batch_size=1, flush_interval_ms=10)
+    writer = Writer(Repository(db_engine), batch_size=1, flush_interval_ms=10)
     failure_path = tmp_path / "failed_batch.jsonl"
     failure_path.write_text(
         json.dumps({"kind": OpKind.MESSAGE, "payload": asdict(_message("good"))})
@@ -468,7 +460,7 @@ async def test_recover_failed_batches_replays_the_good_record_of_a_malformed_fil
     recovered = await recover_failed_batches(writer, failure_path)
     await writer.stop()
     assert recovered == 1
-    async with engine.connect() as conn:
+    async with db_engine.connect() as conn:
         rows = (await conn.execute(select(messages))).all()
     assert [row.content for row in rows] == ["good"]
     # The unusable line is kept next to the failure file instead of being
@@ -478,7 +470,9 @@ async def test_recover_failed_batches_replays_the_good_record_of_a_malformed_fil
     assert "good" not in failure_path.read_text(encoding="utf-8")
 
 
-async def test_recover_failed_batches_keeps_a_record_the_database_rejects(tmp_path):
+async def test_recover_failed_batches_keeps_a_record_the_database_rejects(
+    tmp_path, db_engine
+):
     """One record the database rejects must not block the good ones."""
 
     class SelectiveRepository:
@@ -493,10 +487,8 @@ async def test_recover_failed_batches_keeps_a_record_the_database_rejects(tmp_pa
                     raise RuntimeError("the database rejects this record")
             await self._inner.apply_batch(ops)
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
-    await init_db(engine)
     writer = Writer(
-        SelectiveRepository(Repository(engine)), batch_size=1, flush_interval_ms=10
+        SelectiveRepository(Repository(db_engine)), batch_size=1, flush_interval_ms=10
     )
     failure_path = tmp_path / "failed_batch.jsonl"
     failure_path.write_text(
@@ -510,7 +502,7 @@ async def test_recover_failed_batches_keeps_a_record_the_database_rejects(tmp_pa
     recovered = await recover_failed_batches(writer, failure_path)
     await writer.stop()
     assert recovered == 1
-    async with engine.connect() as conn:
+    async with db_engine.connect() as conn:
         rows = (await conn.execute(select(messages))).all()
     assert [row.content for row in rows] == ["good"]
     # The rejected record stays in the file, the recovered one is gone.
@@ -519,12 +511,12 @@ async def test_recover_failed_batches_keeps_a_record_the_database_rejects(tmp_pa
     assert "good" not in remaining
 
 
-async def test_recover_failed_batches_survives_a_record_it_cannot_rebuild(tmp_path):
+async def test_recover_failed_batches_survives_a_record_it_cannot_rebuild(
+    tmp_path, db_engine
+):
     """A record that no longer matches its dataclass must not crash the start."""
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
-    await init_db(engine)
-    writer = Writer(Repository(engine), batch_size=1, flush_interval_ms=10)
+    writer = Writer(Repository(db_engine), batch_size=1, flush_interval_ms=10)
     failure_path = tmp_path / "failed_batch.jsonl"
     failure_path.write_text(
         json.dumps({"kind": OpKind.MESSAGE, "payload": {"unknown_field": 1}})
@@ -543,12 +535,11 @@ async def test_recover_failed_batches_survives_a_record_it_cannot_rebuild(tmp_pa
 
 async def test_recover_failed_batches_quarantines_a_record_with_an_unknown_kind(
     tmp_path,
+    db_engine,
 ):
     """A record the repository can never handle must not block every start."""
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
-    await init_db(engine)
-    writer = Writer(Repository(engine), batch_size=1, flush_interval_ms=10)
+    writer = Writer(Repository(db_engine), batch_size=1, flush_interval_ms=10)
     failure_path = tmp_path / "failed_batch.jsonl"
     failure_path.write_text(
         json.dumps({"kind": OpKind.MESSAGE, "payload": asdict(_message("good"))})
@@ -561,7 +552,7 @@ async def test_recover_failed_batches_quarantines_a_record_with_an_unknown_kind(
     recovered = await recover_failed_batches(writer, failure_path)
     await writer.stop()
     assert recovered == 1
-    async with engine.connect() as conn:
+    async with db_engine.connect() as conn:
         rows = (await conn.execute(select(messages))).all()
     assert [row.content for row in rows] == ["good"]
     # The unknown kind is kept next to the failure file and does not stay
@@ -574,12 +565,11 @@ async def test_recover_failed_batches_quarantines_a_record_with_an_unknown_kind(
 
 async def test_recover_failed_batches_quarantines_a_record_without_an_object_payload(
     tmp_path,
+    db_engine,
 ):
     """A record whose payload is not a dataclass payload can never be used."""
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
-    await init_db(engine)
-    writer = Writer(Repository(engine), batch_size=1, flush_interval_ms=10)
+    writer = Writer(Repository(db_engine), batch_size=1, flush_interval_ms=10)
     failure_path = tmp_path / "failed_batch.jsonl"
     failure_path.write_text(
         json.dumps({"kind": OpKind.MESSAGE, "payload": "not an object"})
@@ -595,9 +585,9 @@ async def test_recover_failed_batches_quarantines_a_record_without_an_object_pay
     assert "not an object" in rejected
 
 
-async def test_writer_keeps_writing_after_it_was_restarted(tmp_path):
+async def test_writer_keeps_writing_after_it_was_restarted(db_engine):
     """A restarted writer must not inherit the stopping flag of the old one."""
-    writer, engine = await _make_writer(tmp_path)
+    writer = await _make_writer(db_engine)
     await writer.stop()
     await writer.start()
     # The restarted task needs a moment to notice that the writer is
@@ -608,14 +598,14 @@ async def test_writer_keeps_writing_after_it_was_restarted(tmp_path):
     record.message_id = 2
     assert writer.submit(WriteOp(OpKind.MESSAGE, record)) is True
     await writer.stop()
-    async with engine.connect() as conn:
+    async with db_engine.connect() as conn:
         rows = (await conn.execute(select(messages))).all()
     assert [row.content for row in rows] == ["after the restart"]
 
 
-async def test_submit_after_stop_returns_false(tmp_path, caplog):
+async def test_submit_after_stop_returns_false(db_engine, caplog):
     """An operation handed to a stopped writer would never be written."""
-    writer, _ = await _make_writer(tmp_path)
+    writer = await _make_writer(db_engine)
     await writer.stop()
     with caplog.at_level(logging.WARNING, logger="foresight.writer"):
         assert writer.submit(WriteOp(OpKind.MESSAGE, _message())) is False
