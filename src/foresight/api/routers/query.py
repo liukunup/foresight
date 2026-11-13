@@ -7,7 +7,12 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from foresight.api.query import QueryError, QueryResult, clamp_limit
+from foresight.api.query import (
+    QueryDatabaseError,
+    QueryError,
+    QueryResult,
+    clamp_limit,
+)
 
 router = APIRouter()
 
@@ -33,7 +38,9 @@ async def run_query(payload: QueryRequest, request: Request) -> QueryResponse:
     The statement is not built here: the runner in `foresight.api.query`
     owns the SQL and the rules that keep it read-only. A statement the
     runner refuses is a bad request — the caller sent something that is
-    not a read — and not a failure of the server.
+    not a read — and not a failure of the server. A database that
+    cannot answer at all is the opposite: there is nothing the caller
+    can fix, so it is a failure of the server.
     """
     runner = request.app.state.query_runner
     try:
@@ -42,6 +49,10 @@ async def run_query(payload: QueryRequest, request: Request) -> QueryResponse:
         )
     except QueryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except QueryDatabaseError as exc:
+        raise HTTPException(
+            status_code=500, detail="the database could not be read"
+        ) from exc
     return QueryResponse(
         columns=result.columns,
         rows=result.rows,

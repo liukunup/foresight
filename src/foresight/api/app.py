@@ -25,12 +25,17 @@ from foresight.storage.db import create_engine
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Close the engine the application built when it shuts down.
+    """Close the resources the application built when it shuts down.
 
-    Only an engine the application created itself is disposed: an
+    Only a resource the application created itself is closed: an
     injected engine belongs to the caller, which may still be using it.
+    The query runner owns the engine it built, so closing the runner
+    closes that engine too.
     """
     yield
+    runner = getattr(app.state, "query_runner", None)
+    if runner is not None:
+        await runner.dispose()
     if getattr(app.state, "owns_engine", False):
         engine = getattr(app.state, "engine", None)
         if engine is not None:
