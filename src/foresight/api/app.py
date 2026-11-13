@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, FastAPI
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from foresight.api.deps import require_token
-from foresight.api.routers import health, messages
+from foresight.api.routers import channels, health, messages, reactions, users
 from foresight.config import Config
 from foresight.storage.db import create_engine
 
@@ -65,4 +65,7 @@ def create_app(config: Config, engine: AsyncEngine | None = None) -> FastAPI:
     app.state.config = config
     include_api_router(app, health.router, tags=["health"])
     include_api_router(app, messages.router, tags=["messages"])
+    include_api_router(app, users.router, tags=["users"])
+    include_api_router(app, channels.router, tags=["channels"])
+    include_api_router(app, reactions.router, tags=["reactions"])
     return app

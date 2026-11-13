@@ -67,3 +67,36 @@ class HealthOut(BaseModel):
     total_attachments: int
     db_size_mb: float
     last_captured_at: str | None
+
+
+class UserOut(BaseModel):
+    """One speaker of the dump, counted over the messages table."""
+
+    author_id: int
+    username: str | None
+    message_count: int
+    first_message_at: str | None
+    last_message_at: str | None
+    avg_chars: float
+
+
+class ChannelOut(BaseModel):
+    """One channel of the dump, counted over the messages table."""
+
+    channel_id: int
+    guild_id: int | None
+    name: str | None
+    message_count: int
+    last_message_at: str | None
+
+
+class ReactionOut(BaseModel):
+    """One reaction row, soft removals included."""
+
+    id: int
+    message_id: int
+    user_id: int
+    emoji: str
+    is_custom: bool
+    added_at: str
+    removed_at: str | None
