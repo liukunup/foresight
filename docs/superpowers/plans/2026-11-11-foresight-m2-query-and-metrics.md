@@ -226,7 +226,7 @@ class StatsService:
             )
             .where(*clauses)
             .group_by(messages.c.author_id)
-            .order_by(func.count().desc())
+            .order_by(func.count().desc(), messages.c.author_id)
             .limit(limit)
         )
         async with self._engine.connect() as conn:
@@ -285,9 +285,16 @@ class StatsService:
     ) -> list[dict[str, Any]]:
         """Aggregate extracted issues first, fall back to frequent words."""
         clauses = self._filter(since, until, channel_id)
-        stmt = select(message_analysis.c.issues_json).where(
-            *clauses,
-            message_analysis.c.issues_json.is_not(None),
+        # 必须 join 回 messages：过滤条件引用的是 messages 的列，
+        # 不 join 会渲染成 FROM message_analysis, messages 的笛卡尔积。
+        stmt = (
+            select(message_analysis.c.issues_json)
+            .select_from(
+                message_analysis.join(
+                    messages, message_analysis.c.message_id == messages.c.message_id
+                )
+            )
+            .where(*clauses, message_analysis.c.issues_json.is_not(None))
         )
         async with self._engine.connect() as conn:
             rows = (await conn.execute(stmt)).all()
