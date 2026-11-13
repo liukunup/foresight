@@ -159,6 +159,14 @@ def bucket_expr(column: Any, bucket: str) -> Any:
     return func.substr(column, 1, 10)
 
 
+def _ranked(counter: Counter[str], limit: int) -> list[dict[str, Any]]:
+    """Rank topics by count, then by name, so every backend agrees."""
+    if limit <= 0:
+        return []
+    ordered = sorted(counter.items(), key=lambda item: (-item[1], item[0]))
+    return [{"topic": topic, "count": count} for topic, count in ordered[:limit]]
+
+
 class StatsService:
     """Aggregate queries used by both the API and the CLI."""
 
@@ -302,16 +310,17 @@ class StatsService:
         for row in rows:
             try:
                 issues = json.loads(row.issues_json or "[]")
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
+                continue
+            # issues_json 是 TEXT 列，数据库不约束其内容：
+            # 解码结果不是列表就跳过这一行，不能让整个查询崩掉。
+            if not isinstance(issues, list):
                 continue
             for issue in issues:
                 if isinstance(issue, str) and issue.strip():
                     counter[issue.strip()] += 1
         if counter:
-            return [
-                {"topic": topic, "count": count}
-                for topic, count in counter.most_common(limit)
-            ]
+            return _ranked(counter, limit)
         return await self._frequent_words(clauses, limit)
 
     async def _frequent_words(
@@ -326,9 +335,7 @@ class StatsService:
                 token = token.strip()
                 if len(token) > 2:
                     counter[token] += 1
-        return [
-            {"topic": topic, "count": count} for topic, count in counter.most_common(limit)
-        ]
+        return _ranked(counter, limit)
 ```
 
 - [ ] **Step 4: 运行测试确认通过**
