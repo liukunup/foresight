@@ -1,9 +1,10 @@
-"""Tests for the query, stats and serve commands.
+"""Tests for the query, stats, serve and both commands.
 
 These commands are the ones an operator reaches for when the API is not
 running: they read the dump directly, so a broken API does not hide the
-data. The query command must stay read-only, and the serve command must
-refuse to expose the API to the network without a token.
+data. The query command must stay read-only, the serve command must
+refuse to expose the API to the network without a token, and the both
+command must give the API an engine that can only read.
 """
 
 from pathlib import Path
@@ -155,12 +156,27 @@ port = 8000
     engines: list[tuple[bool, Any]] = []
     applications: list[Any] = []
     events: list[str] = []
+    disposed: list[Any] = []
     real_create_engine = storage_db.create_engine
+
+    class _EngineProxy:
+        """The real engine, with its disposal recorded."""
+
+        def __init__(self, engine: Any) -> None:
+            self._engine = engine
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._engine, name)
+
+        async def dispose(self) -> None:
+            disposed.append(self._engine)
+            await self._engine.dispose()
 
     def fake_create_engine(config: Any, **kwargs: Any) -> Any:
         engine = real_create_engine(config, **kwargs)
-        engines.append((bool(kwargs.get("readonly")), engine))
-        return engine
+        proxy = _EngineProxy(engine)
+        engines.append((bool(kwargs.get("readonly")), proxy))
+        return proxy
 
     class _FakeBot:
         async def start(self, token: str) -> None:
@@ -194,6 +210,8 @@ port = 8000
     assert "mode=ro" in str(applications[0].state.engine.url)
     # The API engine belongs to the command, so the command disposes it.
     assert applications[0].state.owns_engine is False
+    # Both engines are released when the command ends.
+    assert len(disposed) == 2
     assert events[0] == "bot.start"
     assert "server.serve" in events
     # The bot is closed when the command ends.
