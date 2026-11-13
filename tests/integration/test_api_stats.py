@@ -208,3 +208,122 @@ async def test_stats_endpoints_are_empty_without_messages(api_harness, auth):
         body = response.json()
         assert body["items"] == [], path
         assert body["total"] == 0, path
+
+
+async def test_stats_top_talkers_reports_a_truncated_page(api_harness, auth):
+    """A list that was cut at the limit says that it was cut.
+
+    Without the flag a caller sees `total: 2, has_more: false` and believes
+    that only two authors ever wrote a message.
+    """
+    records = [
+        message(1, author_id=30),
+        message(2, author_id=31),
+        message(3, author_id=32),
+    ]
+    harness = await api_harness(records)
+
+    response = await harness.client.get(
+        "/api/stats/top-talkers", headers=auth, params={"limit": 2}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["items"]) == 2
+    assert body["total"] == 2
+    assert body["truncated"] is True
+    assert body["has_more"] is True
+
+
+async def test_stats_top_talkers_reports_a_complete_page(api_harness, auth):
+    """A list that holds everything is not truncated."""
+    records = [
+        message(1, author_id=30),
+        message(2, author_id=31),
+        message(3, author_id=32),
+    ]
+    harness = await api_harness(records)
+
+    response = await harness.client.get(
+        "/api/stats/top-talkers", headers=auth, params={"limit": 50}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 3
+    assert body["truncated"] is False
+    assert body["has_more"] is False
+
+
+async def test_stats_topics_reports_a_truncated_page(api_harness, auth):
+    """The topics say the same about their own truncation."""
+    records = [
+        message(1, content="alpha alpha"),
+        message(2, content="beta beta"),
+        message(3, content="gamma gamma"),
+    ]
+    harness = await api_harness(records)
+
+    response = await harness.client.get(
+        "/api/stats/topics", headers=auth, params={"limit": 1}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["items"]) == 1
+    assert body["total"] == 1
+    assert body["truncated"] is True
+    assert body["has_more"] is True
+
+
+async def test_stats_topics_reports_a_complete_page(api_harness, auth):
+    records = [
+        message(1, content="alpha alpha"),
+        message(2, content="beta beta"),
+        message(3, content="gamma gamma"),
+    ]
+    harness = await api_harness(records)
+
+    response = await harness.client.get(
+        "/api/stats/topics", headers=auth, params={"limit": 50}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 3
+    assert body["truncated"] is False
+    assert body["has_more"] is False
+
+
+async def test_stats_activity_reports_a_truncated_page(api_harness, auth):
+    """The activity buckets are cut at the limit as well."""
+    records = [
+        message(1, created_at="2026-11-11T10:00:00+00:00"),
+        message(2, created_at="2026-11-12T10:00:00+00:00"),
+        message(3, created_at="2026-11-13T10:00:00+00:00"),
+    ]
+    harness = await api_harness(records)
+
+    response = await harness.client.get(
+        "/api/stats/activity", headers=auth, params={"limit": 2}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["items"]) == 2
+    assert body["total"] == 2
+    assert body["truncated"] is True
+    assert body["has_more"] is True
+
+
+async def test_stats_activity_reports_a_complete_page(api_harness, auth):
+    records = [
+        message(1, created_at="2026-11-11T10:00:00+00:00"),
+        message(2, created_at="2026-11-12T10:00:00+00:00"),
+        message(3, created_at="2026-11-13T10:00:00+00:00"),
+    ]
+    harness = await api_harness(records)
+
+    response = await harness.client.get(
+        "/api/stats/activity", headers=auth, params={"limit": 50}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 3
+    assert body["truncated"] is False
+    assert body["has_more"] is False

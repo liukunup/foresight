@@ -27,9 +27,18 @@ async def list_channels(
     """List the channels of the dump, the busiest one first.
 
     A channel is a channel that carries at least one message: the counting
-    happens over the messages table. The name and the guild of a channel are
-    read in a second query, because joining the channels table into the
-    grouped statement would change what the grouping is over.
+    happens over the messages table. The name of a channel is read in a
+    second query, because joining the channels table into the grouped
+    statement would change what the grouping is over.
+
+    The guild of a channel is the guild of its messages, so it comes from
+    the same table the endpoint filters over: a snapshot that disagrees
+    with the messages must not make the response describe another guild
+    than the one that was filtered.
+
+    The envelope counts the groups and not the messages: `total` is the
+    number of channels that match the filter and `items` holds one row per
+    channel, however many messages that channel carries.
     """
     # A request for more than the maximum is clamped instead of rejected:
     # the caller asked for a page, not for an error.
@@ -47,6 +56,11 @@ async def list_channels(
     stmt = (
         select(
             messages.c.channel_id,
+            # The guild of the messages, not the guild of the snapshot. A
+            # channel belongs to one guild; when a dump carries messages
+            # of two guilds for one channel, the larger id is reported, so
+            # that the answer does not depend on the order of the rows.
+            func.max(messages.c.guild_id).label("guild_id"),
             func.count().label("message_count"),
             func.max(messages.c.created_at).label("last_message_at"),
         )
@@ -70,7 +84,6 @@ async def list_channels(
                     select(
                         channels.c.channel_id,
                         channels.c.name,
-                        channels.c.guild_id,
                     ).where(channels.c.channel_id.in_(ids))
                 )
             ).all()
@@ -81,7 +94,7 @@ async def list_channels(
         items.append(
             ChannelOut(
                 channel_id=row.channel_id,
-                guild_id=meta.guild_id if meta is not None else None,
+                guild_id=row.guild_id,
                 name=meta.name if meta is not None else None,
                 message_count=int(row.message_count),
                 last_message_at=row.last_message_at,

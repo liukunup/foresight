@@ -31,6 +31,10 @@ async def list_users(
     listed. The usernames are read in a second query, because joining the
     users table into the grouped statement would change what the grouping
     is over.
+
+    The envelope counts the groups and not the messages: `total` is the
+    number of speakers that match the filter and `items` holds one row per
+    speaker, however many messages that speaker wrote.
     """
     # A request for more than the maximum is clamped instead of rejected:
     # the caller asked for a page, not for an error.

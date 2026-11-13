@@ -267,6 +267,40 @@ async def test_channels_endpoint_filters_by_guild(api_harness, auth):
     assert body["items"][0]["channel_id"] == 21
 
 
+async def test_channels_endpoint_reports_the_guild_of_the_messages(api_harness, auth):
+    """The guild of a channel is the guild of its messages.
+
+    The endpoint filters over the messages table, so the guild it reports
+    has to come from the same table: a snapshot that disagrees with the
+    messages must not make the response describe another guild than the
+    one that was filtered.
+    """
+    harness = await api_harness([message(1, channel_id=20, guild_id=10)])
+    repo = Repository(harness.engine)
+    await repo.apply_batch(
+        [
+            WriteOp(
+                OpKind.CHANNEL,
+                ChannelSnapshot(
+                    channel_id=20,
+                    guild_id=999,
+                    name="general",
+                    topic=None,
+                    channel_type="text",
+                    position=None,
+                    captured_at="2026-11-11T10:00:00+00:00",
+                ),
+            )
+        ]
+    )
+
+    response = await harness.client.get("/api/channels", headers=auth)
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["guild_id"] == 10
+    assert item["name"] == "general"
+
+
 async def test_channels_endpoint_is_empty_without_messages(api_harness, auth):
     harness = await api_harness()
 
