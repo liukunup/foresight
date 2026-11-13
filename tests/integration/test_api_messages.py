@@ -14,6 +14,8 @@ from foresight.domain.models import MessageAnalysis, MessageRecord, OpKind, Writ
 from foresight.storage.db import init_db
 from foresight.storage.repository import Repository
 
+from .conftest import api_message
+
 
 async def test_health_requires_token(api_client):
     response = await api_client.get("/api/health")
@@ -146,3 +148,114 @@ async def test_message_detail_carries_the_analysis(tmp_path, monkeypatch):
     assert body["analysis"]["translated_text"] == "你好"
     assert body["analysis"]["sentiment"] == "positive"
     assert body["analysis"]["sentiment_score"] == 0.9
+
+
+async def test_messages_ordering_is_stable_for_equal_timestamps(api_harness, auth):
+    """The message id breaks the tie between two equal timestamps.
+
+    Without the tie-breaker a page could show the same row twice or skip
+    one, so the two pages together must be exactly the seeded rows. The
+    messages are seeded out of order on purpose: the row order of the
+    database must not decide the order of the pages.
+    """
+    records = [
+        api_message(2, "second", "2026-11-11T10:00:00+00:00"),
+        api_message(1, "first", "2026-11-11T10:00:00+00:00"),
+        api_message(4, "fourth", "2026-11-12T10:00:00+00:00"),
+        api_message(3, "third", "2026-11-12T10:00:00+00:00"),
+    ]
+    harness = await api_harness(records)
+
+    first = await harness.client.get(
+        "/api/messages", headers=auth, params={"limit": 2, "offset": 0}
+    )
+    second = await harness.client.get(
+        "/api/messages", headers=auth, params={"limit": 2, "offset": 2}
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_ids = [item["message_id"] for item in first.json()["items"]]
+    second_ids = [item["message_id"] for item in second.json()["items"]]
+
+    assert set(first_ids).isdisjoint(second_ids)
+    assert sorted(first_ids + second_ids) == [1, 2, 3, 4]
+    # Both sort keys run in the requested direction.
+    assert first_ids + second_ids == [4, 3, 2, 1]
+
+
+async def test_messages_ordering_is_stable_for_equal_timestamps_asc(api_harness, auth):
+    """The tie is broken in the requested direction."""
+    records = [
+        api_message(2, "second", "2026-11-11T10:00:00+00:00"),
+        api_message(1, "first", "2026-11-11T10:00:00+00:00"),
+        api_message(4, "fourth", "2026-11-12T10:00:00+00:00"),
+        api_message(3, "third", "2026-11-12T10:00:00+00:00"),
+    ]
+    harness = await api_harness(records)
+
+    first = await harness.client.get(
+        "/api/messages", headers=auth, params={"limit": 2, "offset": 0, "order": "asc"}
+    )
+    second = await harness.client.get(
+        "/api/messages", headers=auth, params={"limit": 2, "offset": 2, "order": "asc"}
+    )
+    first_ids = [item["message_id"] for item in first.json()["items"]]
+    second_ids = [item["message_id"] for item in second.json()["items"]]
+
+    assert set(first_ids).isdisjoint(second_ids)
+    assert sorted(first_ids + second_ids) == [1, 2, 3, 4]
+    assert first_ids + second_ids == [1, 2, 3, 4]
+
+
+async def test_messages_search_treats_the_wildcards_literally(api_harness, auth):
+    """`q` is a substring, not a pattern.
+
+    A search for `%` looks for a percent sign and a search for `a_b`
+    looks for an underscore, not for any character.
+    """
+    records = [
+        api_message(1, "a_b"),
+        api_message(2, "axb"),
+        api_message(3, "a%b"),
+        api_message(4, "plain"),
+        api_message(5, "back\\slash"),
+    ]
+    harness = await api_harness(records)
+
+    underscore = await harness.client.get(
+        "/api/messages", headers=auth, params={"q": "a_b"}
+    )
+    assert underscore.status_code == 200
+    assert underscore.json()["total"] == 1
+    assert [item["message_id"] for item in underscore.json()["items"]] == [1]
+
+    percent = await harness.client.get("/api/messages", headers=auth, params={"q": "%"})
+    assert percent.status_code == 200
+    assert percent.json()["total"] == 1
+    assert [item["message_id"] for item in percent.json()["items"]] == [3]
+
+    # The backslash is escaped as well, so it still matches itself.
+    backslash = await harness.client.get(
+        "/api/messages", headers=auth, params={"q": "back\\slash"}
+    )
+    assert backslash.status_code == 200
+    assert backslash.json()["total"] == 1
+    assert [item["message_id"] for item in backslash.json()["items"]] == [5]
+
+
+async def test_messages_search_matches_a_non_ascii_needle(api_harness, auth):
+    """The needle is lowercased by the database, not by Python.
+
+    SQLite's `lower()` only folds ASCII while Python's `lower()` folds
+    every script: when the needle is lowered in Python and the column in
+    SQL, the two sides disagree and the match is lost.
+    """
+    records = [api_message(1, "ÉCOLE 42")]
+    harness = await api_harness(records)
+
+    response = await harness.client.get(
+        "/api/messages", headers=auth, params={"q": "École 42"}
+    )
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert response.json()["items"][0]["message_id"] == 1

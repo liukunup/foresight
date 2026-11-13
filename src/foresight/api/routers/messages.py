@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from foresight.api.deps import get_engine, require_token
+from foresight.api.deps import get_engine
 from foresight.api.schemas import AnalysisOut, MessageDetail, MessageOut, Page
 from foresight.storage.tables import message_analysis, messages
 
@@ -15,10 +15,26 @@ router = APIRouter()
 MAX_LIMIT = 500
 DEFAULT_LIMIT = 50
 
+# The character that escapes the wildcards of a LIKE pattern. A backslash
+# is the escape character of every backend the project supports, and
+# SQLAlchemy renders the clause the way each of them expects it.
+LIKE_ESCAPE = "\\"
 
-@router.get(
-    "/messages", response_model=Page[MessageOut], dependencies=[Depends(require_token)]
-)
+
+def _escape_like(value: str) -> str:
+    """Escape the wildcards of a literal search term.
+
+    The search term is a substring and not a pattern, so the wildcards
+    of LIKE are escaped: a search for `%` looks for a percent sign. The
+    backslash is escaped first, otherwise the escapes added for the
+    wildcards would be escaped a second time.
+    """
+    escaped = value.replace("\\", "\\\\")
+    escaped = escaped.replace("%", "\\%").replace("_", "\\_")
+    return escaped
+
+
+@router.get("/messages", response_model=Page[MessageOut])
 async def list_messages(
     channel_id: int | None = None,
     author_id: int | None = None,
@@ -71,10 +87,18 @@ async def list_messages(
     if edited is False:
         clauses.append(messages.c.edited_at.is_(None))
     if q:
-        # The pattern is lowercased in Python and the column is lowercased
-        # in SQL: the match is case insensitive and behaves the same on
-        # SQLite, PostgreSQL and MySQL.
-        clauses.append(func.lower(messages.c.content).like(f"%{q.lower()}%"))
+        # The term is a literal substring: the wildcards of LIKE are
+        # escaped and the pattern is matched against the lowered column.
+        # Both sides are lowered by the database, so the match is case
+        # insensitive and the two sides cannot disagree about a letter
+        # the backend does not fold — SQLite's `lower()` only folds
+        # ASCII, PostgreSQL's and MySQL's fold every script.
+        pattern = f"%{_escape_like(q)}%"
+        clauses.append(
+            func.lower(messages.c.content).like(
+                func.lower(pattern), escape=LIKE_ESCAPE
+            )
+        )
 
     total_stmt = select(func.count()).select_from(messages).where(*clauses)
     # The message id breaks the tie between two messages that share a
@@ -106,11 +130,7 @@ async def list_messages(
     )
 
 
-@router.get(
-    "/messages/{message_id}",
-    response_model=MessageDetail,
-    dependencies=[Depends(require_token)],
-)
+@router.get("/messages/{message_id}", response_model=MessageDetail)
 async def get_message(
     message_id: int, engine: AsyncEngine = Depends(get_engine)
 ) -> MessageDetail:

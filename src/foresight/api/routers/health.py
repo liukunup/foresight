@@ -8,14 +8,14 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from foresight.api.deps import get_engine, require_token
+from foresight.api.deps import get_engine
 from foresight.api.schemas import HealthOut
 from foresight.storage.tables import attachments, messages
 
 router = APIRouter()
 
 
-@router.get("/health", response_model=HealthOut, dependencies=[Depends(require_token)])
+@router.get("/health", response_model=HealthOut)
 async def health(engine: AsyncEngine = Depends(get_engine)) -> HealthOut:
     """Report the state of the dump.
 
