@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from foresight.api.deps import get_engine
+from foresight.api.metrics import db_attachments_total, db_messages_total
 from foresight.api.schemas import HealthOut
 from foresight.storage.tables import attachments, messages
 
@@ -40,6 +41,10 @@ async def health(engine: AsyncEngine = Depends(get_engine)) -> HealthOut:
                 .limit(1)
             )
         ).first()
+    # The counts are known here, so they are published here: a scrape of
+    # /metrics must not query the database on its own.
+    db_messages_total.set(total)
+    db_attachments_total.set(media)
     size_mb = 0.0
     path = getattr(engine.url, "database", None)
     if path:

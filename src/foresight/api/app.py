@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+import secrets
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 
-from fastapi import APIRouter, Depends, FastAPI
+from fastapi import APIRouter, Depends, FastAPI, Request, Response
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from foresight.api.deps import require_token
+from foresight.api.metrics import (
+    api_request_duration_seconds,
+    api_requests_total,
+    get_metrics,
+    metrics_content_type,
+)
 from foresight.api.query import build_query_runner
 from foresight.api.routers import (
     channels,
@@ -88,4 +96,52 @@ def create_app(config: Config, engine: AsyncEngine | None = None) -> FastAPI:
     include_api_router(app, reactions.router, tags=["reactions"])
     include_api_router(app, stats.router, tags=["stats"])
     include_api_router(app, query.router, tags=["query"])
+
+    @app.middleware("http")
+    async def _count_requests(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        """Count every request and measure how long it took.
+
+        The middleware sits outside the routers, so it also sees the
+        requests that are refused: an API that answers 401 is still an API
+        that was asked a question.
+        """
+        started = time.perf_counter()
+        response = await call_next(request)
+        elapsed = time.perf_counter() - started
+        path = request.url.path
+        api_requests_total.labels(
+            method=request.method, path=path, status=str(response.status_code)
+        ).inc()
+        api_request_duration_seconds.labels(method=request.method, path=path).observe(
+            elapsed
+        )
+        return response
+
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics(request: Request) -> Response:
+        """Serve the metrics in the Prometheus exposition format.
+
+        The endpoint sits outside `/api`, so the bearer token of the API
+        does not apply to it: Prometheus scrapes it without a token. A
+        metrics token guards it separately, for the deployments that do
+        not want the endpoint open.
+        """
+        expected = getattr(app.state.config.api, "metrics_token", "") or ""
+        if expected:
+            supplied = request.headers.get("x-metrics-token", "")
+            # The comparison runs on bytes: `compare_digest` refuses
+            # strings that carry non-ASCII characters, and a client that
+            # sends such a token must get a 401 instead of a 500.
+            if not secrets.compare_digest(
+                supplied.encode("utf-8"), expected.encode("utf-8")
+            ):
+                return Response(
+                    content=b'{"detail":"invalid metrics token"}',
+                    status_code=401,
+                    media_type="application/json",
+                )
+        return Response(content=get_metrics(), media_type=metrics_content_type())
+
     return app
