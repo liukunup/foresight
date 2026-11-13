@@ -33,6 +33,19 @@ def bucket_expr(column: Any, bucket: str) -> ColumnElement[Any]:
     return func.substr(column, 1, 10)
 
 
+def _ranked(counter: Counter[str], limit: int) -> list[tuple[str, int]]:
+    """Order the counted topics deterministically.
+
+    The count decides the order and the topic itself breaks a tie. A counter
+    alone keeps the order in which the topics were first seen, which depends
+    on the order the database returned the rows in: that order is the rowid
+    order on SQLite and unspecified on PostgreSQL and MySQL.
+    """
+    if limit <= 0:
+        return []
+    return sorted(counter.items(), key=lambda item: (-item[1], item[0]))[:limit]
+
+
 class StatsService:
     """Aggregate queries used by both the API and the CLI."""
 
@@ -170,7 +183,16 @@ class StatsService:
         channel_id: int | None = None,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """Aggregate extracted issues first, fall back to frequent words."""
+        """Aggregate extracted issues first, fall back to frequent words.
+
+        An extracted issue is only counted when its message row exists: an
+        analysis row whose message is gone contributes nothing, and if it
+        was the only analysis the result falls back to frequent words.
+
+        The `issues_json` column holds free text that nothing constrains, so
+        a payload that is not a list of issues is skipped: it must neither
+        crash the query nor contribute a nonsense topic.
+        """
         clauses = self._filter(since, until, channel_id)
         # The analysis rows are joined to their message: the filters address
         # the message columns, and a join keeps one analysis row counted once
@@ -192,13 +214,18 @@ class StatsService:
                 issues = json.loads(row.issues_json or "[]")
             except json.JSONDecodeError:
                 continue
+            # Only a list holds issues. A JSON null, an object or a bare
+            # string is a payload the schema does not forbid, so such a row
+            # is skipped instead of being iterated.
+            if not isinstance(issues, list):
+                continue
             for issue in issues:
                 if isinstance(issue, str) and issue.strip():
                     counter[issue.strip()] += 1
         if counter:
             return [
                 {"topic": topic, "count": count}
-                for topic, count in counter.most_common(limit)
+                for topic, count in _ranked(counter, limit)
             ]
         return await self._frequent_words(clauses, limit)
 
@@ -221,5 +248,5 @@ class StatsService:
                 if len(token) > 2:
                     counter[token] += 1
         return [
-            {"topic": topic, "count": count} for topic, count in counter.most_common(limit)
+            {"topic": topic, "count": count} for topic, count in _ranked(counter, limit)
         ]

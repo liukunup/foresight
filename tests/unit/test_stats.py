@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from sqlalchemy.dialects import mysql, postgresql, sqlite
 
 from foresight.domain.models import (
@@ -71,6 +72,17 @@ def _analysis(message_id: int, issues: list[str]) -> MessageAnalysis:
     )
 
 
+def _raw_analysis(message_id: int, issues_json: str) -> MessageAnalysis:
+    """Build an analysis row with a verbatim `issues_json` payload.
+
+    The AI worker stores a JSON array, but the column is free text: nothing
+    in the schema constrains the format, so a row can hold any payload.
+    """
+    analysis = _analysis(message_id, [])
+    analysis.issues_json = issues_json
+    return analysis
+
+
 async def test_overview_counts(db_engine):
     stats, _ = await _make_stats(db_engine)
     result = await stats.overview()
@@ -87,11 +99,46 @@ async def test_overview_respects_since(db_engine):
     assert result["total_messages"] == 3
 
 
+async def test_overview_until_includes_the_boundary(db_engine):
+    """`until` is inclusive: a message created exactly at it is counted."""
+    stats, _ = await _make_stats(db_engine)
+    result = await stats.overview(until="2026-11-13T10:00:00+00:00")
+    assert result["total_messages"] == 3
+
+
+async def test_overview_until_excludes_later_messages(db_engine):
+    """A message created after `until` is not counted."""
+    stats, _ = await _make_stats(db_engine)
+    result = await stats.overview(until="2026-11-13T09:59:59+00:00")
+    assert result["total_messages"] == 2
+
+
 async def test_top_talkers(db_engine):
     stats, _ = await _make_stats(db_engine)
     result = await stats.top_talkers(limit=10)
     assert [row["author_id"] for row in result] == [30, 31]
     assert result[0]["message_count"] == 3
+
+
+async def test_top_talkers_respects_the_time_filters(db_engine):
+    """`since` and `until` narrow the talkers down to the matching messages."""
+    stats, _ = await _make_stats(db_engine)
+    assert await stats.top_talkers(since="2026-11-14T00:00:00+00:00") == [
+        {"author_id": 30, "username": None, "message_count": 1, "total_chars": 7},
+        {"author_id": 31, "username": None, "message_count": 1, "total_chars": 7},
+    ]
+    assert await stats.top_talkers(until="2026-11-13T10:00:00+00:00") == [
+        {"author_id": 30, "username": None, "message_count": 2, "total_chars": 14},
+        {"author_id": 31, "username": None, "message_count": 1, "total_chars": 7},
+    ]
+
+
+async def test_top_talkers_respects_the_channel_filter(db_engine):
+    stats, _ = await _make_stats(db_engine)
+    assert await stats.top_talkers(channel_id=20) == [
+        {"author_id": 30, "username": None, "message_count": 2, "total_chars": 14},
+        {"author_id": 31, "username": None, "message_count": 1, "total_chars": 7},
+    ]
 
 
 async def test_activity_buckets_by_day(db_engine):
@@ -111,6 +158,28 @@ async def test_activity_buckets_by_hour(db_engine):
     stats, _ = await _make_stats(db_engine)
     result = await stats.activity(bucket="hour")
     assert result[0]["bucket"] == "2026-11-11T10"
+
+
+async def test_activity_respects_the_time_filters(db_engine):
+    """`since` and `until` narrow the buckets down to the matching messages."""
+    stats, _ = await _make_stats(db_engine)
+    assert await stats.activity(since="2026-11-14T00:00:00+00:00") == [
+        {"bucket": "2026-11-14", "message_count": 1},
+        {"bucket": "2026-11-15", "message_count": 1},
+    ]
+    assert await stats.activity(until="2026-11-13T10:00:00+00:00") == [
+        {"bucket": "2026-11-11", "message_count": 1},
+        {"bucket": "2026-11-12", "message_count": 1},
+        {"bucket": "2026-11-13", "message_count": 1},
+    ]
+
+
+async def test_activity_respects_the_channel_filter(db_engine):
+    stats, _ = await _make_stats(db_engine)
+    assert await stats.activity(channel_id=21) == [
+        {"bucket": "2026-11-14", "message_count": 1},
+        {"bucket": "2026-11-15", "message_count": 1},
+    ]
 
 
 async def test_overview_respects_channel(db_engine):
@@ -196,6 +265,89 @@ async def test_topics_falls_back_to_frequent_words(db_engine):
     stats, _ = await _make_stats(db_engine)
     result = await stats.topics()
     assert result == [{"topic": "hello", "count": 5}]
+
+
+@pytest.mark.parametrize(
+    "issues_json",
+    [
+        pytest.param("null", id="json-null"),
+        pytest.param('{"a": 1}', id="json-object"),
+        pytest.param('"bug"', id="json-string"),
+        pytest.param("{not json", id="malformed"),
+    ],
+)
+async def test_topics_skips_payloads_that_are_not_issue_lists(db_engine, issues_json):
+    """A row whose payload is not a list of issues is skipped, not counted.
+
+    The column is free text, so a row can hold anything. A payload that is
+    not a list must neither crash the query nor contribute a nonsense topic.
+    """
+    stats, engine = await _make_stats(db_engine)
+    await Repository(engine).apply_batch(
+        [
+            WriteOp(OpKind.ANALYSIS, _raw_analysis(1, issues_json)),
+            WriteOp(OpKind.ANALYSIS, _analysis(2, ["bug"])),
+            WriteOp(OpKind.ANALYSIS, _raw_analysis(3, issues_json)),
+            WriteOp(OpKind.ANALYSIS, _analysis(4, ["bug"])),
+        ]
+    )
+    assert await stats.topics() == [{"topic": "bug", "count": 2}]
+
+
+async def test_topics_breaks_a_tie_by_the_topic(db_engine):
+    """Topics with an equal count come back in a stable, alphabetical order."""
+    stats, engine = await _make_stats(db_engine)
+    await Repository(engine).apply_batch(
+        [
+            WriteOp(OpKind.ANALYSIS, _analysis(2, ["zebra"])),
+            WriteOp(OpKind.ANALYSIS, _analysis(4, ["apple"])),
+        ]
+    )
+    assert await stats.topics() == [
+        {"topic": "apple", "count": 1},
+        {"topic": "zebra", "count": 1},
+    ]
+
+
+async def test_topics_respects_the_limit(db_engine):
+    """The limit caps the number of topics; a non-positive limit returns none."""
+    stats, engine = await _make_stats(db_engine)
+    await Repository(engine).apply_batch(
+        [
+            WriteOp(OpKind.ANALYSIS, _analysis(2, ["zebra"])),
+            WriteOp(OpKind.ANALYSIS, _analysis(4, ["apple"])),
+        ]
+    )
+    assert await stats.topics(limit=1) == [{"topic": "apple", "count": 1}]
+    assert await stats.topics(limit=0) == []
+    assert await stats.topics(limit=-1) == []
+
+
+async def test_topics_fallback_breaks_a_tie_by_the_word(db_engine):
+    """The word fallback sorts equal counts alphabetically too."""
+    repo = Repository(db_engine)
+    records = [
+        MessageRecord(
+            message_id=index + 1,
+            guild_id=10,
+            channel_id=20,
+            author_id=30,
+            content=content,
+            message_type=0,
+            created_at=f"2026-11-1{index + 1}T10:00:00+00:00",
+            captured_at="2026-11-11T10:00:00+00:00",
+            char_count=7,
+            word_count=1,
+        )
+        for index, content in enumerate(["zebra", "apple", "mango"])
+    ]
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, rec) for rec in records])
+    stats = StatsService(db_engine)
+    assert await stats.topics() == [
+        {"topic": "apple", "count": 1},
+        {"topic": "mango", "count": 1},
+        {"topic": "zebra", "count": 1},
+    ]
 
 
 def test_bucket_expr_is_portable():

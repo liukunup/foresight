@@ -1,4 +1,10 @@
-"""The only module that knows SQL."""
+"""The write side of the storage layer.
+
+This module owns the writes: it applies the batches of the collector, the
+AI worker and the API to the tables of `storage/tables.py`. The read side
+lives next door in `storage/stats.py`, which issues its own SELECT
+statements.
+"""
 
 from __future__ import annotations
 
