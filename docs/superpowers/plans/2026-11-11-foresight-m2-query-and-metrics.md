@@ -1280,7 +1280,15 @@ async def stats_top_talkers(
     rows = await stats.top_talkers(
         since=since, until=until, channel_id=channel_id, limit=limit
     )
-    return {"total": len(rows), "limit": limit, "offset": 0, "has_more": False, "items": rows}
+    truncated = len(rows) >= limit
+    return {
+        "total": len(rows),
+        "limit": limit,
+        "offset": 0,
+        "has_more": truncated,
+        "truncated": truncated,
+        "items": rows,
+    }
 
 
 @router.get("/stats/activity", dependencies=[Depends(require_token)])
@@ -1291,10 +1299,19 @@ async def stats_activity(
     bucket: str = Query("day", pattern="^(hour|day)$"),
     stats: StatsService = Depends(get_stats),
 ) -> dict:
-    rows = await stats.activity(
+    buckets = await stats.activity(
         since=since, until=until, bucket=bucket, channel_id=channel_id
     )
-    return {"total": len(rows), "limit": len(rows), "offset": 0, "has_more": False, "items": rows}
+    rows = buckets[:limit]
+    truncated = len(rows) >= limit
+    return {
+        "total": len(rows),
+        "limit": limit,
+        "offset": 0,
+        "has_more": truncated,
+        "truncated": truncated,
+        "items": rows,
+    }
 
 
 @router.get("/stats/topics", dependencies=[Depends(require_token)])
@@ -1308,7 +1325,15 @@ async def stats_topics(
     rows = await stats.topics(
         since=since, until=until, channel_id=channel_id, limit=limit
     )
-    return {"total": len(rows), "limit": limit, "offset": 0, "has_more": False, "items": rows}
+    truncated = len(rows) >= limit
+    return {
+        "total": len(rows),
+        "limit": limit,
+        "offset": 0,
+        "has_more": truncated,
+        "truncated": truncated,
+        "items": rows,
+    }
 ```
 
 修改 `src/foresight/api/app.py`：导入 `stats` 并加入 `app.include_router(stats.router, prefix="/api", tags=["stats"])`。
