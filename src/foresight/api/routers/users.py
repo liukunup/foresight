@@ -118,13 +118,13 @@ async def get_user(
     )
     async with engine.connect() as conn:
         row = (await conn.execute(stmt)).first()
+        if row is None:
+            raise HTTPException(status_code=404, detail="user not found")
         username = (
             await conn.execute(
                 select(users.c.username).where(users.c.user_id == author_id)
             )
         ).first()
-    if row is None:
-        raise HTTPException(status_code=404, detail="user not found")
     return UserOut(
         author_id=row.author_id,
         username=username[0] if username is not None else None,

@@ -168,6 +168,41 @@ async def test_users_endpoint_limit_is_capped(api_harness, auth):
     assert response.json()["limit"] == 500
 
 
+async def test_users_endpoint_paginates_over_the_speakers(api_harness, auth):
+    """The envelope pages over the speakers, not over the messages.
+
+    A speaker that wrote four messages is one row of the list, so the
+    total is the number of speakers and the offset moves from speaker to
+    speaker.
+    """
+    records = [
+        message(1, author_id=30),
+        message(2, author_id=30),
+        message(3, author_id=31),
+        message(4, author_id=32),
+    ]
+    harness = await api_harness(records)
+
+    first = await harness.client.get(
+        "/api/users", headers=auth, params={"limit": 2, "offset": 0}
+    )
+    second = await harness.client.get(
+        "/api/users", headers=auth, params={"limit": 2, "offset": 2}
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_body = first.json()
+    second_body = second.json()
+    assert first_body["total"] == 3
+    assert first_body["limit"] == 2
+    assert first_body["offset"] == 0
+    assert first_body["has_more"] is True
+    assert second_body["offset"] == 2
+    assert second_body["has_more"] is False
+    assert [item["author_id"] for item in first_body["items"]] == [30, 31]
+    assert [item["author_id"] for item in second_body["items"]] == [32]
+
+
 async def test_users_endpoint_is_empty_without_messages(api_harness, auth):
     """An empty database answers with zeros, not with an error."""
     harness = await api_harness()
