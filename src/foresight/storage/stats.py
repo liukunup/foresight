@@ -110,6 +110,15 @@ class StatsService:
         channel_id: int | None = None,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
+        """Return the most active authors, ordered by message count.
+
+        A non-positive limit returns nothing without touching the database:
+        a negative limit would render as `LIMIT -1`, which SQLite reads as
+        "no limit" while PostgreSQL rejects, so the same call would succeed
+        on one backend and fail on another.
+        """
+        if limit <= 0:
+            return []
         clauses = self._filter(since, until, channel_id)
         stmt = (
             select(
@@ -191,7 +200,9 @@ class StatsService:
 
         The `issues_json` column holds free text that nothing constrains, so
         a payload that is not a list of issues is skipped: it must neither
-        crash the query nor contribute a nonsense topic.
+        crash the query nor contribute a nonsense topic. A pathologically
+        nested payload raises `RecursionError` in the decoder instead of
+        `JSONDecodeError`, so it is skipped as well.
         """
         clauses = self._filter(since, until, channel_id)
         # The analysis rows are joined to their message: the filters address
@@ -212,7 +223,7 @@ class StatsService:
         for row in rows:
             try:
                 issues = json.loads(row.issues_json or "[]")
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 continue
             # Only a list holds issues. A JSON null, an object or a bare
             # string is a payload the schema does not forbid, so such a row

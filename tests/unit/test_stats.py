@@ -9,8 +9,10 @@ date bucketing.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.dialects import mysql, postgresql, sqlite
 
 from foresight.domain.models import (
@@ -83,6 +85,26 @@ def _raw_analysis(message_id: int, issues_json: str) -> MessageAnalysis:
     return analysis
 
 
+@contextmanager
+def _record_selects(engine):
+    """Collect the SELECT statements the engine runs inside the block.
+
+    The listener sits on the synchronous engine behind the async wrapper:
+    the async engine fires the events of its synchronous counterpart.
+    """
+    recorded: list[str] = []
+
+    def _before(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            recorded.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _before)
+    try:
+        yield recorded
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _before)
+
+
 async def test_overview_counts(db_engine):
     stats, _ = await _make_stats(db_engine)
     result = await stats.overview()
@@ -139,6 +161,21 @@ async def test_top_talkers_respects_the_channel_filter(db_engine):
         {"author_id": 30, "username": None, "message_count": 2, "total_chars": 14},
         {"author_id": 31, "username": None, "message_count": 1, "total_chars": 7},
     ]
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+async def test_top_talkers_clamps_a_non_positive_limit(db_engine, limit):
+    """A non-positive limit returns nothing and never reaches the database.
+
+    A negative limit renders as `LIMIT -1`: SQLite reads that as "no limit"
+    while PostgreSQL rejects it, so the same call would succeed on one
+    backend and fail on another. The limit is therefore clamped before the
+    statement is built and every backend agrees on an empty result.
+    """
+    stats, _ = await _make_stats(db_engine)
+    with _record_selects(db_engine) as selects:
+        assert await stats.top_talkers(limit=limit) == []
+        assert selects == []
 
 
 async def test_activity_buckets_by_day(db_engine):
@@ -292,6 +329,25 @@ async def test_topics_skips_payloads_that_are_not_issue_lists(db_engine, issues_
         ]
     )
     assert await stats.topics() == [{"topic": "bug", "count": 2}]
+
+
+async def test_topics_skips_a_deeply_nested_payload(db_engine):
+    """A pathologically nested payload is skipped, not raised.
+
+    The JSON decoder recurses once per nesting level, so a payload nested
+    thousands of levels deep raises `RecursionError` instead of
+    `JSONDecodeError`. Such a row must be skipped like a malformed one: the
+    query never crashes.
+    """
+    stats, engine = await _make_stats(db_engine)
+    deep = "[" * 100_000 + "]" * 100_000
+    await Repository(engine).apply_batch(
+        [
+            WriteOp(OpKind.ANALYSIS, _raw_analysis(1, deep)),
+            WriteOp(OpKind.ANALYSIS, _analysis(2, ["bug"])),
+        ]
+    )
+    assert await stats.topics() == [{"topic": "bug", "count": 1}]
 
 
 async def test_topics_breaks_a_tie_by_the_topic(db_engine):
