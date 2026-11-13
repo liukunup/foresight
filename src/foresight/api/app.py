@@ -65,6 +65,31 @@ def include_api_router(app: FastAPI, router: APIRouter, *, tags: Sequence[str]) 
     )
 
 
+def _route_path(request: Request) -> str:
+    """Return the path of the route that answered the request.
+
+    The label of a request is the path of its route, with the values of
+    the parameters replaced by their names: a path that carries an id
+    would give one time series per id, and Prometheus would drown in
+    them. A request that matched no route carries no bound either, so
+    every such request is reported under one name.
+    """
+    scope = request.scope
+    if scope.get("route") is None:
+        # No route matched, so the path is whatever the caller sent.
+        return "unmatched"
+    path = scope.get("path")
+    if not isinstance(path, str):
+        return "unmatched"
+    segments = path.split("/")
+    for name, value in (scope.get("path_params") or {}).items():
+        text = str(value)
+        segments = [
+            f"{{{name}}}" if segment == text else segment for segment in segments
+        ]
+    return "/".join(segments)
+
+
 def create_app(config: Config, engine: AsyncEngine | None = None) -> FastAPI:
     """Build the read-only API application.
 
@@ -110,7 +135,7 @@ def create_app(config: Config, engine: AsyncEngine | None = None) -> FastAPI:
         started = time.perf_counter()
         response = await call_next(request)
         elapsed = time.perf_counter() - started
-        path = request.url.path
+        path = _route_path(request)
         api_requests_total.labels(
             method=request.method, path=path, status=str(response.status_code)
         ).inc()

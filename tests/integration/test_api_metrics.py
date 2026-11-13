@@ -41,6 +41,25 @@ async def test_metrics_records_refused_requests(api_client):
     )
 
 
+async def test_metrics_label_a_path_with_the_route_and_not_with_the_id(
+    api_client, auth
+):
+    # The label of a route with a parameter is the template: one time
+    # series per message id would melt Prometheus.
+    await api_client.get("/api/messages/1", headers=auth)
+    response = await api_client.get("/metrics")
+    assert 'path="/api/messages/{message_id}"' in response.text
+    assert 'path="/api/messages/1"' not in response.text
+
+
+async def test_metrics_label_an_unmatched_path_without_its_value(api_client):
+    # A path that matches no route carries no bound, so it is not a label.
+    await api_client.get("/api/nothing-here")
+    response = await api_client.get("/metrics")
+    assert 'path="unmatched"' in response.text
+    assert 'path="/api/nothing-here"' not in response.text
+
+
 async def test_health_updates_the_database_gauges(api_client, auth):
     await api_client.get("/api/health", headers=auth)
     response = await api_client.get("/metrics")
