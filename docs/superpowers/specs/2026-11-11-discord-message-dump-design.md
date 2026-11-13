@@ -161,6 +161,7 @@ foresight/
 - Discord 雪花 ID 存 `BIGINT`（< 2^63，安全且可索引）
 - 时间统一存 **UTC ISO-8601 TEXT**，例：`2026-11-11T13:45:00+00:00`。SQLite 的 `date()`/`strftime()`、PG 的 `to_char()`、MySQL 的 `DATE_FORMAT()` 都能处理
 - JSON 字段一律用 **文本类型** 存 JSON 字符串，序列化在应用层做（不引入 PG `JSONB` 等方言专属类型，保证三方言行为一致）。实现上用 `Text().with_variant(mysql.LONGTEXT, "mysql")`：SQLite / PG 仍是 `TEXT`，MySQL 用 `LONGTEXT` 绕开其 65,535 字节上限
+- 读取 JSON 列时**必须校验解码结果的类型**：列是 `TEXT`，数据库不约束其内容，解析失败或类型不符的记录必须跳过，而不是让整个查询崩溃
 - 布尔列用 SQLAlchemy `Boolean`（SQLite 存 0/1，PG 原生 bool，MySQL TINYINT）
 
 ### 5.2 表结构
@@ -501,7 +502,7 @@ PG / MySQL 下使用只读事务（`SET TRANSACTION READ ONLY` / `SET SESSION TR
 | `GET /api/stats/overview` | 总量、独立发言人数、平均字数、删除率、编辑率、日活 |
 | `GET /api/stats/top-talkers` | 发言排行 |
 | `GET /api/stats/activity` | 时间分布（`bucket=hour\|day`） |
-| `GET /api/stats/topics` | 高频词/议题（优先聚合 `message_analysis.issues`，无分析数据时回退到内容分词） |
+| `GET /api/stats/topics` | 高频词/议题（优先聚合 `message_analysis.issues` 中提取的议题；**没有提取出任何议题时**回退到正文分词统计） |
 
 ### 11.5 只读 SQL 端点
 
