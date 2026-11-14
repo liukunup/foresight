@@ -115,6 +115,9 @@ OWN_FETCH = re.compile(
     re.IGNORECASE,
 )
 
+# The marker of a dollar quoted string of PostgreSQL.
+DOLLAR_QUOTE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
+
 
 class QueryError(Exception):
     """Raised when a statement is not a safe read-only query."""
@@ -193,14 +196,61 @@ def _skip_quoted(statement: str, start: int, quote: str) -> int:
     return index
 
 
+def _skip_line_comment(statement: str, start: int) -> int:
+    """Return the index just after the line comment that starts at `start`.
+
+    A line comment ends with the line it is on: the newline is part of
+    the statement that follows it.
+    """
+    end = statement.find("\n", start)
+    return len(statement) if end == -1 else end + 1
+
+
+def _skip_block_comment(statement: str, start: int) -> int:
+    """Return the index just after the block comment that starts at `start`.
+
+    A block comment that is never closed runs to the end of the
+    statement: the statement is broken anyway.
+    """
+    end = statement.find("*/", start + 2)
+    return len(statement) if end == -1 else end + 2
+
+
+def _skip_dollar_quoted(statement: str, start: int) -> int | None:
+    """Return the index just after the dollar quoted string at `start`.
+
+    The strings of PostgreSQL are written between two markers: `$$` or
+    a marker with a tag, as in `$tag$`. None of them is closed by a
+    quote, so the scanner has to know about them: a `drop` between two
+    markers is a value and not an operation.
+
+    Returns None when the text at `start` is not the beginning of such
+    a string — the placeholders of PostgreSQL, as in `$1`, are not.
+    """
+    match = DOLLAR_QUOTE.match(statement, start)
+    if match is None:
+        return None
+    marker = match.group(0)
+    end = statement.find(marker, match.end())
+    if end == -1:
+        return None
+    return end + len(marker)
+
+
 def _strip_quoted_text(statement: str) -> str:
-    """Return the statement without its literals and quoted identifiers.
+    """Return the statement without its literals, its identifiers and its comments.
 
     A single-quoted string, a double-quoted identifier and a
     backtick-quoted identifier all hold text, not code: what is inside
     them cannot be an operation, so it must not be read as one. Each of
     them is closed by its own quote, and a quote inside one of them is
     escaped by doubling it.
+
+    A comment holds a remark, and a remark is not code either: a `;` or
+    a `drop` inside a comment is not a second statement and not an
+    operation. The comments are therefore taken out before the
+    statement is read — and a quote inside a comment does not open a
+    literal that would swallow the rest of the statement.
     """
     parts: list[str] = []
     index = 0
@@ -210,6 +260,20 @@ def _strip_quoted_text(statement: str) -> str:
             index = _skip_quoted(statement, index, char)
             parts.append(" ")
             continue
+        if statement.startswith("--", index):
+            index = _skip_line_comment(statement, index)
+            parts.append(" ")
+            continue
+        if statement.startswith("/*", index):
+            index = _skip_block_comment(statement, index)
+            parts.append(" ")
+            continue
+        if char == "$":
+            end = _skip_dollar_quoted(statement, index)
+            if end is not None:
+                index = end
+                parts.append(" ")
+                continue
         parts.append(char)
         index += 1
     return "".join(parts)

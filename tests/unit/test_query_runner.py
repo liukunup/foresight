@@ -252,3 +252,39 @@ def test_the_limit_is_clamped():
 def test_a_statement_that_is_not_a_read_is_refused():
     with pytest.raises(QueryError):
         validate_read_only("DELETE FROM messages")
+
+
+def test_a_comment_cannot_hide_a_second_statement():
+    """A comment is not code, and the code after it is still code.
+
+    The quote of the comment used to open a literal that swallowed the
+    rest of the statement: the semicolon of the second statement was
+    never seen, and the filter let the statement through.
+    """
+    with pytest.raises(QueryError):
+        validate_read_only(
+            "SELECT 1 -- '\n; INSERT INTO messages (message_id) VALUES (1)"
+        )
+
+
+def test_a_block_comment_cannot_hide_a_write():
+    """The same goes for a comment that spans more than one line."""
+    with pytest.raises(QueryError):
+        validate_read_only("SELECT 1 /* ' */ ; DROP TABLE messages")
+
+
+def test_a_comment_may_hold_a_forbidden_word():
+    """A remark is not an operation."""
+    assert validate_read_only("SELECT 1 -- drop the table")
+    assert validate_read_only("SELECT 1 /* insert a row */")
+
+
+def test_a_dollar_quoted_string_is_not_code():
+    """The strings of PostgreSQL hold a value, like every other literal."""
+    assert validate_read_only("SELECT $$drop$$ AS x")
+    assert validate_read_only("SELECT $tag$insert$tag$ AS x")
+
+
+def test_a_parameter_of_postgresql_is_not_a_dollar_quote():
+    """The placeholders of PostgreSQL are not strings."""
+    assert validate_read_only("SELECT $1 FROM messages")
