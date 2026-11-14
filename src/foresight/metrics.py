@@ -61,3 +61,14 @@ writer_batch_size = Histogram(
     "Rows per write batch",
     registry=REGISTRY,
 )
+media_downloads_total = Counter(
+    "foresight_media_downloads_total",
+    "Attachment downloads",
+    ["status"],
+    registry=REGISTRY,
+)
+media_bytes_total = Counter(
+    "foresight_media_bytes_total",
+    "Bytes downloaded",
+    registry=REGISTRY,
+)

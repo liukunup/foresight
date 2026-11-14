@@ -22,6 +22,8 @@ from prometheus_client import (
 
 from foresight.metrics import (
     REGISTRY,
+    media_bytes_total,
+    media_downloads_total,
     messages_captured,
     messages_deleted,
     messages_edited,
@@ -81,17 +83,6 @@ ai_tokens_total = Counter(
     "foresight_ai_tokens_total",
     "LLM tokens consumed",
     ["type"],
-    registry=REGISTRY,
-)
-media_downloads_total = Counter(
-    "foresight_media_downloads_total",
-    "Attachment downloads",
-    ["status"],
-    registry=REGISTRY,
-)
-media_bytes_total = Counter(
-    "foresight_media_bytes_total",
-    "Bytes downloaded",
     registry=REGISTRY,
 )
 api_requests_total = Counter(
