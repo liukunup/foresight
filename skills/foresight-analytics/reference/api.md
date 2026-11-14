@@ -77,6 +77,10 @@ The bounds are compared as strings, so they must be full ISO-8601
 timestamps such as `2026-11-11T00:00:00+00:00`. A bare date compares
 before every message of that day and would drop it from an `until` bound.
 
+`q` matches a case insensitive substring. SQLite folds ASCII only, so a
+search for a non-ASCII upper case letter does not match its lower case
+form there; PostgreSQL and MySQL fold every script.
+
 Each item contains the message fields listed in `schema.md`.
 
 ### `GET /api/messages/{message_id}`
