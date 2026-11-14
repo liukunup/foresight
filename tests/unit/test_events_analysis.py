@@ -70,15 +70,21 @@ def test_message_without_analysis_sink_still_works():
     assert writer.ops
 
 
-def test_a_message_without_content_is_not_analysed():
-    """There is nothing to analyse in an empty message."""
+def test_a_message_without_content_is_analysed():
+    """The worker decides what is worth analysing.
+
+    The handler hands over every message that reached the writer: a
+    message that carries no text is skipped by the worker, which marks
+    it as skipped — a message that stays `pending` is queued again on
+    every restart.
+    """
     seen = []
     writer = RecordingWriter()
     handler = EventHandler(
         _config(), writer, analysis_sink=lambda mid, content: seen.append((mid, content))
     )
     handler.handle_message(_message("   "))
-    assert seen == []
+    assert seen == [(100, "   ")]
 
 
 def test_a_message_the_writer_refuses_is_not_analysed():

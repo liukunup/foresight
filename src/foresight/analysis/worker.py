@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
@@ -16,12 +17,56 @@ from foresight.metrics import ai_queue_depth
 
 logger = logging.getLogger(__name__)
 
-# The number of attempts at most: the message is marked as failed when
-# they are all used up.
-MAX_ATTEMPTS = 3
+# The number of retries after the first attempt: one attempt plus three
+# retries make four attempts in total, with the backoff in
+# `RETRY_DELAYS` waited out between them. The name is spelled out, so
+# that it cannot be confused with the retries of the writer, which count
+# the same way.
+MAX_RETRIES = 3
+
+# The delays between the attempts grow every time: 1 s, 2 s and 4 s.
+RETRY_DELAYS = (1.0, 2.0, 4.0)
 
 # A message with less text than this has nothing to analyse.
 SKIP_MIN_LENGTH = 2
+
+# The characters of an emoji, and the two that glue them together. A
+# message that carries nothing else is a message of emojis.
+EMOJI = re.compile(
+    "["
+    "\u2600-\u27bf"  # the symbols and the dingbats
+    "\u2b00-\u2bff"  # the symbols and the arrows
+    "\U0001f000-\U0001faff"  # the pictographs and the emoticons
+    "\ufe0f"  # the variation selector
+    "\u200d"  # the zero width joiner
+    "]"
+)
+
+# A message that is nothing but a link.
+URL = re.compile(r"^(?:https?://|ftp://|www\.)\S+$", re.IGNORECASE)
+
+
+def should_skip(content: str) -> bool:
+    """Whether the message carries nothing the model could analyse.
+
+    The rules are the ones of the spec (§10.4): an empty message, a
+    message that is only emojis, a message that is only a link and a
+    message of less than two characters are skipped, and the model is
+    not called for them.
+
+    The decision is taken here and nowhere else: the caller hands over
+    every message that reached the writer, and the worker marks the ones
+    that carry nothing as `skipped`. A message that was handed over and
+    not marked would stay `pending` for ever.
+    """
+    text = (content or "").strip()
+    if len(text) < SKIP_MIN_LENGTH:
+        return True
+    if URL.match(text):
+        return True
+    # What is left of the text once the emojis are taken out of it tells
+    # whether the message was only emojis.
+    return not EMOJI.sub("", text).strip()
 
 # The end of the queue: it tells a worker that no more work is coming.
 _STOP = object()
@@ -153,13 +198,12 @@ class AnalysisWorker:
 
     async def _process(self, message_id: int, content: str) -> None:
         """Analyse one message and write the result."""
-        text = (content or "").strip()
-        if len(text) < SKIP_MIN_LENGTH:
+        if should_skip(content):
             # There is nothing to analyse: the message is skipped, not failed.
             await self._set_status(message_id, "skipped")
             return
         last_error = "analysis failed"
-        for attempt in range(MAX_ATTEMPTS):
+        for attempt in range(MAX_RETRIES + 1):
             try:
                 result = await self._llm.analyze(content)
             except LlmPermanentError as exc:
@@ -176,11 +220,11 @@ class AnalysisWorker:
                 logger.warning(
                     "llm analysis failed (attempt %d/%d): %s",
                     attempt + 1,
-                    MAX_ATTEMPTS,
+                    MAX_RETRIES + 1,
                     exc,
                 )
-                if attempt < MAX_ATTEMPTS - 1:
-                    await self._wait(1.0 * (attempt + 1))
+                if attempt < MAX_RETRIES:
+                    await self._wait(RETRY_DELAYS[attempt])
                 continue
             await self._store(message_id, result)
             return

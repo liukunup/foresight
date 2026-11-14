@@ -512,6 +512,106 @@ async def test_worker_skips_a_message_without_content(db_engine):
     assert rows == []
 
 
+async def test_worker_skips_an_empty_message(db_engine):
+    """An empty message is marked as skipped, and not left pending.
+
+    The message is handed over even when it carries no text: the worker
+    is the one that decides, and it must mark the message as skipped —
+    a message that stays `pending` is queued again on every restart.
+    """
+    repo = Repository(db_engine)
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
+
+    with respx.mock:
+        route = respx.post("https://llm.example/v1/chat/completions").mock(
+            return_value=_response({"translation": "你好"})
+        )
+        worker = AnalysisWorker(repo, LlmClient(_config()), max_concurrency=1)
+        await worker.start()
+        worker.submit(1, "")
+        await worker.stop()
+        assert not route.called
+
+    async with db_engine.connect() as conn:
+        status = (
+            await conn.execute(select(messages.c.analysis_status))
+        ).scalar_one()
+    assert status == "skipped"
+
+
+async def test_worker_skips_a_message_that_is_only_a_url(db_engine):
+    """A link and nothing else carries nothing to analyse."""
+    repo = Repository(db_engine)
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
+
+    with respx.mock:
+        route = respx.post("https://llm.example/v1/chat/completions").mock(
+            return_value=_response({"translation": "你好"})
+        )
+        worker = AnalysisWorker(repo, LlmClient(_config()), max_concurrency=1)
+        await worker.start()
+        worker.submit(1, "https://example.com/a-very-long-link")
+        await worker.stop()
+        assert not route.called
+
+    async with db_engine.connect() as conn:
+        status = (
+            await conn.execute(select(messages.c.analysis_status))
+        ).scalar_one()
+    assert status == "skipped"
+
+
+async def test_worker_skips_a_message_that_is_only_emoji(db_engine):
+    """Emojis and nothing else carry nothing to analyse."""
+    repo = Repository(db_engine)
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
+
+    with respx.mock:
+        route = respx.post("https://llm.example/v1/chat/completions").mock(
+            return_value=_response({"translation": "你好"})
+        )
+        worker = AnalysisWorker(repo, LlmClient(_config()), max_concurrency=1)
+        await worker.start()
+        worker.submit(1, "😀😀")
+        await worker.stop()
+        assert not route.called
+
+    async with db_engine.connect() as conn:
+        status = (
+            await conn.execute(select(messages.c.analysis_status))
+        ).scalar_one()
+    assert status == "skipped"
+
+
+async def test_worker_analyses_a_message_with_a_link_in_it(db_engine):
+    """A message that carries text is analysed, link or not."""
+    repo = Repository(db_engine)
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
+
+    with respx.mock:
+        route = respx.post("https://llm.example/v1/chat/completions").mock(
+            return_value=_response(
+                {
+                    "translation": "你好",
+                    "sentiment": "neutral",
+                    "sentiment_score": 0.5,
+                    "issues": [],
+                }
+            )
+        )
+        worker = AnalysisWorker(repo, LlmClient(_config()), max_concurrency=1)
+        await worker.start()
+        worker.submit(1, "look at https://example.com")
+        await worker.stop()
+        assert route.called
+
+    async with db_engine.connect() as conn:
+        status = (
+            await conn.execute(select(messages.c.analysis_status))
+        ).scalar_one()
+    assert status == "done"
+
+
 async def test_worker_marks_the_message_as_failed(db_engine, monkeypatch):
     monkeypatch.setattr("foresight.analysis.worker._sleep", _no_wait)
     repo = Repository(db_engine)
@@ -594,7 +694,32 @@ async def test_worker_waits_between_the_attempts(db_engine, monkeypatch):
     worker.submit(1, "hello")
     await worker.stop()
 
-    assert delays == [1.0, 2.0]
+    assert delays == [1.0, 2.0, 4.0]
+
+
+async def test_worker_retries_the_analysis_three_times(db_engine):
+    """One attempt and three retries are four attempts.
+
+    The spec asks for three retries (spec §10.3), and the write queue
+    counts them the same way: a message that failed is not given up on
+    before the third retry.
+    """
+    repo = Repository(db_engine)
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
+
+    llm = _BrokenLlm(RuntimeError("boom"))
+    worker = AnalysisWorker(repo, llm, max_concurrency=1, sleep=_no_wait)
+    await worker.start()
+    worker.submit(1, "hello")
+    await worker.stop()
+
+    assert llm.calls == 4
+
+    async with db_engine.connect() as conn:
+        status = (
+            await conn.execute(select(messages.c.analysis_status))
+        ).scalar_one()
+    assert status == "failed"
 
 
 async def test_worker_fails_a_message_the_model_answered_with_the_wrong_shape(
