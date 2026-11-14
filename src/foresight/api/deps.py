@@ -25,8 +25,14 @@ _CHALLENGE = {"WWW-Authenticate": "Bearer"}
 _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # A date with a time: `2026-11-01T10:00:00`, with an optional fraction
-# and an optional offset.
+# and an optional offset. The separator may be a `T` or a space.
 _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}")
+
+# The separator between the date and the time of a bound. The stored
+# timestamps carry a `T`, and a space sorts before a `T` — so a bound that
+# keeps its space would sort before every timestamp of the day it names
+# and would exclude that day without saying so.
+_SEPARATOR = re.compile(r"[T ]")
 
 # The first and the last moment of a day. The stored timestamps carry
 # microseconds, so the bound of a day has to carry them too: a bound
@@ -54,6 +60,10 @@ def _normalize_bound(value: str, name: str, *, end_of_day: bool) -> str:
 
     A value that is neither a timestamp nor a date is refused: a bound
     that cannot be read must not answer with a silently empty range.
+
+    The separator of a timestamp is normalized to the `T` the stored
+    timestamps use: the bounds are compared as strings, and a space sorts
+    before a `T`.
     """
     if _DATE_ONLY.match(value):
         try:
@@ -68,7 +78,7 @@ def _normalize_bound(value: str, name: str, *, end_of_day: bool) -> str:
         except ValueError:
             pass
         else:
-            return value
+            return _SEPARATOR.sub("T", value, count=1)
     raise ValueError(
         f"invalid '{name}': {value!r} is neither an ISO-8601 timestamp "
         "nor a date of the form YYYY-MM-DD"

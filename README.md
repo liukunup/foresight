@@ -145,14 +145,16 @@ export FORESIGHT_API_TOKEN="..."                 # 脚本会提示下一步
 
 时间边界 `since` / `until` 两种写法都可以：
 
-- 完整时间戳，如 `2026-11-01T10:00:00+00:00` —— 按字面比较，两端都是闭区间；
+- 完整时间戳，如 `2026-11-01T10:00:00+00:00` —— 按字面比较，两端都是闭区间；日期和时间之间的分隔符写成空格（`2026-11-01 10:00:00`）也行，会被统一成 `T`；
 - 纯日期，如 `2026-11-01` —— `since` 取这天 `00:00:00` 起点，`until` 取这天 `23:59:59.999999` 终点，也就是**整天都算在内**。
 
 其他写法（比如 `since=last-tuesday`）会被拒绝，返回 422 并在报错里点名是哪个参数不对。
 
 ## Prometheus 指标
 
-`GET /metrics` 暴露全部指标，例如 `foresight_messages_captured_total`、`foresight_writer_queue_depth`、`foresight_api_requests_total`、`foresight_db_messages_total`。
+`GET /metrics` 暴露全部指标，例如 `foresight_messages_captured_total`、`foresight_writer_queue_depth`、`foresight_writer_dropped_total`、`foresight_api_requests_total`、`foresight_db_messages_total`。
+
+`foresight_writer_dropped_total` 按 `kind` 和 `reason`（`queue_full` / `stopped`）统计被写队列丢掉的写入操作 —— 队列满了或者写队列已经停了的时候，操作不会被写进数据库，这个计数让丢失看得见。
 
 > 指标标签不会使用 `user_id`（基数太高会打爆 Prometheus），用户维度请查 API。
 
