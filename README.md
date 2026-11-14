@@ -91,6 +91,8 @@ uv run foresight both        # 采集器 + API 同时跑
 | `FORESIGHT_CONFIG` | 可选 | 配置文件路径，默认 `config.toml` |
 | `FORESIGHT_API_HOST` / `FORESIGHT_API_PORT` | 可选 | 覆盖 `[api].host` / `[api].port` |
 
+compose 另外用一个 `FORESIGHT_PORT` 决定宿主机上映射出来的端口（默认 `8000`），它只影响 compose，不影响服务本身。
+
 ## 命令
 
 | 命令 | 作用 |
@@ -165,6 +167,9 @@ API 绑定到 `0.0.0.0`（非本机）时必须设置 token，否则服务拒绝
 
 **容器起来但写不了数据库（permission denied）**
 容器内的服务用 uid `10001` 运行，`./data` 必须对它可写。Linux 上建目录时用 `sudo chown -R 10001:10001 data`；macOS / Windows 的 Docker Desktop 一般不用管。
+
+**容器一直显示 unhealthy**
+健康检查打的是 `/metrics`。如果你在 `config.toml` 里填了 `api.metrics_token`，这个端点就需要令牌，探针拿不到 200，容器就会被判为不健康 —— 把 `metrics_token` 留空即可。
 
 **机器人报 403 / 看不到频道**
 bot 没被邀请进服务器，或没有该频道的读取权限（`Read Message History`）。
