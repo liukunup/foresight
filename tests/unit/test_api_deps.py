@@ -50,3 +50,40 @@ def test_a_bare_date_still_names_the_whole_day():
 def test_an_unreadable_bound_is_refused():
     with pytest.raises(ValueError):
         normalize_time_bounds(since="2026-11-11 13:45 yesterday")
+
+
+def test_a_bound_with_an_offset_is_converted_to_utc():
+    """The dump holds UTC timestamps, and the bounds are compared as strings.
+
+    A bound that keeps its offset would be compared as a string against
+    a UTC timestamp: `2026-11-11T10:00:00+08:00` would be read as ten
+    o'clock UTC, which is two hours later than the moment it names.
+    """
+    bounds = normalize_time_bounds(since="2026-11-11T10:00:00+08:00")
+    assert bounds.since == "2026-11-11T02:00:00+00:00"
+
+
+def test_an_upper_bound_with_an_offset_is_converted_to_utc():
+    bounds = normalize_time_bounds(until="2026-11-11T10:00:00+08:00")
+    assert bounds.until == "2026-11-11T02:00:00+00:00"
+
+
+def test_a_bound_with_a_zulu_is_converted_to_utc():
+    """The stored form carries `+00:00`, and `Z` sorts after it."""
+    bounds = normalize_time_bounds(since="2026-11-11T10:00:00Z")
+    assert bounds.since == "2026-11-11T10:00:00+00:00"
+
+
+def test_a_bound_with_an_offset_keeps_its_fraction():
+    bounds = normalize_time_bounds(since="2026-11-11 10:00:00.123456+08:00")
+    assert bounds.since == "2026-11-11T02:00:00.123456+00:00"
+
+
+def test_a_bound_without_an_offset_is_left_alone():
+    """A bound without an offset names a moment of the service.
+
+    The timestamps of the dump are UTC, so a bound without an offset is
+    read as UTC — and it is kept in the form it was written in.
+    """
+    bounds = normalize_time_bounds(since="2026-11-11 13:45")
+    assert bounds.since == "2026-11-11T13:45"

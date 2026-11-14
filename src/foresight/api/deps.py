@@ -11,7 +11,7 @@ import os
 import re
 import secrets
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from fastapi import HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -64,6 +64,12 @@ def _normalize_bound(value: str, name: str, *, end_of_day: bool) -> str:
     The separator of a timestamp is normalized to the `T` the stored
     timestamps use: the bounds are compared as strings, and a space sorts
     before a `T`.
+
+    A bound that carries an offset names a moment of the world, and it is
+    converted to UTC before it is used: the timestamps of the dump are
+    UTC, and a bound that keeps its offset would be compared as a string
+    against them — `2026-11-11T10:00:00+08:00` would be read as ten
+    o'clock UTC, which is two hours later than the moment it names.
     """
     if _DATE_ONLY.match(value):
         try:
@@ -74,11 +80,16 @@ def _normalize_bound(value: str, name: str, *, end_of_day: bool) -> str:
             return value + (_END_OF_DAY if end_of_day else _START_OF_DAY)
     elif _TIMESTAMP.match(value):
         try:
-            datetime.fromisoformat(value)
+            parsed = datetime.fromisoformat(value)
         except ValueError:
             pass
         else:
-            return _SEPARATOR.sub("T", value, count=1)
+            if parsed.tzinfo is None:
+                # A bound without an offset names a moment of the
+                # service: the dump holds UTC timestamps, so it is read
+                # as UTC and it is kept in the form it was written in.
+                return _SEPARATOR.sub("T", value, count=1)
+            return parsed.astimezone(timezone.utc).isoformat()
     raise ValueError(
         f"invalid '{name}': {value!r} is neither an ISO-8601 timestamp "
         "nor a date of the form YYYY-MM-DD"

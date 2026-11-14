@@ -222,6 +222,46 @@ async def test_llm_client_falls_back_to_neutral_for_an_unknown_sentiment():
     assert result.sentiment == "neutral"
 
 
+async def test_llm_client_clamps_the_sentiment_score():
+    """The score is a confidence between zero and one.
+
+    The column holds a number between zero and one, and the model does
+    not always answer with one: a score of 99 is a confidence of one.
+    """
+    with respx.mock:
+        respx.post("https://llm.example/v1/chat/completions").mock(
+            return_value=_response(
+                {
+                    "translation": "你好",
+                    "sentiment": "positive",
+                    "sentiment_score": 99,
+                    "issues": [],
+                }
+            )
+        )
+        client = LlmClient(_config())
+        result = await client.analyze("hello")
+    assert result.sentiment_score == 1.0
+
+
+async def test_llm_client_clamps_a_negative_sentiment_score():
+    """A score below zero is a confidence of zero."""
+    with respx.mock:
+        respx.post("https://llm.example/v1/chat/completions").mock(
+            return_value=_response(
+                {
+                    "translation": "你好",
+                    "sentiment": "negative",
+                    "sentiment_score": -3,
+                    "issues": [],
+                }
+            )
+        )
+        client = LlmClient(_config())
+        result = await client.analyze("hello")
+    assert result.sentiment_score == 0.0
+
+
 async def test_llm_client_asks_again_with_a_strict_prompt():
     """An answer that is not JSON gets one more chance with a strict prompt."""
     with respx.mock:

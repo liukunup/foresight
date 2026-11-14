@@ -276,6 +276,11 @@ def _to_result(
     A sentiment outside the four known values becomes `neutral`: the column
     is queried by those values, so a free-form string would break the
     analysis.
+
+    The score is a confidence between zero and one, and the model does
+    not always answer with one: a score outside of that range is
+    clamped, so that the column never holds a number that cannot be
+    read as a confidence.
     """
     sentiment = parsed.get("sentiment")
     if sentiment not in VALID_SENTIMENTS:
@@ -285,6 +290,8 @@ def _to_result(
         score = float(score) if score is not None else None
     except (TypeError, ValueError):
         score = None
+    if score is not None:
+        score = min(1.0, max(0.0, score))
     issues = parsed.get("issues")
     if not isinstance(issues, list):
         issues = []
