@@ -26,16 +26,24 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from sqlalchemy import select  # noqa: E402
+from sqlalchemy import select, text  # noqa: E402
+from sqlalchemy.exc import SQLAlchemyError  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine  # noqa: E402
 
+from foresight.api.query import (  # noqa: E402
+    QueryError,
+    build_query_runner,
+)
+from foresight.config import DatabaseConfig  # noqa: E402
 from foresight.domain.models import (  # noqa: E402
     AttachmentRecord,
     AttachmentStatus,
@@ -50,7 +58,7 @@ from foresight.domain.models import (  # noqa: E402
     UserSnapshot,
     WriteOp,
 )
-from foresight.storage.db import init_db  # noqa: E402
+from foresight.storage.db import create_engine, init_db  # noqa: E402
 from foresight.storage.repository import Repository  # noqa: E402
 from foresight.storage.tables import (  # noqa: E402
     attachments,
@@ -326,6 +334,117 @@ CHECKS: list[tuple[str, Callable[[Repository, AsyncEngine], Any]]] = [
 ]
 
 
+# -- the API against the real servers --------------------------------------
+#
+# The API reads the dump and never writes to it, and every statement it
+# runs is bounded by a deadline. Both are properties of the session and
+# of the server, so they are checked against the real servers and not
+# only against SQLite.
+
+
+async def check_the_read_only_engine(config: DatabaseConfig) -> None:
+    """The engine of the API cannot write to the dump.
+
+    On SQLite the guarantee is the read-only URI of the driver, on
+    PostgreSQL and MySQL it is the read-only session of the connection.
+    """
+    engine = create_engine(config, readonly=True)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("CREATE TABLE api_probe (a INTEGER)"))
+    except SQLAlchemyError:
+        # The write was refused, which is what has to happen.
+        return
+    finally:
+        await engine.dispose()
+    raise AssertionError("the read-only engine accepted a write")
+
+
+async def check_the_read_only_transaction(config: DatabaseConfig) -> None:
+    """The session of the API refuses a write even without the setting."""
+    engine = create_engine(config, readonly=True)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SET TRANSACTION READ ONLY"))
+            await conn.execute(text("CREATE TABLE api_probe (a INTEGER)"))
+    except SQLAlchemyError:
+        return
+    finally:
+        await engine.dispose()
+    raise AssertionError("the read-only transaction accepted a write")
+
+
+async def check_the_deadline_of_the_statement(config: DatabaseConfig) -> None:
+    """A statement that runs too long is stopped by the database."""
+    runner = build_query_runner(config, timeout=2)
+    try:
+        await runner.run(_slow_statement(config), {}, 10, 0)
+    except QueryError:
+        # The statement was stopped: the caller is told about it.
+        return
+    finally:
+        await runner.dispose()
+    raise AssertionError("the statement ran past the deadline")
+
+
+API_CHECKS: list[tuple[str, Callable[[DatabaseConfig], Any]]] = [
+    ("the read-only engine", check_the_read_only_engine),
+    ("the read-only transaction", check_the_read_only_transaction),
+    ("the deadline of the statement", check_the_deadline_of_the_statement),
+]
+
+
+def _slow_statement(config: DatabaseConfig) -> str:
+    """A statement that runs for ever on this backend.
+
+    MySQL interrupts a statement that sleeps with a partial result and
+    without an error, so the slow statement there is an aggregate over a
+    table that is big enough to take longer than the deadline.
+    """
+    if config.backend == "postgresql":
+        return "SELECT pg_sleep(30)"
+    if config.backend == "mysql":
+        return (
+            "SELECT SUM(a.i * b.i * c.i) FROM api_slow a, api_slow b, api_slow c"
+        )
+    return "SELECT COUNT(*) FROM api_slow a, api_slow b, api_slow c"
+
+
+async def _prepare_slow_table(config: DatabaseConfig) -> None:
+    """Write the table the slow statement reads."""
+    engine = create_engine(config)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("DROP TABLE IF EXISTS api_slow"))
+            await conn.execute(text("CREATE TABLE api_slow (i INTEGER)"))
+            await conn.execute(
+                text(
+                    "INSERT INTO api_slow VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10)"
+                )
+            )
+            for offset in (10, 20, 40, 80, 160, 320, 640):
+                await conn.execute(
+                    text(f"INSERT INTO api_slow SELECT i + {offset} FROM api_slow")
+                )
+    finally:
+        await engine.dispose()
+
+
+async def run_api_checks(
+    name: str, config: DatabaseConfig
+) -> list[tuple[str, bool, str]]:
+    """Run the checks of the API on one backend and report each of them."""
+    results: list[tuple[str, bool, str]] = []
+    for check_name, check in API_CHECKS:
+        try:
+            await _prepare_slow_table(config)
+            await check(config)
+            results.append((check_name, True, ""))
+        except Exception as exc:  # noqa: BLE001
+            results.append((check_name, False, f"{type(exc).__name__}: {exc}"))
+    return results
+
+
 async def run_backend(name: str, url: str) -> list[tuple[str, bool, str]]:
     """Run every check on one backend and report the outcome of each."""
     results: list[tuple[str, bool, str]] = []
@@ -344,6 +463,21 @@ async def run_backend(name: str, url: str) -> list[tuple[str, bool, str]]:
         finally:
             await engine.dispose()
     return results
+
+
+def _config_for(name: str, url: str, path: str) -> DatabaseConfig:
+    """The configuration of the backend the script is talking to."""
+    if name == "sqlite":
+        return DatabaseConfig(backend="sqlite", path=path)
+    parsed = urlsplit(url)
+    return DatabaseConfig(
+        backend=name,
+        host=parsed.hostname or "localhost",
+        port=parsed.port or 5432,
+        database=(parsed.path or "/foresight").lstrip("/"),
+        user=parsed.username or "foresight",
+        password=parsed.password or "",
+    )
 
 
 async def main(argv: list[str]) -> int:
@@ -365,6 +499,22 @@ async def main(argv: list[str]) -> int:
             else:
                 failures += 1
                 print(f"  FAIL  {check_name}: {detail}")
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / "foresight.db")
+            config = _config_for(name, url, path)
+            if name == "sqlite":
+                # The API reads a file, and not a database in memory.
+                file_engine = create_engine(config)
+                try:
+                    await init_db(file_engine)
+                finally:
+                    await file_engine.dispose()
+            for check_name, ok, detail in await run_api_checks(name, config):
+                if ok:
+                    print(f"  ok    {check_name}")
+                else:
+                    failures += 1
+                    print(f"  FAIL  {check_name}: {detail}")
     print()
     if failures:
         print(f"{failures} check(s) failed")
