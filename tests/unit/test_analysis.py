@@ -7,6 +7,7 @@ it sets on the message are what the rest of the service reads.
 
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
@@ -14,7 +15,7 @@ import respx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from foresight.analysis.llm import LlmClient, LlmError
+from foresight.analysis.llm import LlmClient, LlmError, LlmPermanentError
 from foresight.analysis.prompts import PROMPT_VERSION
 from foresight.analysis.worker import AnalysisWorker
 from foresight.config import AiConfig
@@ -71,6 +72,32 @@ async def _no_wait(delay: float) -> None:
     """Stand in for the sleep between the attempts of the worker."""
 
 
+async def _wait_for_depth(expected: float, timeout: float = 10.0) -> None:
+    """Wait until the gauge of the queue shows the expected depth."""
+    deadline = time.monotonic() + timeout
+    while _sample("foresight_ai_queue_depth") != expected:
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                "the depth of the queue did not reach "
+                f"{expected}: {_sample('foresight_ai_queue_depth')}"
+            )
+        await asyncio.sleep(0.01)
+
+
+class _BrokenLlm:
+    """A client that fails in the way the test asks it to fail."""
+
+    model = "broken-model"
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.calls = 0
+
+    async def analyze(self, content: str):
+        self.calls += 1
+        raise self.error
+
+
 async def test_llm_client_parses_json_payload():
     config = AiConfig(
         enabled=True,
@@ -112,7 +139,7 @@ async def test_llm_client_raises_on_non_json():
 
 async def test_llm_client_raises_without_api_key():
     client = LlmClient(AiConfig(enabled=True, base_url="https://llm.example/v1"))
-    with pytest.raises(LlmError):
+    with pytest.raises(LlmPermanentError):
         await client.analyze("hello")
 
 
@@ -150,7 +177,8 @@ async def test_worker_stores_analysis(tmp_path):
     await engine.dispose()
 
 
-async def test_worker_marks_failed_after_retries(tmp_path):
+async def test_worker_marks_failed_after_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr("foresight.analysis.worker._sleep", _no_wait)
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'a.db'}")
     await init_db(engine)
     repo = Repository(engine)
@@ -165,7 +193,6 @@ async def test_worker_marks_failed_after_retries(tmp_path):
         worker = AnalysisWorker(repo, client, max_concurrency=1)
         await worker.start()
         worker.submit(1, "hello")
-        await asyncio.sleep(1.5)
         await worker.stop()
         assert route.call_count >= 2
 
@@ -270,6 +297,161 @@ async def test_llm_client_counts_the_requests_and_the_tokens():
     )
 
 
+async def test_llm_client_counts_the_tokens_of_an_answer_it_cannot_use():
+    """The call was paid for, even when the answer cannot be parsed."""
+    prompt_before = _sample("foresight_ai_tokens_total", {"type": "prompt"})
+    completion_before = _sample("foresight_ai_tokens_total", {"type": "completion"})
+
+    with respx.mock:
+        route = respx.post("https://llm.example/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": "not json"}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                },
+            )
+        )
+        client = LlmClient(_config())
+        with pytest.raises(LlmError):
+            await client.analyze("hello")
+
+    # The answer is asked for again with the strict prompt, so the two
+    # calls are the ones the tokens are counted for.
+    assert route.call_count == 2
+    assert _sample("foresight_ai_tokens_total", {"type": "prompt"}) == prompt_before + 20
+    assert (
+        _sample("foresight_ai_tokens_total", {"type": "completion"})
+        == completion_before + 10
+    )
+
+
+async def test_llm_client_uses_one_client_for_every_call():
+    """One client for the life of the client: the connections are pooled."""
+    clients: list[httpx.AsyncClient] = []
+
+    def factory(**kwargs) -> httpx.AsyncClient:
+        client = httpx.AsyncClient(**kwargs)
+        clients.append(client)
+        return client
+
+    with respx.mock:
+        respx.post("https://llm.example/v1/chat/completions").mock(
+            return_value=_response(
+                {
+                    "translation": "你好",
+                    "sentiment": "neutral",
+                    "sentiment_score": 0.5,
+                    "issues": [],
+                }
+            )
+        )
+        client = LlmClient(_config(), client_factory=factory)
+        await client.analyze("hello")
+        await client.analyze("hello again")
+        assert len(clients) == 1
+        assert not clients[0].is_closed
+        await client.close()
+
+    assert clients[0].is_closed
+
+
+async def test_llm_client_asks_again_when_the_answer_has_the_wrong_shape():
+    """A JSON answer without the four keys is not an answer either."""
+    with respx.mock:
+        route = respx.post("https://llm.example/v1/chat/completions").mock(
+            side_effect=[
+                _response({"result": {"translation": "你好"}}),
+                _response(
+                    {
+                        "translation": "你好",
+                        "sentiment": "neutral",
+                        "sentiment_score": 0.5,
+                        "issues": [],
+                    }
+                ),
+            ]
+        )
+        client = LlmClient(_config())
+        result = await client.analyze("hello")
+
+    assert route.call_count == 2
+    assert result.translation == "你好"
+
+
+async def test_llm_client_raises_when_the_answer_has_the_wrong_shape():
+    """An answer with the wrong shape is a failure, not an empty analysis."""
+    with respx.mock:
+        route = respx.post("https://llm.example/v1/chat/completions").mock(
+            return_value=_response({"result": {"translation": "你好"}})
+        )
+        client = LlmClient(_config())
+        with pytest.raises(LlmError):
+            await client.analyze("hello")
+    assert route.call_count == 2
+
+
+async def test_llm_client_raises_a_permanent_error_for_a_rejected_request():
+    """A request the endpoint refuses does not get better by trying again."""
+    with respx.mock:
+        route = respx.post("https://llm.example/v1/chat/completions").mock(
+            return_value=httpx.Response(401, text="nope")
+        )
+        client = LlmClient(_config())
+        with pytest.raises(LlmPermanentError):
+            await client.analyze("hello")
+    assert route.call_count == 1
+
+
+async def test_llm_client_raises_a_permanent_error_for_an_unusable_url():
+    """A url the client cannot use is a mistake of the configuration."""
+    client = LlmClient(_config(base_url="not-a-url"))
+    with pytest.raises(LlmPermanentError):
+        await client.analyze("hello")
+
+
+async def test_llm_client_does_not_call_the_model_when_the_ai_is_disabled():
+    """A disabled AI is not called at all."""
+    with respx.mock:
+        route = respx.post("https://llm.example/v1/chat/completions").mock(
+            return_value=_response(
+                {
+                    "translation": "你好",
+                    "sentiment": "neutral",
+                    "sentiment_score": 0.5,
+                    "issues": [],
+                }
+            )
+        )
+        client = LlmClient(_config(enabled=False))
+        with pytest.raises(LlmError):
+            await client.analyze("hello")
+    assert not route.called
+
+
+async def test_llm_client_sends_the_system_prompt_as_a_system_message():
+    """The prompt of the analysis is a system prompt, not a user message."""
+    with respx.mock:
+        route = respx.post("https://llm.example/v1/chat/completions").mock(
+            return_value=_response(
+                {
+                    "translation": "你好",
+                    "sentiment": "neutral",
+                    "sentiment_score": 0.5,
+                    "issues": [],
+                }
+            )
+        )
+        client = LlmClient(_config())
+        await client.analyze("the login times out")
+
+    sent = json.loads(route.calls[0].request.content)["messages"]
+    assert sent[0]["role"] == "system"
+    assert "JSON" in sent[0]["content"]
+    assert sent[1]["role"] == "user"
+    assert "the login times out" in sent[1]["content"]
+
+
 async def test_worker_marks_the_message_as_done(db_engine):
     repo = Repository(db_engine)
     await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
@@ -331,7 +513,7 @@ async def test_worker_skips_a_message_without_content(db_engine):
 
 
 async def test_worker_marks_the_message_as_failed(db_engine, monkeypatch):
-    monkeypatch.setattr(asyncio, "sleep", _no_wait)
+    monkeypatch.setattr("foresight.analysis.worker._sleep", _no_wait)
     repo = Repository(db_engine)
     await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
 
@@ -354,12 +536,98 @@ async def test_worker_marks_the_message_as_failed(db_engine, monkeypatch):
     assert status == "failed"
 
 
-async def test_worker_publishes_the_depth_of_the_queue(db_engine, monkeypatch):
-    monkeypatch.setattr(asyncio, "sleep", _no_wait)
+async def test_worker_fails_a_message_after_an_unexpected_error(db_engine):
+    """An error the worker does not expect does not strand the message."""
     repo = Repository(db_engine)
     await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
 
-    depth_before = _sample("foresight_ai_queue_depth")
+    llm = _BrokenLlm(RuntimeError("boom"))
+    worker = AnalysisWorker(repo, llm, max_concurrency=1, sleep=_no_wait)
+    await worker.start()
+    worker.submit(1, "hello")
+    await worker.stop()
+
+    async with db_engine.connect() as conn:
+        row = (await conn.execute(select(message_analysis))).one()
+        status = (
+            await conn.execute(select(messages.c.analysis_status))
+        ).scalar_one()
+    assert status == "failed"
+    assert "boom" in row.error
+
+
+async def test_worker_does_not_retry_a_permanent_error(db_engine):
+    """A missing key is a configuration error: one attempt is enough."""
+    repo = Repository(db_engine)
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
+
+    llm = _BrokenLlm(LlmPermanentError("FORESIGHT_LLM_API_KEY is not set"))
+    worker = AnalysisWorker(repo, llm, max_concurrency=1)
+    await worker.start()
+    worker.submit(1, "hello")
+    await worker.stop()
+
+    assert llm.calls == 1
+    async with db_engine.connect() as conn:
+        row = (await conn.execute(select(message_analysis))).one()
+        status = (
+            await conn.execute(select(messages.c.analysis_status))
+        ).scalar_one()
+    assert status == "failed"
+    assert "FORESIGHT_LLM_API_KEY" in row.error
+
+
+async def test_worker_waits_between_the_attempts(db_engine, monkeypatch):
+    """The worker waits through its own seam, not through the stdlib."""
+    delays: list[float] = []
+
+    async def record(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("foresight.analysis.worker._sleep", record)
+    repo = Repository(db_engine)
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
+
+    llm = _BrokenLlm(RuntimeError("boom"))
+    worker = AnalysisWorker(repo, llm, max_concurrency=1)
+    await worker.start()
+    worker.submit(1, "hello")
+    await worker.stop()
+
+    assert delays == [1.0, 2.0]
+
+
+async def test_worker_fails_a_message_the_model_answered_with_the_wrong_shape(
+    db_engine, monkeypatch
+):
+    """A JSON answer without the four keys is not a successful analysis."""
+    monkeypatch.setattr("foresight.analysis.worker._sleep", _no_wait)
+    repo = Repository(db_engine)
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
+
+    with respx.mock:
+        respx.post("https://llm.example/v1/chat/completions").mock(
+            return_value=_response({"result": {"translation": "你好"}})
+        )
+        worker = AnalysisWorker(repo, LlmClient(_config()), max_concurrency=1)
+        await worker.start()
+        worker.submit(1, "hello")
+        await worker.stop()
+
+    async with db_engine.connect() as conn:
+        row = (await conn.execute(select(message_analysis))).one()
+        status = (
+            await conn.execute(select(messages.c.analysis_status))
+        ).scalar_one()
+    assert status == "failed"
+    assert row.error
+    assert row.translated_text is None
+
+
+async def test_worker_publishes_the_depth_of_the_queue(db_engine):
+    """The gauge counts the messages that wait, not the entries of the queue."""
+    repo = Repository(db_engine)
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
 
     with respx.mock:
         respx.post("https://llm.example/v1/chat/completions").mock(
@@ -374,11 +642,18 @@ async def test_worker_publishes_the_depth_of_the_queue(db_engine, monkeypatch):
         )
         worker = AnalysisWorker(repo, LlmClient(_config()), max_concurrency=1)
         await worker.start()
-        worker.submit(1, "hello")
+        # The gauge of the registry is process wide, so the test compares
+        # the values with each other: it must not depend on what an
+        # earlier test left behind.
+        before = _sample("foresight_ai_queue_depth")
+        assert worker.submit(1, "hello") is True
+        assert _sample("foresight_ai_queue_depth") == before + 1
+        await _wait_for_depth(before)
+        assert _sample("foresight_ai_queue_depth") == before
         await worker.stop()
-
-    # The queue is empty again: the work is done.
-    assert _sample("foresight_ai_queue_depth") == depth_before
+        # Nothing waits any more: the end markers of the queue are not
+        # work, so they must not show up as a backlog.
+        assert _sample("foresight_ai_queue_depth") == before
 
 
 async def test_worker_refuses_a_message_when_the_queue_is_full(db_engine):

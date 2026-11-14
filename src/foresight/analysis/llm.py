@@ -6,11 +6,15 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
-from foresight.analysis.prompts import PROMPT_VERSION, build_prompt, build_strict_prompt
+from foresight.analysis.prompts import (
+    PROMPT_VERSION,
+    build_system_prompt,
+    build_user_prompt,
+)
 from foresight.config import AiConfig
 from foresight.metrics import (
     ai_request_duration_seconds,
@@ -22,9 +26,27 @@ logger = logging.getLogger(__name__)
 
 VALID_SENTIMENTS = ("positive", "neutral", "negative", "mixed")
 
+# The four results of the analysis. An answer that does not carry all of
+# them is not the analysis of the message: it is answered again, with the
+# strict prompt.
+EXPECTED_KEYS = ("translation", "sentiment", "sentiment_score", "issues")
+
+# The status codes that are worth another attempt: the endpoint was busy
+# or it asked us to slow down. Every other 4xx is a mistake of the request
+# itself, and it does not get better by trying again.
+RETRYABLE_STATUS = frozenset({408, 429})
+
 
 class LlmError(Exception):
     """Raised when the model call fails or the answer cannot be parsed."""
+
+
+class LlmPermanentError(LlmError):
+    """Raised when another attempt cannot help.
+
+    A missing key or a disabled AI is a mistake of the configuration: the
+    call is refused right away, instead of being retried.
+    """
 
 
 @dataclass
@@ -51,6 +73,7 @@ class LlmClient:
     def __init__(self, config: AiConfig, client_factory: Any = None) -> None:
         self._config = config
         self._client_factory = client_factory or httpx.AsyncClient
+        self._client: httpx.AsyncClient | None = None
 
     @property
     def endpoint(self) -> str:
@@ -63,55 +86,101 @@ class LlmClient:
         """The name of the model the analyses are made with."""
         return self._config.model
 
+    async def __aenter__(self) -> "LlmClient":
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        """Close the client of the endpoint."""
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.aclose()
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """The client of the endpoint.
+
+        One client for the life of the client: the connections are pooled
+        and every call reuses them, instead of paying for a handshake of
+        its own.
+        """
+        if self._client is None:
+            self._client = cast(
+                httpx.AsyncClient,
+                self._client_factory(timeout=self._config.timeout_seconds),
+            )
+        return self._client
+
     async def analyze(self, content: str) -> LlmResult:
         """Analyse one message.
 
         Raises :class:`LlmError` when the call itself failed, and when the
-        model answered with something that is not JSON twice.
+        model did not answer with a usable JSON object twice. A
+        :class:`LlmPermanentError` is raised when another attempt cannot
+        help.
         """
+        if not self._config.enabled:
+            raise LlmPermanentError("the AI analysis is disabled")
         if not self._config.api_key:
-            raise LlmError("FORESIGHT_LLM_API_KEY is not set")
+            raise LlmPermanentError("FORESIGHT_LLM_API_KEY is not set")
         started = time.perf_counter()
         target = self._config.translation_target
-        answer = await self._call(build_prompt(content, target))
+        answer = await self._call(
+            build_system_prompt(target), build_user_prompt(content)
+        )
         if answer is None:
-            # The model answered with prose or with a fenced JSON object:
-            # it gets one more chance, with a prompt that asks for raw JSON.
-            logger.warning("the model did not answer with JSON, asking again")
-            answer = await self._call(build_strict_prompt(content, target))
+            # The model answered with prose, with a fenced JSON object or
+            # with an object of the wrong shape: it gets one more chance,
+            # with a prompt that asks for raw JSON.
+            logger.warning(
+                "the model did not answer with a usable JSON object, asking again"
+            )
+            answer = await self._call(
+                build_system_prompt(target, strict=True),
+                build_user_prompt(content),
+            )
         if answer is None:
-            raise LlmError("the model did not return valid JSON")
+            raise LlmError("the model did not return a usable answer")
         parsed, body = answer
         return _to_result(parsed, body, self._config.model, _elapsed_ms(started))
 
-    async def _call(self, prompt: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    async def _call(
+        self, system_prompt: str, user_prompt: str
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
         """Ask the model once.
 
         Returns the parsed answer together with the raw body, or None when
-        the model answered with something that is not JSON.
+        the model answered with something that is not a usable answer.
         """
         started = time.perf_counter()
         try:
-            body = await self._post(prompt)
+            body = await self._post(system_prompt, user_prompt)
+            # The tokens are counted for every answer that came back, even
+            # for one that cannot be used: the call was paid for anyway.
+            _count_tokens(body)
             parsed = _parse_json(_content_of(body))
         except LlmError:
             ai_requests_total.labels(status="failed").inc()
             raise
         else:
-            if parsed is None:
+            if parsed is None or not _has_expected_keys(parsed):
                 ai_requests_total.labels(status="failed").inc()
                 return None
             ai_requests_total.labels(status="ok").inc()
-            _count_tokens(body)
             return parsed, body
         finally:
             ai_request_duration_seconds.observe(time.perf_counter() - started)
 
-    async def _post(self, prompt: str) -> dict[str, Any]:
+    async def _post(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         """Send one chat completion request."""
         payload = {
             "model": self._config.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
             "temperature": 0,
             "response_format": {"type": "json_object"},
         }
@@ -119,20 +188,45 @@ class LlmClient:
             "Authorization": f"Bearer {self._config.api_key}",
             "Content-Type": "application/json",
         }
+        client = self._get_client()
         try:
-            async with self._client_factory(
-                timeout=self._config.timeout_seconds
-            ) as client:
-                response = await client.post(
-                    self.endpoint, json=payload, headers=headers
-                )
-                response.raise_for_status()
-                body = response.json()
+            response = await client.post(
+                self.endpoint, json=payload, headers=headers
+            )
+            response.raise_for_status()
+            body = response.json()
+        except (httpx.InvalidURL, httpx.UnsupportedProtocol) as exc:
+            # The url of the endpoint is wrong, or it speaks another
+            # protocol: another attempt cannot make it right.
+            raise LlmPermanentError(f"the endpoint url is not usable: {exc}") from exc
+        except httpx.HTTPStatusError as exc:
+            raise _status_error(exc) from exc
+        except httpx.TransportError as exc:
+            # A transport error is a hiccup of the network: another attempt
+            # can still succeed.
+            raise LlmError(f"the endpoint could not be reached: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise LlmError(str(exc)) from exc
+        except ValueError as exc:
+            raise LlmError(f"the endpoint answered with a broken body: {exc}") from exc
         except Exception as exc:
             raise LlmError(str(exc)) from exc
         if not isinstance(body, dict):
             raise LlmError("unexpected response shape")
         return body
+
+
+def _status_error(exc: httpx.HTTPStatusError) -> LlmError:
+    """The error of a request the endpoint answered with a status code.
+
+    A request the endpoint refuses does not get better by trying again:
+    the key is wrong or the request itself is malformed. A server error and
+    a request that came too early do get another attempt.
+    """
+    status = exc.response.status_code
+    if status >= 500 or status in RETRYABLE_STATUS:
+        return LlmError(f"the endpoint answered with {status}: {exc}")
+    return LlmPermanentError(f"the endpoint refused the request with {status}: {exc}")
 
 
 def _content_of(body: dict[str, Any]) -> str:
@@ -163,6 +257,15 @@ def _parse_json(text: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _has_expected_keys(parsed: dict[str, Any]) -> bool:
+    """Whether the answer carries the four results of the analysis.
+
+    An answer without them is not an answer: it is the JSON of something
+    else, and it must not be stored as an empty analysis.
+    """
+    return all(key in parsed for key in EXPECTED_KEYS)
 
 
 def _to_result(

@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from foresight.analysis.llm import LlmError
+from foresight.analysis.llm import LlmPermanentError
 from foresight.analysis.prompts import PROMPT_VERSION
 from foresight.domain.models import MessageAnalysis, OpKind, WriteOp
 from foresight.metrics import ai_queue_depth
@@ -24,6 +25,17 @@ SKIP_MIN_LENGTH = 2
 
 # The end of the queue: it tells a worker that no more work is coming.
 _STOP = object()
+
+# The seam between the worker and the wait between two attempts. The
+# tests hand in their own, so that they do not have to patch the sleep of
+# the standard library: a patch there would silence every library that
+# sleeps inside the test as well.
+Sleep = Callable[[float], Awaitable[None]]
+
+
+async def _sleep(delay: float) -> None:
+    """Wait for the given number of seconds."""
+    await asyncio.sleep(delay)
 
 
 class AnalysisWorker:
@@ -41,6 +53,7 @@ class AnalysisWorker:
         *,
         max_concurrency: int = 2,
         queue_maxsize: int = 1000,
+        sleep: Sleep | None = None,
     ) -> None:
         self._repo = repo
         self._llm = llm
@@ -48,6 +61,10 @@ class AnalysisWorker:
         self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=queue_maxsize)
         self._tasks: list[asyncio.Task[None]] = []
         self._stopping = False
+        self._pending = 0
+        # The seam of the wait between two attempts: None means the
+        # default wait of the module.
+        self._sleep = sleep
 
     async def start(self) -> None:
         if self._tasks:
@@ -55,6 +72,9 @@ class AnalysisWorker:
         # A worker that was stopped before is running again, so the
         # stopping flag of the old run must not leak into the new tasks.
         self._stopping = False
+        # A worker that starts has nothing to wait for yet.
+        self._pending = 0
+        self._publish_depth()
         self._tasks = [
             asyncio.create_task(self._worker(index), name=f"foresight-analysis-{index}")
             for index in range(self._max_concurrency)
@@ -73,6 +93,10 @@ class AnalysisWorker:
         for task in self._tasks:
             await task
         self._tasks = []
+        # Nothing waits any more: the end markers of the queue are not
+        # work, so they must not show up as a backlog.
+        self._pending = 0
+        self._publish_depth()
 
     def submit(self, message_id: int, content: str) -> bool:
         """Queue a message for analysis.
@@ -90,8 +114,18 @@ class AnalysisWorker:
         except asyncio.QueueFull:
             logger.warning("analysis queue is full, dropping message %s", message_id)
             return False
-        ai_queue_depth.set(self._queue.qsize())
+        self._pending += 1
+        self._publish_depth()
         return True
+
+    def _publish_depth(self) -> None:
+        """Publish the number of messages that wait for their analysis.
+
+        The gauge counts the messages and not the entries of the queue: the
+        end markers of the queue are not work, and counting them would
+        leave a phantom backlog behind after every stop.
+        """
+        ai_queue_depth.set(self._pending)
 
     async def _worker(self, index: int) -> None:  # noqa: ARG002
         while True:
@@ -106,7 +140,8 @@ class AnalysisWorker:
                 logger.exception("analysis failed for message %s", message_id)
             finally:
                 self._queue.task_done()
-                ai_queue_depth.set(self._queue.qsize())
+                self._pending -= 1
+                self._publish_depth()
 
     async def _process(self, message_id: int, content: str) -> None:
         """Analyse one message and write the result."""
@@ -119,8 +154,17 @@ class AnalysisWorker:
         for attempt in range(MAX_ATTEMPTS):
             try:
                 result = await self._llm.analyze(content)
-            except LlmError as exc:
-                last_error = str(exc)
+            except LlmPermanentError as exc:
+                # A permanent failure — a missing key, a disabled AI — does
+                # not get better by another attempt: the message is failed
+                # right away.
+                last_error = str(exc) or type(exc).__name__
+                logger.warning("llm analysis failed for good: %s", exc)
+                break
+            except Exception as exc:
+                # Every other failure is worth another attempt — and it
+                # must never leave the message in `pending`.
+                last_error = str(exc) or type(exc).__name__
                 logger.warning(
                     "llm analysis failed (attempt %d/%d): %s",
                     attempt + 1,
@@ -128,11 +172,16 @@ class AnalysisWorker:
                     exc,
                 )
                 if attempt < MAX_ATTEMPTS - 1:
-                    await asyncio.sleep(1.0 * (attempt + 1))
+                    await self._wait(1.0 * (attempt + 1))
                 continue
             await self._store(message_id, result)
             return
         await self._store_failure(message_id, last_error)
+
+    async def _wait(self, delay: float) -> None:
+        """Wait between two attempts."""
+        sleep = self._sleep if self._sleep is not None else _sleep
+        await sleep(delay)
 
     async def _store(self, message_id: int, result: Any) -> None:
         """Write the analysis of a message and mark the message as done."""

@@ -21,16 +21,25 @@ STRICT_SUFFIX = (
 )
 
 
-def build_prompt(content: str, translation_target: str) -> str:
-    """The prompt that asks for the analysis of one message."""
-    system = SYSTEM_PROMPT.format(target=translation_target)
-    return f"{system}\n\nMessage:\n{content}"
+def build_system_prompt(translation_target: str, *, strict: bool = False) -> str:
+    """The system prompt of the analysis.
 
+    The prompt is the system prompt of the request: it tells the model what
+    to answer and in which shape, and it does not carry the message itself.
 
-def build_strict_prompt(content: str, translation_target: str) -> str:
-    """The prompt of the second attempt, when the answer was not JSON.
-
-    The model wraps its answer in markdown fences often enough that one
-    stricter try is worth it.
+    The strict variant is the prompt of the second attempt: it asks for raw
+    JSON, for the model that wrapped its answer in markdown fences.
     """
-    return build_prompt(content, translation_target) + STRICT_SUFFIX
+    system = SYSTEM_PROMPT.format(target=translation_target)
+    if strict:
+        return system + STRICT_SUFFIX
+    return system
+
+
+def build_user_prompt(content: str) -> str:
+    """The message that is analysed.
+
+    The message is the user message of the request: it is the text the
+    analysis is about.
+    """
+    return f"Message:\n{content}"
