@@ -554,10 +554,11 @@ PG / MySQL 下使用只读事务（`SET TRANSACTION READ ONLY` / `SET SESSION TR
 | `foresight_writer_batches_total` | Counter | `status` | 落库批次数（`ok`/`failed`） |
 | `foresight_writer_batch_size` | Histogram | — | 每批条数 |
 | `foresight_ai_requests_total` | Counter | `status` | LLM 调用数（`ok`/`failed`） |
+| `foresight_ai_tokens_total` | Counter | `type` | LLM token 消耗（`prompt`/`completion`） |
 | `foresight_ai_request_duration_seconds` | Histogram | — | LLM 耗时 |
 | `foresight_ai_tokens_total` | Counter | `type` | `prompt` / `completion` token 数 |
 | `foresight_ai_queue_depth` | Gauge | — | 分析队列积压 |
-| `foresight_media_downloads_total` | Counter | `status` | 附件下载数（`ok`/`failed`） |
+| `foresight_media_downloads_total` | Counter | `status` | 附件下载数（`ok`/`failed`/`skipped`，`skipped` = 超过大小上限被主动跳过） |
 | `foresight_media_bytes_total` | Counter | — | 下载字节数 |
 | `foresight_api_requests_total` | Counter | `method`, `path`, `status` | API 请求数 |
 | `foresight_api_request_duration_seconds` | Histogram | `method`, `path` | API 耗时 |
