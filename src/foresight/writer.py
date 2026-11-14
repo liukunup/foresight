@@ -360,8 +360,14 @@ async def recover_failed_batches(writer: Writer, path: Path | None) -> int:
     block the good ones. Every attempt is a single one: the replay does
     not wait out the retry backoff of the writer, because the failure
     file already holds the records and replays them on the next start.
+
     The write is idempotent, so a record that is replayed twice is
-    harmless.
+    harmless: a snapshot overwrites its row with the very same values, the
+    counter of the edits only counts an edit that is newer than the one
+    the row already carries, and a reaction that was taken back stays
+    taken back. The two status kinds write an absolute value — the status
+    of an attachment, the analysis status of a message — so a replay of
+    an older record restores the older status.
 
     Only the records that really reached the database are removed from the
     failure file; the others stay there and are replayed on the next

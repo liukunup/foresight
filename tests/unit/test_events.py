@@ -336,3 +336,55 @@ def test_a_removed_reaction_is_not_a_received_reaction():
     handler.handle_raw_reaction_remove(_raw_payload())
 
     assert _sample_value("foresight_reactions_total", labels) == before
+
+
+def test_the_raw_edit_timestamp_is_written_in_the_canonical_form():
+    """The database compares the timestamps of the edits as strings.
+
+    Discord sends the moment of the last edit as an ISO-8601 string with
+    microseconds; the mapper writes the canonical form of the service. Two
+    spellings of the same moment would compare as two different edits, and
+    the replay of an edit would count as a new one.
+    """
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    payload = SimpleNamespace(
+        channel_id=20,
+        message_id=100,
+        data={
+            "content": "edited",
+            "edited_timestamp": "2026-11-11T01:00:00.000000+00:00",
+        },
+    )
+    handler.handle_raw_edit(payload)
+    assert writer.ops[0].payload.edited_at == "2026-11-11T01:00:00+00:00"
+
+
+def test_a_raw_edit_timestamp_in_another_offset_is_moved_to_utc():
+    """The timestamps are compared as strings, so they must be in one zone."""
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    payload = SimpleNamespace(
+        channel_id=20,
+        message_id=100,
+        data={
+            "content": "edited",
+            "edited_timestamp": "2026-11-11T03:00:00+02:00",
+        },
+    )
+    handler.handle_raw_edit(payload)
+    assert writer.ops[0].payload.edited_at == "2026-11-11T01:00:00+00:00"
+
+
+def test_a_raw_edit_without_a_timestamp_is_stamped_with_the_moment():
+    """A payload without a timestamp still carries one."""
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    payload = SimpleNamespace(
+        channel_id=20,
+        message_id=100,
+        data={"content": "edited"},
+    )
+    handler.handle_raw_edit(payload)
+    assert writer.ops[0].payload.edited_at.endswith("+00:00")
+

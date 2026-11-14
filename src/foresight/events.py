@@ -48,6 +48,26 @@ def _label(value: Any) -> str:
     return str(value)
 
 
+def _edit_timestamp(raw: Any) -> str:
+    """The moment of an edit, in the canonical form of the service.
+
+    Discord sends the moment of the last edit as an ISO-8601 string, and
+    the database compares the timestamps of the edits as strings. The
+    value is therefore rendered the way the mapper renders every other
+    timestamp: in UTC, without a fraction when there is none. Two
+    spellings of the same moment would compare as two different edits, and
+    the replay of an edit would count as a new one.
+    """
+    if isinstance(raw, str):
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            logger.warning("unreadable edit timestamp: %r", raw)
+        else:
+            return iso(parsed) or ""
+    return iso(datetime.now(timezone.utc)) or ""
+
+
 class EventHandler:
     """Turn Discord events into write operations."""
 
@@ -122,7 +142,7 @@ class EventHandler:
             content = data.get("content")
             if content is None:
                 return
-            edited_at = data.get("edited_timestamp") or iso(datetime.now(timezone.utc))
+            edited_at = _edit_timestamp(data.get("edited_timestamp"))
             if self._writer.submit(
                 WriteOp(
                     OpKind.MESSAGE_EDIT,
