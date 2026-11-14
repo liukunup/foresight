@@ -40,7 +40,7 @@ docker compose logs -f foresight
 
 - 数据库和下载的附件都落在仓库里的 `./data` 目录（容器内 `/app/data`）。
 - 端口默认 `8000`；想换就设环境变量 `FORESIGHT_PORT=8080 docker compose up -d`。
-- 停止：`docker compose down`（加 `-v` 会连同数据卷一起删掉）。
+- 停止：`docker compose down`（数据在宿主机的 `./data` 里，`down` 不会删掉它）。
 
 ## 快速开始（本地）
 
