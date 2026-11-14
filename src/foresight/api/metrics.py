@@ -22,6 +22,10 @@ from prometheus_client import (
 
 from foresight.metrics import (
     REGISTRY,
+    ai_queue_depth,
+    ai_request_duration_seconds,
+    ai_requests_total,
+    ai_tokens_total,
     media_bytes_total,
     media_downloads_total,
     messages_captured,
@@ -61,28 +65,6 @@ backfill_messages_total = Counter(
     "foresight_backfill_messages_total",
     "Messages imported by backfill",
     ["channel_id"],
-    registry=REGISTRY,
-)
-ai_queue_depth = Gauge(
-    "foresight_ai_queue_depth",
-    "Messages waiting for AI analysis",
-    registry=REGISTRY,
-)
-ai_requests_total = Counter(
-    "foresight_ai_requests_total",
-    "LLM analysis calls",
-    ["status"],
-    registry=REGISTRY,
-)
-ai_request_duration_seconds = Histogram(
-    "foresight_ai_request_duration_seconds",
-    "LLM analysis latency",
-    registry=REGISTRY,
-)
-ai_tokens_total = Counter(
-    "foresight_ai_tokens_total",
-    "LLM tokens consumed",
-    ["type"],
     registry=REGISTRY,
 )
 api_requests_total = Counter(

@@ -72,3 +72,25 @@ media_bytes_total = Counter(
     "Bytes downloaded",
     registry=REGISTRY,
 )
+ai_queue_depth = Gauge(
+    "foresight_ai_queue_depth",
+    "Messages waiting for AI analysis",
+    registry=REGISTRY,
+)
+ai_requests_total = Counter(
+    "foresight_ai_requests_total",
+    "LLM analysis calls",
+    ["status"],
+    registry=REGISTRY,
+)
+ai_request_duration_seconds = Histogram(
+    "foresight_ai_request_duration_seconds",
+    "LLM analysis latency",
+    registry=REGISTRY,
+)
+ai_tokens_total = Counter(
+    "foresight_ai_tokens_total",
+    "LLM tokens consumed",
+    ["type"],
+    registry=REGISTRY,
+)
