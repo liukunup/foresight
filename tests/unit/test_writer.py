@@ -674,3 +674,53 @@ async def test_submit_after_stop_returns_false(db_engine, caplog):
     with caplog.at_level(logging.WARNING, logger="foresight.writer"):
         assert writer.submit(WriteOp(OpKind.MESSAGE, _message())) is False
     assert any("stopped" in record.message for record in caplog.records)
+
+
+# -- the dropped operations ----------------------------------------------
+
+
+async def test_the_writer_counts_an_operation_dropped_by_a_full_queue(db_engine):
+    """A dropped operation must be counted, not only logged."""
+    labels = {"kind": OpKind.MESSAGE, "reason": "queue_full"}
+    before = _sample_value("foresight_writer_dropped_total", labels)
+
+    writer = await _make_writer(db_engine, queue_maxsize=1)
+    writer.submit(WriteOp(OpKind.MESSAGE, _message()))
+    assert writer.submit(WriteOp(OpKind.MESSAGE, _message())) is False
+    await writer.stop()
+
+    assert (
+        _sample_value("foresight_writer_dropped_total", labels) == before + 1
+    )
+
+
+async def test_the_writer_counts_an_operation_dropped_after_the_stop(db_engine):
+    """An operation handed to a stopped writer is dropped as well."""
+    labels = {"kind": OpKind.MESSAGE, "reason": "stopped"}
+    before = _sample_value("foresight_writer_dropped_total", labels)
+
+    writer = await _make_writer(db_engine)
+    await writer.stop()
+    assert writer.submit(WriteOp(OpKind.MESSAGE, _message())) is False
+
+    assert (
+        _sample_value("foresight_writer_dropped_total", labels) == before + 1
+    )
+
+
+async def test_the_writer_counts_every_dropped_operation(db_engine):
+    """Every dropped operation is counted, not only the first one."""
+    labels = {"kind": OpKind.MESSAGE, "reason": "queue_full"}
+    before = _sample_value("foresight_writer_dropped_total", labels)
+
+    writer = await _make_writer(db_engine, queue_maxsize=1)
+    writer.submit(WriteOp(OpKind.MESSAGE, _message()))
+    for _ in range(3):
+        writer.submit(WriteOp(OpKind.MESSAGE, _message()))
+    await writer.stop()
+
+    assert (
+        _sample_value("foresight_writer_dropped_total", labels) == before + 3
+    )
+
+

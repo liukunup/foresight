@@ -32,7 +32,12 @@ from typing import Any, Protocol, Sequence
 
 from foresight.domain import models as domain_models
 from foresight.domain.models import OpKind, WriteOp
-from foresight.metrics import writer_batch_size, writer_batches_total, writer_queue_depth
+from foresight.metrics import (
+    writer_batch_size,
+    writer_batches_total,
+    writer_dropped_total,
+    writer_queue_depth,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -145,15 +150,19 @@ class Writer:
         """Enqueue an operation.
 
         Returns False when the queue is full or the writer has been
-        stopped; the operation is never written in either case.
+        stopped; the operation is never written in either case. Every
+        dropped operation is counted, so that the loss is visible in the
+        metrics and not only in the log.
         """
         if self._stopping:
             logger.warning("writer is stopped, dropping operation kind=%s", op.kind)
+            writer_dropped_total.labels(kind=op.kind, reason="stopped").inc()
             return False
         try:
             self._queue.put_nowait(op)
         except asyncio.QueueFull:
             logger.warning("write queue is full, dropping operation kind=%s", op.kind)
+            writer_dropped_total.labels(kind=op.kind, reason="queue_full").inc()
             return False
         self._publish_depth()
         return True

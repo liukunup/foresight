@@ -56,6 +56,12 @@ writer_batches_total = Counter(
     ["status"],
     registry=REGISTRY,
 )
+writer_dropped_total = Counter(
+    "foresight_writer_dropped_total",
+    "Write operations dropped by the writer",
+    ["kind", "reason"],
+    registry=REGISTRY,
+)
 writer_batch_size = Histogram(
     "foresight_writer_batch_size",
     "Rows per write batch",
