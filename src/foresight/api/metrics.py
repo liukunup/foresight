@@ -3,65 +3,62 @@
 Label discipline: `channel_id` and `guild_id` are bounded and safe.
 `user_id` must never be used as a label — the cardinality would melt
 Prometheus.
+
+The registry and the collectors of the collector live in
+`foresight.metrics`: the collector must reach them without depending on
+the API layer. They are re-exported here, so that this module stays the
+one place an importer looks for a metric.
 """
 
 from __future__ import annotations
 
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
-    CollectorRegistry,
     Counter,
     Gauge,
     Histogram,
     generate_latest,
 )
 
-REGISTRY = CollectorRegistry()
+from foresight.metrics import (
+    REGISTRY,
+    messages_captured,
+    messages_deleted,
+    messages_edited,
+    reactions_total,
+    writer_batches_total,
+    writer_batch_size,
+    writer_queue_depth,
+)
 
-messages_captured = Counter(
-    "foresight_messages_captured_total",
-    "Messages captured from Discord",
-    ["channel_id", "guild_id"],
-    registry=REGISTRY,
-)
-messages_deleted = Counter(
-    "foresight_messages_deleted_total",
-    "Messages soft deleted",
-    ["channel_id"],
-    registry=REGISTRY,
-)
-messages_edited = Counter(
-    "foresight_messages_edited_total",
-    "Messages edited",
-    ["channel_id"],
-    registry=REGISTRY,
-)
-reactions_total = Counter(
-    "foresight_reactions_total",
-    "Reactions received",
-    ["channel_id"],
-    registry=REGISTRY,
-)
+__all__ = [
+    "REGISTRY",
+    "ai_queue_depth",
+    "ai_request_duration_seconds",
+    "ai_requests_total",
+    "ai_tokens_total",
+    "api_request_duration_seconds",
+    "api_requests_total",
+    "backfill_messages_total",
+    "db_attachments_total",
+    "db_messages_total",
+    "get_metrics",
+    "media_bytes_total",
+    "media_downloads_total",
+    "messages_captured",
+    "messages_deleted",
+    "messages_edited",
+    "metrics_content_type",
+    "reactions_total",
+    "writer_batches_total",
+    "writer_batch_size",
+    "writer_queue_depth",
+]
+
 backfill_messages_total = Counter(
     "foresight_backfill_messages_total",
     "Messages imported by backfill",
     ["channel_id"],
-    registry=REGISTRY,
-)
-writer_queue_depth = Gauge(
-    "foresight_writer_queue_depth",
-    "Pending write operations",
-    registry=REGISTRY,
-)
-writer_batches_total = Counter(
-    "foresight_writer_batches_total",
-    "Write batches flushed",
-    ["status"],
-    registry=REGISTRY,
-)
-writer_batch_size = Histogram(
-    "foresight_writer_batch_size",
-    "Rows per write batch",
     registry=REGISTRY,
 )
 ai_queue_depth = Gauge(

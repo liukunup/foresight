@@ -20,9 +20,21 @@ from sqlalchemy import select
 import foresight.writer as writer_module
 from foresight.domain import models as domain_models
 from foresight.domain.models import MessageRecord, OpKind, WriteOp
+from foresight.metrics import REGISTRY
 from foresight.storage.repository import Repository
 from foresight.storage.tables import messages
 from foresight.writer import Writer, recover_failed_batches
+
+
+def _sample_value(name: str, labels: dict[str, str] | None = None) -> float:
+    """The current value of a sample of the metric registry.
+
+    The registry is process wide, so a test reads the value before and
+    after the write and compares the two: the counters of one test must
+    not disturb the counters of another one.
+    """
+    value = REGISTRY.get_sample_value(name, labels or {})
+    return 0.0 if value is None else value
 
 
 class _FakeRepository:
@@ -108,6 +120,58 @@ async def test_writer_reports_the_queue_depth(db_engine):
     writer.submit(WriteOp(OpKind.MESSAGE, _message()))
     assert writer.queue_depth == 1
     await writer.stop()
+
+
+async def test_writer_publishes_the_depth_of_the_queue(db_engine):
+    """The gauge of the queue must show the real depth, not a stale zero."""
+    writer = await _make_writer(db_engine)
+    writer.submit(WriteOp(OpKind.MESSAGE, _message()))
+    # The background task has not run yet: the operation is still queued.
+    assert _sample_value("foresight_writer_queue_depth") == 1
+    await writer.stop()
+    # The queue is drained when the writer stops.
+    assert _sample_value("foresight_writer_queue_depth") == 0
+
+
+async def test_writer_counts_the_batches_it_writes(db_engine):
+    before = _sample_value("foresight_writer_batches_total", {"status": "ok"})
+    writer = await _make_writer(db_engine)
+    writer.submit(WriteOp(OpKind.MESSAGE, _message()))
+    await writer.stop()
+    assert _sample_value("foresight_writer_batches_total", {"status": "ok"}) == before + 1
+
+
+async def test_writer_counts_a_failed_batch_as_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(writer_module, "RETRY_DELAYS", (0.0, 0.0, 0.0))
+
+    class BrokenRepository:
+        async def apply_batch(self, ops):
+            raise RuntimeError("db is gone")
+
+    before = _sample_value("foresight_writer_batches_total", {"status": "failed"})
+    writer = Writer(
+        BrokenRepository(),
+        batch_size=1,
+        flush_interval_ms=10,
+        failure_path=tmp_path / "failed_batch.jsonl",
+    )
+    await writer.start()
+    writer.submit(WriteOp(OpKind.MESSAGE, _message()))
+    await writer.stop()
+    assert (
+        _sample_value("foresight_writer_batches_total", {"status": "failed"})
+        == before + 1
+    )
+
+
+async def test_writer_measures_the_rows_of_a_batch(db_engine):
+    before = _sample_value("foresight_writer_batch_size_sum")
+    writer = await _make_writer(db_engine)
+    writer.submit(WriteOp(OpKind.MESSAGE, _message()))
+    writer.submit(WriteOp(OpKind.MESSAGE, _message()))
+    await writer.stop()
+    # The two operations went into one batch of two rows.
+    assert _sample_value("foresight_writer_batch_size_sum") == before + 2
 
 
 async def test_recover_failed_batches_replays_records(tmp_path, db_engine):

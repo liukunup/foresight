@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, Depends, FastAPI, Request, Response
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from foresight.api.deps import require_token
@@ -29,6 +31,8 @@ from foresight.api.routers import (
 )
 from foresight.config import Config
 from foresight.storage.db import create_engine
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -97,6 +101,20 @@ def _observe_request(request: Request, status: str, elapsed: float) -> None:
     api_request_duration_seconds.labels(method=request.method, path=path).observe(elapsed)
 
 
+async def _refresh_database_gauges(engine: AsyncEngine) -> None:
+    """Publish the counts of the dump as the gauges of the database.
+
+    A database that cannot be read must not take the metrics down with
+    it: the gauges keep the value of the last scrape and the reason goes
+    into the log, so that a scrape still answers with the metrics of the
+    rest of the service.
+    """
+    try:
+        await health.publish_counts(engine)
+    except SQLAlchemyError as exc:
+        logger.warning("could not refresh the database gauges: %s", exc)
+
+
 def create_app(config: Config, engine: AsyncEngine | None = None) -> FastAPI:
     """Build the read-only API application.
 
@@ -158,6 +176,12 @@ def create_app(config: Config, engine: AsyncEngine | None = None) -> FastAPI:
         does not apply to it: Prometheus scrapes it without a token. A
         metrics token guards it separately, for the deployments that do
         not want the endpoint open.
+
+        The gauges of the database are refreshed here, on every scrape:
+        the health endpoint sits behind the bearer token, so a probe that
+        has no token would never reach it and the gauges would stay at
+        zero while the dump holds rows. One count query per scrape is
+        cheap.
         """
         expected = getattr(app.state.config.api, "metrics_token", "") or ""
         if expected:
@@ -173,6 +197,7 @@ def create_app(config: Config, engine: AsyncEngine | None = None) -> FastAPI:
                     status_code=401,
                     media_type="application/json",
                 )
+        await _refresh_database_gauges(app.state.engine)
         return Response(content=get_metrics(), media_type=metrics_content_type())
 
     return app

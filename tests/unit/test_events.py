@@ -17,6 +17,7 @@ import pytest
 
 from foresight.domain.models import OpKind
 from foresight.events import EventHandler
+from foresight.metrics import REGISTRY
 
 
 class RecordingWriter:
@@ -31,6 +32,17 @@ class RecordingWriter:
 
     def kinds(self):
         return [op.kind for op in self.ops]
+
+
+def _sample_value(name: str, labels: dict[str, str] | None = None) -> float:
+    """The current value of a sample of the metric registry.
+
+    The registry is process wide, so a test reads the value before and
+    after the event and compares the two: the counters of one test must
+    not disturb the counters of another one.
+    """
+    value = REGISTRY.get_sample_value(name, labels or {})
+    return 0.0 if value is None else value
 
 
 def _config(channel_ids=(20,)):
@@ -228,3 +240,99 @@ def test_reaction_add_and_remove():
     assert added.payload.removed_at is None
     assert removed.payload.emoji == "🔥"
     assert removed.payload.removed_at is not None
+
+
+def test_a_captured_message_is_counted():
+    """The metric of the captured messages must follow the events."""
+    labels = {"channel_id": "20", "guild_id": "10"}
+    before = _sample_value("foresight_messages_captured_total", labels)
+
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    handler.handle_message(_message())
+
+    assert (
+        _sample_value("foresight_messages_captured_total", labels) == before + 1
+    )
+
+
+def test_a_message_outside_the_whitelist_is_not_counted():
+    labels = {"channel_id": "999", "guild_id": "10"}
+    before = _sample_value("foresight_messages_captured_total", labels)
+
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    handler.handle_message(_message(channel_id=999))
+
+    assert _sample_value("foresight_messages_captured_total", labels) == before
+
+
+def test_a_message_the_writer_refuses_is_not_counted():
+    """A message the queue refused is not captured, so it is not counted."""
+
+    class FullWriter:
+        """A writer whose queue is full: it refuses every operation."""
+
+        def submit(self, op):
+            return False
+
+    labels = {"channel_id": "20", "guild_id": "10"}
+    before = _sample_value("foresight_messages_captured_total", labels)
+
+    handler = EventHandler(_config(), FullWriter())
+    handler.handle_message(_message())
+
+    assert _sample_value("foresight_messages_captured_total", labels) == before
+
+
+def test_an_edited_message_is_counted():
+    labels = {"channel_id": "20"}
+    before = _sample_value("foresight_messages_edited_total", labels)
+
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    handler.handle_raw_edit(
+        SimpleNamespace(
+            channel_id=20,
+            message_id=100,
+            data={"content": "edited", "edited_timestamp": "2026-11-11T01:00:00+00:00"},
+        )
+    )
+
+    assert _sample_value("foresight_messages_edited_total", labels) == before + 1
+
+
+def test_a_deleted_message_is_counted():
+    labels = {"channel_id": "20"}
+    before = _sample_value("foresight_messages_deleted_total", labels)
+
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    handler.handle_raw_delete(
+        SimpleNamespace(channel_id=20, message_id=100, cached_message=None)
+    )
+
+    assert _sample_value("foresight_messages_deleted_total", labels) == before + 1
+
+
+def test_a_received_reaction_is_counted():
+    labels = {"channel_id": "20"}
+    before = _sample_value("foresight_reactions_total", labels)
+
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    handler.handle_raw_reaction_add(_raw_payload())
+
+    assert _sample_value("foresight_reactions_total", labels) == before + 1
+
+
+def test_a_removed_reaction_is_not_a_received_reaction():
+    """A reaction that is taken back is not a reaction that was received."""
+    labels = {"channel_id": "20"}
+    before = _sample_value("foresight_reactions_total", labels)
+
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    handler.handle_raw_reaction_remove(_raw_payload())
+
+    assert _sample_value("foresight_reactions_total", labels) == before

@@ -27,8 +27,25 @@ from foresight.domain.models import (
     OpKind,
     WriteOp,
 )
+from foresight.metrics import (
+    messages_captured,
+    messages_deleted,
+    messages_edited,
+    reactions_total,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _label(value: Any) -> str:
+    """Turn an id into the value of a metric label.
+
+    A label is a string, and an id that is not there — a message of a
+    direct message has no guild — is an empty label and not a guess.
+    """
+    if value is None:
+        return ""
+    return str(value)
 
 
 class EventHandler:
@@ -60,7 +77,13 @@ class EventHandler:
                 return
             captured_at = datetime.now(timezone.utc)
             record = map_message(message, captured_at=captured_at)
-            self._writer.submit(WriteOp(OpKind.MESSAGE, record))
+            if self._writer.submit(WriteOp(OpKind.MESSAGE, record)):
+                # The message is counted when it really reached the writer:
+                # a message the queue refused was not captured at all.
+                messages_captured.labels(
+                    channel_id=_label(record.channel_id),
+                    guild_id=_label(record.guild_id),
+                ).inc()
             self._writer.submit(
                 WriteOp(OpKind.USER, map_user(message.author, updated_at=captured_at))
             )
@@ -85,40 +108,48 @@ class EventHandler:
 
     def handle_raw_edit(self, payload: Any) -> None:
         try:
-            if not self._allowed(getattr(payload, "channel_id", None)):
+            channel_id = getattr(payload, "channel_id", None)
+            if not self._allowed(channel_id):
                 return
             data = getattr(payload, "data", None) or {}
             content = data.get("content")
             if content is None:
                 return
             edited_at = data.get("edited_timestamp") or iso(datetime.now(timezone.utc))
-            self._writer.submit(
+            if self._writer.submit(
                 WriteOp(
                     OpKind.MESSAGE_EDIT,
                     MessageEdit(payload.message_id, content, edited_at),
                 )
-            )
+            ):
+                messages_edited.labels(channel_id=_label(channel_id)).inc()
         except Exception:
             logger.exception("failed to handle message edit")
 
     def handle_raw_delete(self, payload: Any) -> None:
         try:
-            if not self._allowed(getattr(payload, "channel_id", None)):
+            channel_id = getattr(payload, "channel_id", None)
+            if not self._allowed(channel_id):
                 return
             deleted_at = iso(datetime.now(timezone.utc))
-            self._writer.submit(
+            if self._writer.submit(
                 WriteOp(OpKind.MESSAGE_DELETE, MessageDelete(payload.message_id, deleted_at))
-            )
+            ):
+                messages_deleted.labels(channel_id=_label(channel_id)).inc()
         except Exception:
             logger.exception("failed to handle message delete")
 
     def handle_raw_reaction_add(self, payload: Any) -> None:
         try:
-            if not self._allowed(getattr(payload, "channel_id", None)):
+            channel_id = getattr(payload, "channel_id", None)
+            if not self._allowed(channel_id):
                 return
-            self._writer.submit(
+            if self._writer.submit(
                 WriteOp(OpKind.REACTION, map_reaction(payload))
-            )
+            ):
+                # Only a reaction that arrives is a reaction that was
+                # received: one that is taken back again is not counted.
+                reactions_total.labels(channel_id=_label(channel_id)).inc()
         except Exception:
             logger.exception("failed to handle reaction add")
 

@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, NoReturn, Optional
 
 import typer
 
-from foresight.config import Config, ConfigError, load_config
+from foresight.config import Config, ConfigError, DatabaseConfig, load_config
 from foresight.logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -87,18 +88,84 @@ def init_db(
     typer.echo(f"schema ready at {settings.database.path}")
 
 
+async def _build_collector(settings: Config) -> tuple[Any, Any, Any]:
+    """Build the engine, the writer and the bot of the collector.
+
+    Both commands that collect messages use this helper, so the two of
+    them cannot drift apart: the database is opened, the schema is
+    created, the failure file is replayed, the writer is started and the
+    bot is built — always in that order.
+
+    The resources are returned to the caller, which releases them again.
+    A failure in the middle releases what was already built, so a command
+    that does not start leaves nothing behind.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from foresight.bot import build_bot
+    from foresight.events import EventHandler
+    from foresight.storage.db import create_engine, init_db as create_tables
+    from foresight.storage.repository import Repository
+    from foresight.writer import Writer, recover_failed_batches
+
+    # The failure file lives next to the database, so that a database and
+    # its pending writes are always found together.
+    failure_path = Path(settings.database.path).parent / "failed_batch.jsonl"
+
+    engine: Any = None
+    writer: Any = None
+    try:
+        try:
+            engine = create_engine(settings.database)
+        except (OSError, SQLAlchemyError) as exc:
+            # A directory that cannot be created, an unwritable path, a
+            # backend that is not there: the operator gets the cause, not a
+            # traceback. Anything else is a bug and stays a bug.
+            _fail(f"cannot open the database: {exc}")
+        try:
+            await create_tables(engine)
+        except (OSError, SQLAlchemyError) as exc:
+            _fail(f"cannot open the database: {exc}")
+        repo = Repository(engine)
+        writer = Writer(
+            repo,
+            batch_size=settings.writer.batch_size,
+            flush_interval_ms=settings.writer.flush_interval_ms,
+            queue_maxsize=settings.writer.queue_maxsize,
+            failure_path=failure_path,
+        )
+        try:
+            # The replay writes on this coroutine and bypasses the queue,
+            # so it belongs to the startup: the background task of the
+            # writer is not running yet, so it cannot race the replay for
+            # the database lock.
+            await recover_failed_batches(writer, failure_path)
+        except Exception as exc:
+            # A failure file that cannot be read or parsed is a problem of
+            # the operator, not a crash of the collector.
+            _fail(f"cannot replay the failure file {failure_path}: {exc}")
+        await writer.start()
+        handler = EventHandler(settings, writer)
+        bot = build_bot(settings, handler)
+        return engine, writer, bot
+    except BaseException:
+        # The resources that were already built are released again, so
+        # that a command that does not start leaves nothing behind.
+        try:
+            if writer is not None:
+                await writer.stop()
+        finally:
+            if engine is not None:
+                await engine.dispose()
+        raise
+
+
 @app.command()
 def run(
     config: Optional[str] = typer.Option(None, "--config", help="Path to config.toml"),
 ) -> None:
     """Start the Discord collector."""
-    from sqlalchemy.exc import SQLAlchemyError
-
-    from foresight.bot import build_bot, require_token
-    from foresight.events import EventHandler
-    from foresight.storage.db import create_engine, init_db as create_tables
-    from foresight.storage.repository import Repository
-    from foresight.writer import Writer, recover_failed_batches
+    from foresight.bot import require_token
 
     settings = _load(config)
     if not settings.discord.channel_ids:
@@ -110,10 +177,6 @@ def run(
     except RuntimeError as exc:
         _fail(str(exc))
 
-    # The failure file lives next to the database, so that a database and
-    # its pending writes are always found together.
-    failure_path = Path(settings.database.path).parent / "failed_batch.jsonl"
-
     async def _run() -> None:
         # Every resource that was created is released again, even when the
         # step before it failed.
@@ -121,38 +184,7 @@ def run(
         writer: Any = None
         bot: Any = None
         try:
-            try:
-                engine = create_engine(settings.database)
-            except (OSError, SQLAlchemyError) as exc:
-                # A directory that cannot be created, an unwritable path, a
-                # backend that is not there: the operator gets the cause,
-                # not a traceback. Anything else is a bug and stays a bug.
-                _fail(f"cannot open the database: {exc}")
-            try:
-                await create_tables(engine)
-            except (OSError, SQLAlchemyError) as exc:
-                _fail(f"cannot open the database: {exc}")
-            repo = Repository(engine)
-            writer = Writer(
-                repo,
-                batch_size=settings.writer.batch_size,
-                flush_interval_ms=settings.writer.flush_interval_ms,
-                queue_maxsize=settings.writer.queue_maxsize,
-                failure_path=failure_path,
-            )
-            try:
-                # The replay writes on this coroutine and bypasses the
-                # queue, so it belongs to the startup: the background task
-                # of the writer is not running yet, so it cannot race the
-                # replay for the database lock.
-                await recover_failed_batches(writer, failure_path)
-            except Exception as exc:
-                # A failure file that cannot be read or parsed is a problem
-                # of the operator, not a crash of the collector.
-                _fail(f"cannot replay the failure file {failure_path}: {exc}")
-            await writer.start()
-            handler = EventHandler(settings, writer)
-            bot = build_bot(settings, handler)
+            engine, writer, bot = await _build_collector(settings)
             logger.info(
                 "collector starting: channels=%s database=%s",
                 ", ".join(str(cid) for cid in settings.discord.channel_ids),
@@ -213,11 +245,58 @@ async def _stop_server(server_task: Any) -> None:
         await server_task
     except asyncio.CancelledError:
         pass
-    except Exception:
+    except BaseException:
         # The server died on its own — a port that is already taken, for
         # example. The reason belongs in the log, not in a traceback that
         # buries the reason the collector is stopping.
         logger.exception("the API server stopped with an error")
+
+
+async def _run_server(server: Any) -> BaseException | None:
+    """Serve the API and return the reason the server stopped.
+
+    The failure is caught here and not in the task: an exception that
+    escapes a task stops the whole event loop, and the collector would
+    then either go on without the API or die with a traceback. The
+    `SystemExit` that `uvicorn` raises when it cannot bind the port is
+    caught here as well.
+    """
+    try:
+        await server.serve()
+    except asyncio.CancelledError:
+        # A cancellation is not a failure: the task was stopped on
+        # purpose.
+        raise
+    except BaseException as exc:
+        return exc
+    return None
+
+
+def _server_failure(server_task: Any) -> str:
+    """The reason the API server stopped, in one line."""
+    if server_task.cancelled():
+        return "the API server was cancelled"
+    exc = server_task.result()
+    if exc is None:
+        return "the API server stopped"
+    if isinstance(exc, SystemExit):
+        # The server leaves with a `SystemExit` when it cannot bind the
+        # port: the exit code says nothing, but the error it was raised
+        # for does — "[Errno 48] address already in use".
+        cause = exc.__cause__ or exc.__context__
+        if cause is not None:
+            return f"the API server stopped: {cause}"
+        return f"the API server stopped with exit code {exc.code}"
+    return f"the API server stopped: {exc}"
+
+
+def _report_task_failure(task: Any) -> None:
+    """Report the failure of a task that ended on its own."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        raise exc
 
 
 @app.command()
@@ -226,14 +305,10 @@ def both(
 ) -> None:
     """Run the collector and the HTTP API in a single process."""
     import uvicorn
-    from sqlalchemy.exc import SQLAlchemyError
 
     from foresight.api.app import create_app
-    from foresight.bot import build_bot, require_token
-    from foresight.events import EventHandler
-    from foresight.storage.db import create_engine, init_db as create_tables
-    from foresight.storage.repository import Repository
-    from foresight.writer import Writer, recover_failed_batches
+    from foresight.bot import require_token
+    from foresight.storage.db import create_engine
 
     settings = _load(config)
     if not settings.discord.channel_ids:
@@ -246,8 +321,6 @@ def both(
     except RuntimeError as exc:
         _fail(str(exc))
 
-    failure_path = Path(settings.database.path).parent / "failed_batch.jsonl"
-
     async def _run() -> None:
         # Every resource that was created is released again, even when the
         # step before it failed.
@@ -257,38 +330,7 @@ def both(
         bot: Any = None
         server_task: Any = None
         try:
-            try:
-                engine = create_engine(settings.database)
-            except (OSError, SQLAlchemyError) as exc:
-                # A directory that cannot be created, an unwritable path, a
-                # backend that is not there: the operator gets the cause, not a
-                # traceback. Anything else is a bug and stays a bug.
-                _fail(f"cannot open the database: {exc}")
-            try:
-                await create_tables(engine)
-            except (OSError, SQLAlchemyError) as exc:
-                _fail(f"cannot open the database: {exc}")
-            repo = Repository(engine)
-            writer = Writer(
-                repo,
-                batch_size=settings.writer.batch_size,
-                flush_interval_ms=settings.writer.flush_interval_ms,
-                queue_maxsize=settings.writer.queue_maxsize,
-                failure_path=failure_path,
-            )
-            try:
-                # The replay writes on this coroutine and bypasses the
-                # queue, so it belongs to the startup: the background task
-                # of the writer is not running yet, so it cannot race the
-                # replay for the database lock.
-                await recover_failed_batches(writer, failure_path)
-            except Exception as exc:
-                # A failure file that cannot be read or parsed is a problem
-                # of the operator, not a crash of the collector.
-                _fail(f"cannot replay the failure file {failure_path}: {exc}")
-            await writer.start()
-            handler = EventHandler(settings, writer)
-            bot = build_bot(settings, handler)
+            engine, writer, bot = await _build_collector(settings)
             # The API gets an engine of its own, one that can only read.
             # The engine of the collector writes, and the API must not be
             # able to write even when both run in the same process.
@@ -302,7 +344,6 @@ def both(
                     log_level=settings.logging.level.lower(),
                 )
             )
-            server_task = asyncio.create_task(server.serve())
             logger.info(
                 "collector and API starting: channels=%s database=%s api=%s:%s",
                 ", ".join(str(cid) for cid in settings.discord.channel_ids),
@@ -310,7 +351,27 @@ def both(
                 settings.api.host,
                 settings.api.port,
             )
-            await bot.start(token)
+            # The collector and the API are watched together: when the API
+            # dies, the collector stops as well instead of running on
+            # without it.
+            bot_task = asyncio.create_task(bot.start(token))
+            server_task = asyncio.create_task(_run_server(server))
+            done, _pending = await asyncio.wait(
+                {bot_task, server_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if server_task in done and bot_task not in done:
+                # The API is gone while the collector still runs: the
+                # reason is reported now and not at the end of the run.
+                reason = _server_failure(server_task)
+                logger.error("%s", reason)
+                bot_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await bot_task
+                _fail(reason)
+            if bot_task in done:
+                # The collector stopped on its own: its reason belongs to
+                # the caller.
+                _report_task_failure(bot_task)
         finally:
             logger.info("collector and API stopping")
             # Every step runs, even when the one before it failed: the API
@@ -347,14 +408,21 @@ def query(
     """Run a read-only SQL statement against the database."""
     import json
 
-    from foresight.api.query import QueryDatabaseError, QueryError, SqliteQueryRunner
+    from foresight.api.query import (
+        QueryDatabaseError,
+        QueryError,
+        SqliteQueryRunner,
+        clamp_limit,
+    )
 
     # The same runner the API uses: the statement is checked by the same
     # rules, and the connection is opened read-only, so a write cannot
-    # reach the dump even if the check were fooled.
+    # reach the dump even if the check were fooled. The limit is bounded
+    # by the same rule as well, so the command cannot ask for more rows
+    # than the API hands out.
     runner = SqliteQueryRunner(db)
     try:
-        result = asyncio.run(runner.run(sql, {}, limit, 0))
+        result = asyncio.run(runner.run(sql, {}, clamp_limit(limit), 0))
     except (QueryError, QueryDatabaseError) as exc:
         typer.secho(f"query error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
@@ -379,8 +447,11 @@ def stats(
 
     async def _run() -> dict:
         # The engine is built here and not through the storage layer: this
-        # command knows a path and not a configuration, and it only reads.
-        engine = create_async_engine(f"sqlite+aiosqlite:///{db}")
+        # command knows a path and not a configuration. It is opened
+        # read-only, so the command cannot write to the dump even by
+        # accident: the driver itself refuses every write.
+        url = DatabaseConfig(backend="sqlite", path=db).readonly_sqlalchemy_url
+        engine = create_async_engine(url)
         try:
             return await StatsService(engine).overview(since=since, until=until)
         except SQLAlchemyError as exc:

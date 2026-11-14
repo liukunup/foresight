@@ -32,6 +32,7 @@ from typing import Any, Protocol, Sequence
 
 from foresight.domain import models as domain_models
 from foresight.domain.models import OpKind, WriteOp
+from foresight.metrics import writer_batch_size, writer_batches_total, writer_queue_depth
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,14 @@ class Writer:
     def queue_depth(self) -> int:
         return self._queue.qsize()
 
+    def _publish_depth(self) -> None:
+        """Publish the depth of the queue.
+
+        The gauge is published every time the queue changes, so it shows
+        the real backlog and not a zero that hides it.
+        """
+        writer_queue_depth.set(self._queue.qsize())
+
     async def start(self) -> None:
         # A writer that was stopped before is running again, so the
         # stopping flag of the old run must not leak into the new task.
@@ -143,10 +152,11 @@ class Writer:
             return False
         try:
             self._queue.put_nowait(op)
-            return True
         except asyncio.QueueFull:
             logger.warning("write queue is full, dropping operation kind=%s", op.kind)
             return False
+        self._publish_depth()
+        return True
 
     async def apply_ops(self, ops: Sequence[WriteOp]) -> int:
         """Write operations in one batch, without retrying them.
@@ -206,6 +216,7 @@ class Writer:
                 batch.append(await asyncio.wait_for(self._queue.get(), remaining))
             except asyncio.TimeoutError:
                 break
+            self._publish_depth()
         return batch
 
     async def _flush(self, batch: Sequence[WriteOp]) -> bool:
@@ -215,8 +226,12 @@ class Writer:
         with the backoff in `RETRY_DELAYS` — one attempt plus three
         retries — and is then handed to the failure file.
         """
+        # The size of the batch is measured once per batch, not once per
+        # attempt: a batch that is retried is still one batch.
+        writer_batch_size.observe(len(batch))
         for attempt in range(MAX_RETRIES + 1):
             if await self._apply_once(batch):
+                writer_batches_total.labels(status="ok").inc()
                 return True
             if attempt < MAX_RETRIES:
                 logger.warning(
@@ -226,6 +241,7 @@ class Writer:
                 )
                 await asyncio.sleep(RETRY_DELAYS[attempt])
         self._persist_failure(batch)
+        writer_batches_total.labels(status="failed").inc()
         return False
 
     async def _apply_once(self, batch: Sequence[WriteOp]) -> bool:
