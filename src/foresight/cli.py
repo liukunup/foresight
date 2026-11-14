@@ -190,7 +190,7 @@ async def _build_collector(settings: Config) -> _CollectorResources:
             _fail(f"cannot replay the failure file {failure_path}: {exc}")
         await writer.start()
         media_worker = MediaWorker(
-            repo,
+            writer,
             build_media_store(settings.media),
             max_concurrency=settings.media.download_concurrency,
             max_bytes=settings.media.max_download_size_mb * 1024 * 1024,

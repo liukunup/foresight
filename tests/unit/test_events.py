@@ -388,3 +388,54 @@ def test_a_raw_edit_without_a_timestamp_is_stamped_with_the_moment():
     handler.handle_raw_edit(payload)
     assert writer.ops[0].payload.edited_at.endswith("+00:00")
 
+
+# -- the attachments ------------------------------------------------------
+
+
+def _message_with_an_attachment():
+    message = _message()
+    message.attachments = [
+        SimpleNamespace(
+            id=555,
+            filename="a.png",
+            content_type="image/png",
+            size=12,
+            url="https://cdn.example/a.png",
+        )
+    ]
+    return message
+
+
+def test_a_captured_attachment_is_downloaded():
+    """An attachment that reached the writer is downloaded."""
+    writer = RecordingWriter()
+    downloaded = []
+    handler = EventHandler(_config(), writer, media_sink=downloaded.append)
+    handler.handle_message(_message_with_an_attachment())
+    assert [record.attachment_id for record in downloaded] == [555]
+
+
+def test_a_dropped_attachment_is_not_downloaded():
+    """A row the writer refused must not leave a file behind.
+
+    The writer drops the operation when its queue is full. The download
+    would then store a file that no row refers to, and the status update
+    that follows would match no row at all.
+    """
+
+    class FullWriter:
+        """A writer whose queue is full: it refuses every operation."""
+
+        def __init__(self):
+            self.ops = []
+
+        def submit(self, op):
+            self.ops.append(op)
+            return False
+
+    writer = FullWriter()
+    downloaded = []
+    handler = EventHandler(_config(), writer, media_sink=downloaded.append)
+    handler.handle_message(_message_with_an_attachment())
+    assert writer.ops, "the attachment was offered to the writer"
+    assert downloaded == [], "a dropped attachment must not be downloaded"

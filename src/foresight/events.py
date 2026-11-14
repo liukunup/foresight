@@ -127,9 +127,13 @@ class EventHandler:
                 captured_at=captured_at,
                 storage_backend=self._media_backend,
             ):
-                self._writer.submit(WriteOp(OpKind.ATTACHMENT, attachment))
-                if self._media_sink is not None:
-                    self._media_sink(attachment)
+                # Only an attachment that reached the writer is downloaded:
+                # a row the queue refused has no place in the database, so
+                # the file would be an orphan and the status update that
+                # follows would match no row at all.
+                if self._writer.submit(WriteOp(OpKind.ATTACHMENT, attachment)):
+                    if self._media_sink is not None:
+                        self._media_sink(attachment)
         except Exception:
             logger.exception("failed to handle message")
 

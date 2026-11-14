@@ -37,6 +37,7 @@ from foresight.storage.media import (
 )
 from foresight.storage.repository import Repository
 from foresight.storage.tables import attachments
+from foresight.writer import Writer
 
 
 def _record(size: int = 10) -> AttachmentRecord:
@@ -126,8 +127,9 @@ def test_build_media_store_selects_backend(tmp_path: Path):
 
 
 async def test_media_worker_downloads_and_marks_stored(db_engine, tmp_path: Path):
-    repo = Repository(db_engine)
-    await repo.apply_batch([WriteOp(OpKind.ATTACHMENT, _record())])
+    writer = Writer(Repository(db_engine), batch_size=10, flush_interval_ms=10)
+    await writer.start()
+    writer.submit(WriteOp(OpKind.ATTACHMENT, _record()))
 
     downloads_before = _sample("foresight_media_downloads_total", {"status": "ok"})
     bytes_before = _sample("foresight_media_bytes_total")
@@ -137,10 +139,13 @@ async def test_media_worker_downloads_and_marks_stored(db_engine, tmp_path: Path
         route = respx.get("https://cdn.example/a.png").mock(
             return_value=httpx.Response(200, content=payload)
         )
-        worker = MediaWorker(repo, LocalMediaStore(tmp_path / "media"), max_concurrency=1)
+        worker = MediaWorker(
+            writer, LocalMediaStore(tmp_path / "media"), max_concurrency=1
+        )
         await worker.start()
         worker.submit(_record())
         await _stop(worker)
+        await writer.stop()
         assert route.called
 
     async with db_engine.connect() as conn:
@@ -154,8 +159,9 @@ async def test_media_worker_downloads_and_marks_stored(db_engine, tmp_path: Path
 
 async def test_media_worker_follows_a_redirect(db_engine, tmp_path: Path):
     """The bytes of the redirect are not the bytes of the attachment."""
-    repo = Repository(db_engine)
-    await repo.apply_batch([WriteOp(OpKind.ATTACHMENT, _record())])
+    writer = Writer(Repository(db_engine), batch_size=10, flush_interval_ms=10)
+    await writer.start()
+    writer.submit(WriteOp(OpKind.ATTACHMENT, _record()))
 
     payload = b"final-payload"
     with respx.mock:
@@ -167,10 +173,13 @@ async def test_media_worker_follows_a_redirect(db_engine, tmp_path: Path):
         respx.get("https://cdn.example/final.png").mock(
             return_value=httpx.Response(200, content=payload)
         )
-        worker = MediaWorker(repo, LocalMediaStore(tmp_path / "media"), max_concurrency=1)
+        worker = MediaWorker(
+            writer, LocalMediaStore(tmp_path / "media"), max_concurrency=1
+        )
         await worker.start()
         worker.submit(_record())
         await _stop(worker)
+        await writer.stop()
 
     async with db_engine.connect() as conn:
         row = (await conn.execute(select(attachments))).one()
@@ -180,8 +189,9 @@ async def test_media_worker_follows_a_redirect(db_engine, tmp_path: Path):
 
 async def test_media_worker_marks_failure(db_engine, tmp_path: Path, monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", _no_wait)
-    repo = Repository(db_engine)
-    await repo.apply_batch([WriteOp(OpKind.ATTACHMENT, _record())])
+    writer = Writer(Repository(db_engine), batch_size=10, flush_interval_ms=10)
+    await writer.start()
+    writer.submit(WriteOp(OpKind.ATTACHMENT, _record()))
 
     failures_before = _sample("foresight_media_downloads_total", {"status": "failed"})
 
@@ -189,10 +199,13 @@ async def test_media_worker_marks_failure(db_engine, tmp_path: Path, monkeypatch
         respx.get("https://cdn.example/a.png").mock(
             return_value=httpx.Response(500, text="boom")
         )
-        worker = MediaWorker(repo, LocalMediaStore(tmp_path / "media"), max_concurrency=1)
+        worker = MediaWorker(
+            writer, LocalMediaStore(tmp_path / "media"), max_concurrency=1
+        )
         await worker.start()
         worker.submit(_record())
         await _stop(worker)
+        await writer.stop()
 
     async with db_engine.connect() as conn:
         row = (await conn.execute(select(attachments))).one()
@@ -209,17 +222,21 @@ async def test_media_worker_retries_the_download_three_times(
 ):
     """One attempt and three retries are four attempts."""
     monkeypatch.setattr(asyncio, "sleep", _no_wait)
-    repo = Repository(db_engine)
-    await repo.apply_batch([WriteOp(OpKind.ATTACHMENT, _record())])
+    writer = Writer(Repository(db_engine), batch_size=10, flush_interval_ms=10)
+    await writer.start()
+    writer.submit(WriteOp(OpKind.ATTACHMENT, _record()))
 
     with respx.mock:
         route = respx.get("https://cdn.example/a.png").mock(
             return_value=httpx.Response(500, text="boom")
         )
-        worker = MediaWorker(repo, LocalMediaStore(tmp_path / "media"), max_concurrency=1)
+        worker = MediaWorker(
+            writer, LocalMediaStore(tmp_path / "media"), max_concurrency=1
+        )
         await worker.start()
         worker.submit(_record())
         await _stop(worker)
+        await writer.stop()
 
     assert route.call_count == 4
 
@@ -233,17 +250,21 @@ async def test_media_worker_waits_longer_after_every_retry(
         delays.append(delay)
 
     monkeypatch.setattr(asyncio, "sleep", record)
-    repo = Repository(db_engine)
-    await repo.apply_batch([WriteOp(OpKind.ATTACHMENT, _record())])
+    writer = Writer(Repository(db_engine), batch_size=10, flush_interval_ms=10)
+    await writer.start()
+    writer.submit(WriteOp(OpKind.ATTACHMENT, _record()))
 
     with respx.mock:
         respx.get("https://cdn.example/a.png").mock(
             return_value=httpx.Response(500, text="boom")
         )
-        worker = MediaWorker(repo, LocalMediaStore(tmp_path / "media"), max_concurrency=1)
+        worker = MediaWorker(
+            writer, LocalMediaStore(tmp_path / "media"), max_concurrency=1
+        )
         await worker.start()
         worker.submit(_record())
         await _stop(worker)
+        await writer.stop()
 
     assert len(delays) == 3
     assert delays == sorted(delays)
@@ -261,15 +282,16 @@ async def test_media_worker_uses_one_client_for_every_attempt(
         clients.append(client)
         return client
 
-    repo = Repository(db_engine)
-    await repo.apply_batch([WriteOp(OpKind.ATTACHMENT, _record())])
+    writer = Writer(Repository(db_engine), batch_size=10, flush_interval_ms=10)
+    await writer.start()
+    writer.submit(WriteOp(OpKind.ATTACHMENT, _record()))
 
     with respx.mock:
         respx.get("https://cdn.example/a.png").mock(
             return_value=httpx.Response(500, text="boom")
         )
         worker = MediaWorker(
-            repo,
+            writer,
             LocalMediaStore(tmp_path / "media"),
             max_concurrency=1,
             client_factory=factory,
@@ -277,14 +299,16 @@ async def test_media_worker_uses_one_client_for_every_attempt(
         await worker.start()
         worker.submit(_record())
         await _stop(worker)
+        await writer.stop()
 
     assert len(clients) == 1
     assert clients[0].is_closed
 
 
 async def test_media_worker_skips_oversized(db_engine, tmp_path: Path):
-    repo = Repository(db_engine)
-    await repo.apply_batch([WriteOp(OpKind.ATTACHMENT, _record(size=999))])
+    writer = Writer(Repository(db_engine), batch_size=10, flush_interval_ms=10)
+    await writer.start()
+    writer.submit(WriteOp(OpKind.ATTACHMENT, _record(size=999)))
 
     skipped_before = _sample("foresight_media_downloads_total", {"status": "skipped"})
 
@@ -293,11 +317,12 @@ async def test_media_worker_skips_oversized(db_engine, tmp_path: Path):
             return_value=httpx.Response(200, content=b"too-big")
         )
         worker = MediaWorker(
-            repo, LocalMediaStore(tmp_path / "media"), max_concurrency=1, max_bytes=10
+            writer, LocalMediaStore(tmp_path / "media"), max_concurrency=1, max_bytes=10
         )
         await worker.start()
         worker.submit(_record(size=999))
         await _stop(worker)
+        await writer.stop()
         assert not route.called
 
     async with db_engine.connect() as conn:
@@ -445,3 +470,47 @@ async def test_s3_store_open_yields_the_stored_bytes(s3_server: _S3Server):
     data = await _within(_read_all(store, "2026/11/11/555.png"))
 
     assert data == payload
+
+
+# --- the status of an attachment ----------------------------------------
+#
+# The status of an attachment is written through the queue of the writer,
+# so it can never overtake the insert of the row it belongs to: the writer
+# applies the attachments before the statuses of the attachments.
+
+
+async def test_the_status_write_cannot_overtake_the_insert(db_engine, tmp_path: Path):
+    """The row of an attachment must exist before its status is written.
+
+    The worker writes the status while the row is still only queued: the
+    status must not be lost, and the row must not stay `pending` for good.
+    """
+    from foresight.writer import Writer
+
+    repo = Repository(db_engine)
+    writer = Writer(repo, batch_size=50, flush_interval_ms=10)
+    # The row is only queued: the writer has not written it yet.
+    writer.submit(WriteOp(OpKind.ATTACHMENT, _record()))
+
+    with respx.mock:
+        respx.get("https://cdn.example/a.png").mock(
+            return_value=httpx.Response(200, content=b"payload")
+        )
+        worker = MediaWorker(
+            writer, LocalMediaStore(tmp_path / "media"), max_concurrency=1
+        )
+        await worker.start()
+        worker.submit(_record())
+        await _stop(worker)
+
+    # The status was written while the row did not exist yet.
+    async with db_engine.connect() as conn:
+        assert (await conn.execute(select(attachments))).all() == []
+
+    await writer.start()
+    await writer.stop()
+
+    async with db_engine.connect() as conn:
+        row = (await conn.execute(select(attachments))).one()
+    assert row.status == "stored"
+    assert row.sha256 == hashlib.sha256(b"payload").hexdigest()

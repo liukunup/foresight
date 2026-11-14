@@ -41,11 +41,17 @@ class MediaWorker:
     The worker owns its own queue and its own tasks, so the download never
     runs on the callback of Discord: the callback only hands the record
     over.
+
+    The status of an attachment is written through the queue of the writer,
+    not straight into the database. The row of the attachment and the
+    status of that row are then written in the order they were queued: a
+    status that reached the database before its row existed would match no
+    row, and the attachment would stay `pending` for good.
     """
 
     def __init__(
         self,
-        repo: Any,
+        writer: Any,
         store: Any,
         *,
         max_concurrency: int = 3,
@@ -53,7 +59,7 @@ class MediaWorker:
         queue_maxsize: int = 1000,
         client_factory: Any = None,
     ) -> None:
-        self._repo = repo
+        self._writer = writer
         self._store = store
         self._max_concurrency = max_concurrency
         self._max_bytes = max_bytes
@@ -135,7 +141,7 @@ class MediaWorker:
             # The attachment is too big to be downloaded. That is a
             # decision and not an error, so it is skipped and not failed.
             media_downloads_total.labels(status="skipped").inc()
-            await self._write_status(
+            self._write_status(
                 record,
                 "skipped",
                 error="attachment exceeds the configured size limit",
@@ -165,7 +171,7 @@ class MediaWorker:
                 if attempt < DOWNLOAD_MAX_RETRIES:
                     await asyncio.sleep(DOWNLOAD_RETRY_DELAYS[attempt])
         media_downloads_total.labels(status="failed").inc()
-        await self._write_status(record, "failed", error=last_error)
+        self._write_status(record, "failed", error=last_error)
 
     async def _store_bytes(self, record: AttachmentRecord, data: bytes) -> None:
         stored_at = datetime.now(timezone.utc)
@@ -177,7 +183,7 @@ class MediaWorker:
         uri = await self._store.put(
             key, data, record.content_type or "application/octet-stream"
         )
-        await self._write_status(
+        self._write_status(
             record,
             "stored",
             sha256=sha256_hex(data),
@@ -186,7 +192,7 @@ class MediaWorker:
             stored_at=iso(stored_at),
         )
 
-    async def _write_status(
+    def _write_status(
         self,
         record: AttachmentRecord,
         status: str,
@@ -197,24 +203,31 @@ class MediaWorker:
         storage_uri: str | None = None,
         stored_at: str | None = None,
     ) -> None:
-        """Write the terminal status of one attachment row."""
-        await self._repo.apply_batch(
-            [
-                WriteOp(
-                    OpKind.ATTACHMENT_STATUS,
-                    AttachmentStatus(
-                        message_id=record.message_id,
-                        attachment_id=record.attachment_id,
-                        status=status,
-                        error=error,
-                        sha256=sha256,
-                        storage_key=storage_key,
-                        storage_uri=storage_uri,
-                        stored_at=stored_at,
-                    ),
-                )
-            ]
+        """Write the terminal status of one attachment row.
+
+        The status goes through the queue of the writer, so it is written
+        after the row of the attachment and not before it.
+        """
+        written = self._writer.submit(
+            WriteOp(
+                OpKind.ATTACHMENT_STATUS,
+                AttachmentStatus(
+                    message_id=record.message_id,
+                    attachment_id=record.attachment_id,
+                    status=status,
+                    error=error,
+                    sha256=sha256,
+                    storage_key=storage_key,
+                    storage_uri=storage_uri,
+                    stored_at=stored_at,
+                ),
+            )
         )
+        if not written:
+            logger.warning(
+                "the write queue refused the status of attachment %s",
+                record.attachment_id,
+            )
 
 
 def _captured_at(record: AttachmentRecord, fallback: datetime) -> datetime:
