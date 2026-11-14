@@ -724,3 +724,38 @@ async def test_the_writer_counts_every_dropped_operation(db_engine):
     )
 
 
+# -- a task that died ----------------------------------------------------
+
+
+async def test_a_failed_task_does_not_leave_a_stale_handle(db_engine, monkeypatch):
+    """A writer whose task died must be able to start again.
+
+    The handle of the dead task would keep the writer from creating a new
+    one: the operations would be accepted and never written.
+    """
+    writer = await _make_writer(db_engine)
+    dead = True
+    collect = writer._collect_batch  # noqa: SLF001
+
+    async def failing_collect():
+        if dead:
+            raise RuntimeError("the background task died")
+        return await collect()
+
+    monkeypatch.setattr(writer, "_collect_batch", failing_collect)  # noqa: SLF001
+
+    with pytest.raises(RuntimeError):
+        await writer.stop()
+    # The handle of the dead task is gone.
+    assert writer._task is None  # noqa: SLF001
+
+    dead = False
+    await writer.start()
+    record = _message("after the crash")
+    record.message_id = 2
+    assert writer.submit(WriteOp(OpKind.MESSAGE, record)) is True
+    await writer.stop()
+
+    async with db_engine.connect() as conn:
+        rows = (await conn.execute(select(messages))).all()
+    assert [row.content for row in rows] == ["after the crash"]

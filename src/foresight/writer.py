@@ -142,9 +142,14 @@ class Writer:
 
     async def stop(self) -> None:
         self._stopping = True
-        if self._task is not None:
-            await self._task
-            self._task = None
+        task = self._task
+        # The handle is cleared before the task is awaited: a task that
+        # ended with an error would otherwise leave a handle behind, and a
+        # later `start()` would see a task that is not running any more.
+        # The writer would accept operations that are never written.
+        self._task = None
+        if task is not None:
+            await task
 
     def submit(self, op: WriteOp) -> bool:
         """Enqueue an operation.
