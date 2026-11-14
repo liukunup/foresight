@@ -21,12 +21,15 @@ from foresight.storage.media import media_key, sha256_hex
 
 logger = logging.getLogger(__name__)
 
-# A download is attempted three times, with a growing delay between the
-# attempts, before the attachment is marked as failed.
-MAX_RETRIES = 3
+# The number of retries after the first attempt: one attempt plus three
+# retries make four attempts in total, with the backoff in
+# `DOWNLOAD_RETRY_DELAYS` waited out between them. The name is spelled
+# out, so that it cannot be confused with the retries of the writer,
+# which count the same way.
+DOWNLOAD_MAX_RETRIES = 3
 
-# The delay between the attempts grows by a second every time.
-RETRY_DELAYS = (1.0, 2.0)
+# The delay between the attempts grows every time: 1 s, 2 s and 4 s.
+DOWNLOAD_RETRY_DELAYS = (1.0, 2.0, 4.0)
 
 # The end of the queue: it tells a worker that no more work is coming.
 _STOP = object()
@@ -56,6 +59,7 @@ class MediaWorker:
         self._max_bytes = max_bytes
         self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=queue_maxsize)
         self._client_factory = client_factory or httpx.AsyncClient
+        self._client: httpx.AsyncClient | None = None
         self._tasks: list[asyncio.Task[None]] = []
         self._stopping = False
 
@@ -65,6 +69,10 @@ class MediaWorker:
         # A worker that was stopped before is running again, so the
         # stopping flag of the old run must not leak into the new tasks.
         self._stopping = False
+        # One client for the whole run of the worker: the connections are
+        # pooled and every attachment reuses them, instead of paying for
+        # a handshake of its own.
+        self._client = self._client_factory(timeout=30.0, follow_redirects=True)
         self._tasks = [
             asyncio.create_task(self._worker(index), name=f"foresight-media-{index}")
             for index in range(self._max_concurrency)
@@ -83,6 +91,14 @@ class MediaWorker:
         for task in self._tasks:
             await task
         self._tasks = []
+        await self._close_client()
+
+    async def _close_client(self) -> None:
+        """Close the client of the run, if there is one."""
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.aclose()
 
     def submit(self, record: AttachmentRecord) -> bool:
         """Queue an attachment for download.
@@ -112,8 +128,6 @@ class MediaWorker:
                 logger.exception("media processing failed for %s", record.url)
             finally:
                 self._queue.task_done()
-            if self._stopping and self._queue.empty():
-                return
 
     async def _process(self, record: AttachmentRecord) -> None:
         size = record.size or 0
@@ -127,13 +141,15 @@ class MediaWorker:
                 error="attachment exceeds the configured size limit",
             )
             return
+        client = self._client
+        if client is None:
+            raise RuntimeError("the media worker is not started")
         last_error = "download failed"
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(DOWNLOAD_MAX_RETRIES + 1):
             try:
-                async with self._client_factory(timeout=30.0) as client:
-                    response = await client.get(record.url)
-                    response.raise_for_status()
-                    data = response.content
+                response = await client.get(record.url)
+                response.raise_for_status()
+                data = response.content
                 await self._store_bytes(record, data)
                 media_downloads_total.labels(status="ok").inc()
                 media_bytes_total.inc(len(data))
@@ -143,11 +159,11 @@ class MediaWorker:
                 logger.warning(
                     "attachment download failed (attempt %d/%d): %s",
                     attempt + 1,
-                    MAX_RETRIES,
+                    DOWNLOAD_MAX_RETRIES + 1,
                     exc,
                 )
-                if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(RETRY_DELAYS[attempt])
+                if attempt < DOWNLOAD_MAX_RETRIES:
+                    await asyncio.sleep(DOWNLOAD_RETRY_DELAYS[attempt])
         media_downloads_total.labels(status="failed").inc()
         await self._write_status(record, "failed", error=last_error)
 

@@ -21,7 +21,7 @@ class MediaStore(Protocol):
 
     async def exists(self, key: str) -> bool: ...
 
-    async def open(self, key: str) -> AsyncIterator[bytes]: ...
+    def open(self, key: str) -> AsyncIterator[bytes]: ...
 
 
 def media_key(attachment_id: int, filename: str | None, now: datetime) -> str:
@@ -124,12 +124,12 @@ class S3MediaStore:
             response = await client.get_object(
                 Bucket=self._config.bucket, Key=self._full_key(key)
             )
-            async with response["Body"] as stream:
-                while True:
-                    chunk = await stream.read(65536)
-                    if not chunk:
-                        break
-                    yield chunk
+            # The body is read through the stream itself: entering the
+            # `async with` of the body hands out the raw response, whose
+            # `read` takes no size and would read the whole file at once.
+            body = response["Body"]
+            async for chunk in body.iter_chunks(65536):
+                yield chunk
 
 
 def build_media_store(config: MediaConfig) -> MediaStore:

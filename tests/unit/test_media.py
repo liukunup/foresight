@@ -1,18 +1,40 @@
+"""Tests for the attachment storage and the download worker.
+
+The storage is tested against the backends it talks to: the local one on
+a temporary directory, the S3 one against a server that speaks the S3
+protocol. The worker is tested against a mocked HTTP API, so that the
+bytes it stores, the status it writes and the metrics it counts are all
+pinned down.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import hashlib
+import threading
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
+import aioboto3
 import httpx
 import pytest
 import respx
+from moto.server import ThreadedMotoServer
+from sqlalchemy import select
 
 from foresight.config import MediaConfig, S3Config
 from foresight.domain.models import AttachmentRecord, OpKind, WriteOp
 from foresight.media_worker import MediaWorker
 from foresight.metrics import REGISTRY
-from foresight.storage.db import init_db
-from foresight.storage.media import LocalMediaStore, build_media_store, media_key
+from foresight.storage.media import (
+    LocalMediaStore,
+    S3MediaStore,
+    build_media_store,
+    media_key,
+)
 from foresight.storage.repository import Repository
 from foresight.storage.tables import attachments
 
@@ -35,6 +57,28 @@ def _sample(name: str, labels: dict[str, str] | None = None) -> float:
     """The current value of a metric of the process wide registry."""
     value = REGISTRY.get_sample_value(name, labels)
     return 0.0 if value is None else value
+
+
+async def _no_wait(delay: float) -> None:
+    """Stand in for the sleep between the attempts of the worker."""
+
+
+async def _within(coro, timeout: float = 30.0):
+    """Run a coroutine, and fail the test when it takes too long.
+
+    The server of the tests is a real one: a call that hangs must fail
+    the test instead of holding the suite.
+    """
+    return await asyncio.wait_for(coro, timeout=timeout)
+
+
+async def _stop(worker: MediaWorker) -> None:
+    """Stop the worker, and fail the test when it does not come back.
+
+    The wait is bounded: a worker that hangs must fail the test instead
+    of holding the suite until the timeout of the job.
+    """
+    await asyncio.wait_for(worker.stop(), timeout=10)
 
 
 def test_media_key_uses_attachment_id_and_date():
@@ -81,13 +125,8 @@ def test_build_media_store_selects_backend(tmp_path: Path):
     assert s3.__class__.__name__ == "S3MediaStore"
 
 
-async def test_media_worker_downloads_and_marks_stored(tmp_path: Path):
-    engine_kwargs = f"sqlite+aiosqlite:///{tmp_path / 'test.db'}"
-    from sqlalchemy.ext.asyncio import create_async_engine
-
-    engine = create_async_engine(engine_kwargs)
-    await init_db(engine)
-    repo = Repository(engine)
+async def test_media_worker_downloads_and_marks_stored(db_engine, tmp_path: Path):
+    repo = Repository(db_engine)
     await repo.apply_batch([WriteOp(OpKind.ATTACHMENT, _record())])
 
     downloads_before = _sample("foresight_media_downloads_total", {"status": "ok"})
@@ -101,29 +140,47 @@ async def test_media_worker_downloads_and_marks_stored(tmp_path: Path):
         worker = MediaWorker(repo, LocalMediaStore(tmp_path / "media"), max_concurrency=1)
         await worker.start()
         worker.submit(_record())
-        await asyncio.sleep(0.6)
-        await worker.stop()
+        await _stop(worker)
         assert route.called
 
-    from sqlalchemy import select
-
-    async with engine.connect() as conn:
+    async with db_engine.connect() as conn:
         row = (await conn.execute(select(attachments))).one()
     assert row.status == "stored"
     assert row.sha256 == hashlib.sha256(payload).hexdigest()
     assert row.storage_key == "2026/11/11/555.png"
     assert _sample("foresight_media_downloads_total", {"status": "ok"}) == downloads_before + 1
     assert _sample("foresight_media_bytes_total") == bytes_before + len(payload)
-    await engine.dispose()
 
 
-async def test_media_worker_marks_failure(tmp_path: Path):
-    from sqlalchemy import select
-    from sqlalchemy.ext.asyncio import create_async_engine
+async def test_media_worker_follows_a_redirect(db_engine, tmp_path: Path):
+    """The bytes of the redirect are not the bytes of the attachment."""
+    repo = Repository(db_engine)
+    await repo.apply_batch([WriteOp(OpKind.ATTACHMENT, _record())])
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
-    await init_db(engine)
-    repo = Repository(engine)
+    payload = b"final-payload"
+    with respx.mock:
+        respx.get("https://cdn.example/a.png").mock(
+            return_value=httpx.Response(
+                302, headers={"Location": "https://cdn.example/final.png"}
+            )
+        )
+        respx.get("https://cdn.example/final.png").mock(
+            return_value=httpx.Response(200, content=payload)
+        )
+        worker = MediaWorker(repo, LocalMediaStore(tmp_path / "media"), max_concurrency=1)
+        await worker.start()
+        worker.submit(_record())
+        await _stop(worker)
+
+    async with db_engine.connect() as conn:
+        row = (await conn.execute(select(attachments))).one()
+    assert row.status == "stored"
+    assert row.sha256 == hashlib.sha256(payload).hexdigest()
+
+
+async def test_media_worker_marks_failure(db_engine, tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(asyncio, "sleep", _no_wait)
+    repo = Repository(db_engine)
     await repo.apply_batch([WriteOp(OpKind.ATTACHMENT, _record())])
 
     failures_before = _sample("foresight_media_downloads_total", {"status": "failed"})
@@ -135,10 +192,9 @@ async def test_media_worker_marks_failure(tmp_path: Path):
         worker = MediaWorker(repo, LocalMediaStore(tmp_path / "media"), max_concurrency=1)
         await worker.start()
         worker.submit(_record())
-        await asyncio.sleep(0.6)
-        await worker.stop()
+        await _stop(worker)
 
-    async with engine.connect() as conn:
+    async with db_engine.connect() as conn:
         row = (await conn.execute(select(attachments))).one()
     assert row.status == "failed"
     assert row.error
@@ -146,33 +202,246 @@ async def test_media_worker_marks_failure(tmp_path: Path):
         _sample("foresight_media_downloads_total", {"status": "failed"})
         == failures_before + 1
     )
-    await engine.dispose()
 
 
-async def test_media_worker_skips_oversized(tmp_path: Path):
-    from sqlalchemy import select
-    from sqlalchemy.ext.asyncio import create_async_engine
+async def test_media_worker_retries_the_download_three_times(
+    db_engine, tmp_path: Path, monkeypatch
+):
+    """One attempt and three retries are four attempts."""
+    monkeypatch.setattr(asyncio, "sleep", _no_wait)
+    repo = Repository(db_engine)
+    await repo.apply_batch([WriteOp(OpKind.ATTACHMENT, _record())])
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
-    await init_db(engine)
-    repo = Repository(engine)
+    with respx.mock:
+        route = respx.get("https://cdn.example/a.png").mock(
+            return_value=httpx.Response(500, text="boom")
+        )
+        worker = MediaWorker(repo, LocalMediaStore(tmp_path / "media"), max_concurrency=1)
+        await worker.start()
+        worker.submit(_record())
+        await _stop(worker)
+
+    assert route.call_count == 4
+
+
+async def test_media_worker_waits_longer_after_every_retry(
+    db_engine, tmp_path: Path, monkeypatch
+):
+    delays: list[float] = []
+
+    async def record(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", record)
+    repo = Repository(db_engine)
+    await repo.apply_batch([WriteOp(OpKind.ATTACHMENT, _record())])
+
+    with respx.mock:
+        respx.get("https://cdn.example/a.png").mock(
+            return_value=httpx.Response(500, text="boom")
+        )
+        worker = MediaWorker(repo, LocalMediaStore(tmp_path / "media"), max_concurrency=1)
+        await worker.start()
+        worker.submit(_record())
+        await _stop(worker)
+
+    assert len(delays) == 3
+    assert delays == sorted(delays)
+    assert delays[0] < delays[-1]
+
+
+async def test_media_worker_uses_one_client_for_every_attempt(
+    db_engine, tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(asyncio, "sleep", _no_wait)
+    clients: list[httpx.AsyncClient] = []
+
+    def factory(**kwargs) -> httpx.AsyncClient:
+        client = httpx.AsyncClient(**kwargs)
+        clients.append(client)
+        return client
+
+    repo = Repository(db_engine)
+    await repo.apply_batch([WriteOp(OpKind.ATTACHMENT, _record())])
+
+    with respx.mock:
+        respx.get("https://cdn.example/a.png").mock(
+            return_value=httpx.Response(500, text="boom")
+        )
+        worker = MediaWorker(
+            repo,
+            LocalMediaStore(tmp_path / "media"),
+            max_concurrency=1,
+            client_factory=factory,
+        )
+        await worker.start()
+        worker.submit(_record())
+        await _stop(worker)
+
+    assert len(clients) == 1
+    assert clients[0].is_closed
+
+
+async def test_media_worker_skips_oversized(db_engine, tmp_path: Path):
+    repo = Repository(db_engine)
     await repo.apply_batch([WriteOp(OpKind.ATTACHMENT, _record(size=999))])
 
     skipped_before = _sample("foresight_media_downloads_total", {"status": "skipped"})
 
-    worker = MediaWorker(
-        repo, LocalMediaStore(tmp_path / "media"), max_concurrency=1, max_bytes=10
-    )
-    await worker.start()
-    worker.submit(_record(size=999))
-    await asyncio.sleep(0.4)
-    await worker.stop()
+    with respx.mock:
+        route = respx.get("https://cdn.example/a.png").mock(
+            return_value=httpx.Response(200, content=b"too-big")
+        )
+        worker = MediaWorker(
+            repo, LocalMediaStore(tmp_path / "media"), max_concurrency=1, max_bytes=10
+        )
+        await worker.start()
+        worker.submit(_record(size=999))
+        await _stop(worker)
+        assert not route.called
 
-    async with engine.connect() as conn:
+    async with db_engine.connect() as conn:
         row = (await conn.execute(select(attachments))).one()
     assert row.status == "skipped"
     assert (
         _sample("foresight_media_downloads_total", {"status": "skipped"})
         == skipped_before + 1
     )
-    await engine.dispose()
+
+
+# --- the S3 store, against a real S3 API -------------------------------
+#
+# The store speaks the S3 protocol, so it is tested against a server that
+# speaks it too: `moto`'s server mode is a real HTTP server, and it works
+# with the async client of `aioboto3`.
+
+
+@dataclass
+class _S3Server:
+    """A running S3 API and the bucket the tests store their files in."""
+
+    endpoint_url: str
+    bucket: str
+
+    def client(self):  # noqa: ANN201
+        """A client of the server, with the credentials it accepts."""
+        return aioboto3.Session().client(
+            "s3",
+            endpoint_url=self.endpoint_url,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        )
+
+    def store(self) -> S3MediaStore:
+        """The store under test, pointed at the server."""
+        return S3MediaStore(
+            S3Config(
+                bucket=self.bucket,
+                endpoint_url=self.endpoint_url,
+                region="us-east-1",
+                prefix="foresight",
+                use_path_style=True,
+                access_key_id="test",
+                secret_access_key="test",
+            )
+        )
+
+
+def _start_s3_server() -> ThreadedMotoServer:
+    """Start the S3 server, and fail fast when it does not come up.
+
+    The server binds a port of its own, so it cannot lose a race for it.
+    The wait for it is bounded: a server that stays down must fail the
+    test instead of blocking the whole suite.
+    """
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    failures: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            server.start()
+        except BaseException as exc:  # noqa: BLE001
+            failures.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True, name="moto-s3")
+    thread.start()
+    thread.join(timeout=10)
+    if thread.is_alive():
+        raise RuntimeError("the S3 server did not start within 10 seconds")
+    if failures:
+        raise failures[0]
+    return server
+
+
+@pytest.fixture
+async def s3_server() -> AsyncIterator[_S3Server]:
+    """An S3 API on the loopback, with a bucket of its own.
+
+    The bucket carries a random name: the state of the server lives in the
+    process, so a bucket of a fixed name would survive the test that
+    created it.
+    """
+    server = _start_s3_server()
+    try:
+        host, port = server.get_host_and_port()
+        endpoint_url = f"http://{host}:{port}"
+        bucket = f"foresight-test-{uuid4().hex[:12]}"
+        async with aioboto3.Session().client(
+            "s3",
+            endpoint_url=endpoint_url,
+            region_name="us-east-1",
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+        ) as client:
+            await _within(client.create_bucket(Bucket=bucket))
+        yield _S3Server(endpoint_url=endpoint_url, bucket=bucket)
+    finally:
+        server.stop()
+
+
+async def _read_all(store: S3MediaStore, key: str) -> bytes:
+    """Every byte the store gives for a key."""
+    chunks = [chunk async for chunk in store.open(key)]
+    return b"".join(chunks)
+
+
+async def test_s3_store_put_returns_the_uri_and_stores_the_bytes(s3_server: _S3Server):
+    store = s3_server.store()
+    payload = b"binary-payload"
+
+    uri = await _within(store.put("2026/11/11/555.png", payload, "image/png"))
+
+    assert uri == f"s3://{s3_server.bucket}/foresight/2026/11/11/555.png"
+    async with s3_server.client() as client:
+        head = await _within(
+            client.head_object(
+                Bucket=s3_server.bucket, Key="foresight/2026/11/11/555.png"
+            )
+        )
+        assert head["ContentLength"] == len(payload)
+        assert head["ContentType"] == "image/png"
+        stored = await _within(
+            client.get_object(
+                Bucket=s3_server.bucket, Key="foresight/2026/11/11/555.png"
+            )
+        )
+        assert await stored["Body"].read() == payload
+
+
+async def test_s3_store_exists_is_true_only_for_a_stored_key(s3_server: _S3Server):
+    store = s3_server.store()
+    await _within(store.put("2026/11/11/555.png", b"binary-payload", "image/png"))
+
+    assert await _within(store.exists("2026/11/11/555.png")) is True
+    assert await _within(store.exists("2026/11/11/999.png")) is False
+
+
+async def test_s3_store_open_yields_the_stored_bytes(s3_server: _S3Server):
+    store = s3_server.store()
+    payload = b"binary-payload"
+    await _within(store.put("2026/11/11/555.png", payload, "image/png"))
+
+    data = await _within(_read_all(store, "2026/11/11/555.png"))
+
+    assert data == payload
