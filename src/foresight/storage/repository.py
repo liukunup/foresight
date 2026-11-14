@@ -4,6 +4,10 @@ This module owns the writes: it applies the batches of the collector, the
 AI worker and the API to the tables of `storage/tables.py`. The read side
 lives next door in `storage/stats.py`, which issues its own SELECT
 statements.
+
+The one read it owns is the list of the messages that still wait for
+their analysis: the analysis worker repairs them, so the query belongs
+next to the write that marks a message as analysed.
 """
 
 from __future__ import annotations
@@ -11,7 +15,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Callable, Mapping, Sequence
 
-from sqlalchemy import Table, bindparam, func, literal_column, update
+from sqlalchemy import Table, bindparam, func, literal_column, select, update
 from sqlalchemy.dialects.mysql import Insert as MySQLInsert
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import Insert as PGInsert
@@ -138,6 +142,35 @@ class Repository:
         """
         ordered = [kind for kind in OP_ORDER if kind in groups]
         return ordered + [kind for kind in groups if kind not in OP_ORDER]
+
+    async def pending_messages(
+        self, *, since: str | None = None, limit: int = 1000
+    ) -> list[tuple[int, str]]:
+        """The messages that still wait for their analysis.
+
+        A message whose `analysis_status` is still `pending` was never
+        analysed: it was captured while the AI was disabled, or while the
+        worker was down, or its status update was written before its row
+        existed. The collector queues these messages again when it starts,
+        so that a restart does not leave them behind for good.
+
+        The messages are ordered by their creation, so that the oldest
+        ones wait the shortest time.
+        """
+        if limit <= 0:
+            return []
+        clauses: list[Any] = [messages.c.analysis_status == "pending"]
+        if since:
+            clauses.append(messages.c.created_at >= since)
+        stmt = (
+            select(messages.c.message_id, messages.c.content)
+            .where(*clauses)
+            .order_by(messages.c.created_at)
+            .limit(limit)
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(stmt)).all()
+        return [(int(row.message_id), row.content or "") for row in rows]
 
     # -- insert helpers -------------------------------------------------
 

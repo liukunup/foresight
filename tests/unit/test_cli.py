@@ -27,7 +27,9 @@ from foresight.storage import db as storage_db
 runner = CliRunner()
 
 
-def _write_config(tmp_path: Path, channel_ids: str = "[1]") -> Path:
+def _write_config(
+    tmp_path: Path, channel_ids: str = "[1]", ai_enabled: bool = False
+) -> Path:
     """Write a config file for a SQLite database below ``tmp_path``."""
     config_path = tmp_path / "config.toml"
     config_path.write_text(
@@ -38,6 +40,9 @@ channel_ids = {channel_ids}
 [database]
 backend = "sqlite"
 path = "{tmp_path / 'data' / 'foresight.db'}"
+
+[ai]
+enabled = {"true" if ai_enabled else "false"}
 """,
         encoding="utf-8",
     )
@@ -81,6 +86,56 @@ class _FakeWriter:
         return True
 
 
+class _FakeMediaWorker:
+    """A media worker that records what it was given."""
+
+    def __init__(self, repo: Any, store: Any, events: list[str], **kwargs: Any) -> None:
+        self.repo = repo
+        self.store = store
+        self.kwargs = kwargs
+        self.events = events
+        self.records: list[Any] = []
+        self.started = False
+        self.stopped = False
+
+    async def start(self) -> None:
+        self.started = True
+        self.events.append("media.start")
+
+    async def stop(self) -> None:
+        self.stopped = True
+        self.events.append("media.stop")
+
+    def submit(self, record: Any) -> bool:
+        self.records.append(record)
+        return True
+
+
+class _FakeAnalysisWorker:
+    """An analysis worker that records the messages it was given."""
+
+    def __init__(self, repo: Any, llm: Any, events: list[str], **kwargs: Any) -> None:
+        self.repo = repo
+        self.llm = llm
+        self.kwargs = kwargs
+        self.events = events
+        self.submitted: list[tuple[int, str]] = []
+        self.started = False
+        self.stopped = False
+
+    async def start(self) -> None:
+        self.started = True
+        self.events.append("analysis.start")
+
+    async def stop(self) -> None:
+        self.stopped = True
+        self.events.append("analysis.stop")
+
+    def submit(self, message_id: int, content: str) -> bool:
+        self.submitted.append((message_id, content))
+        return True
+
+
 class _EngineProxy:
     """The real engine, with its disposal recorded."""
 
@@ -104,12 +159,26 @@ class _Collector:
     events: list[str]
     replay_paths: list[Path | None]
     writers: list[_FakeWriter]
+    media_workers: list[_FakeMediaWorker]
+    analysis_workers: list[_FakeAnalysisWorker]
     bot: _FakeBot
     db_path: Path
 
 
 @pytest.fixture
-def collector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Collector:
+def ai_enabled(request: pytest.FixtureRequest) -> bool:
+    """The collector runs without the AI, unless a test asks for it.
+
+    A test asks for the AI with
+    ``@pytest.mark.parametrize("ai_enabled", [True], indirect=True)``.
+    """
+    return bool(getattr(request, "param", False))
+
+
+@pytest.fixture
+def collector(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ai_enabled: bool
+) -> _Collector:
     """A ``foresight run`` whose Discord side is faked.
 
     The command is not started by the fixture: every test calls
@@ -119,7 +188,9 @@ def collector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Collector:
     events: list[str] = []
     replay_paths: list[Path | None] = []
     writers: list[_FakeWriter] = []
-    config_path = _write_config(tmp_path)
+    media_workers: list[_FakeMediaWorker] = []
+    analysis_workers: list[_FakeAnalysisWorker] = []
+    config_path = _write_config(tmp_path, ai_enabled=ai_enabled)
     db_path = tmp_path / "data" / "foresight.db"
 
     bot = _FakeBot(events)
@@ -137,6 +208,16 @@ def collector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Collector:
         writers.append(writer)
         return writer
 
+    def make_media_worker(repo: Any, store: Any, **kwargs: Any) -> _FakeMediaWorker:
+        worker = _FakeMediaWorker(repo, store, events, **kwargs)
+        media_workers.append(worker)
+        return worker
+
+    def make_analysis_worker(repo: Any, llm: Any, **kwargs: Any) -> _FakeAnalysisWorker:
+        worker = _FakeAnalysisWorker(repo, llm, events, **kwargs)
+        analysis_workers.append(worker)
+        return worker
+
     real_create_engine = storage_db.create_engine
 
     def fake_create_engine(config: Any) -> Any:
@@ -147,6 +228,11 @@ def collector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Collector:
     monkeypatch.setattr("foresight.writer.Writer", make_writer)
     monkeypatch.setattr("foresight.writer.recover_failed_batches", fake_recover)
     monkeypatch.setattr("foresight.storage.db.create_engine", fake_create_engine)
+    monkeypatch.setattr("foresight.media_worker.MediaWorker", make_media_worker)
+    monkeypatch.setattr("foresight.analysis.worker.AnalysisWorker", make_analysis_worker)
+    monkeypatch.setattr(
+        "foresight.storage.media.build_media_store", lambda config: "media-store"
+    )
 
     def run() -> Any:
         return runner.invoke(app, ["run", "--config", str(config_path)])
@@ -156,9 +242,47 @@ def collector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Collector:
         events=events,
         replay_paths=replay_paths,
         writers=writers,
+        media_workers=media_workers,
+        analysis_workers=analysis_workers,
         bot=bot,
         db_path=db_path,
     )
+
+
+def _seed_pending_messages(db_path: Path, count: int = 2) -> None:
+    """Put messages that wait for their analysis into the database."""
+    import asyncio
+
+    from foresight.config import DatabaseConfig
+    from foresight.domain.models import MessageRecord, OpKind, WriteOp
+    from foresight.storage.db import create_engine, init_db
+    from foresight.storage.repository import Repository
+
+    async def _run() -> None:
+        engine = create_engine(DatabaseConfig(backend="sqlite", path=str(db_path)))
+        await init_db(engine)
+        repo = Repository(engine)
+        await repo.apply_batch(
+            [
+                WriteOp(
+                    OpKind.MESSAGE,
+                    MessageRecord(
+                        message_id=index + 1,
+                        guild_id=10,
+                        channel_id=1,
+                        author_id=30,
+                        content=f"waiting {index}",
+                        message_type=0,
+                        created_at=f"2026-11-1{index}T00:00:00+00:00",
+                        captured_at="2026-11-11T00:00:00+00:00",
+                    ),
+                )
+                for index in range(count)
+            ]
+        )
+        await engine.dispose()
+
+    asyncio.run(_run())
 
 
 def test_init_db_creates_sqlite_file(tmp_path: Path):
@@ -318,7 +442,12 @@ def test_run_stops_the_writer_before_it_disposes_the_engine(collector: _Collecto
     result = collector.run()
     assert result.exit_code == 0, result.output
     assert collector.writers[0].stopped
-    assert collector.events[-3:] == ["bot.close", "writer.stop", "engine.dispose"]
+    assert collector.events[-4:] == [
+        "bot.close",
+        "media.stop",
+        "writer.stop",
+        "engine.dispose",
+    ]
 
 
 def test_run_logs_that_the_collector_starts_and_stops(collector: _Collector, caplog):
@@ -342,7 +471,7 @@ def test_run_stops_the_writer_even_when_the_bot_cannot_be_closed(
     assert result.exit_code != 0
     # The bot could not be closed, but the writer and the engine are
     # released anyway, and in the documented order.
-    assert collector.events[-2:] == ["writer.stop", "engine.dispose"]
+    assert collector.events[-3:] == ["media.stop", "writer.stop", "engine.dispose"]
 
 
 def test_run_reports_a_failing_replay_and_releases_the_engine(
@@ -387,3 +516,81 @@ def test_init_db_does_not_disguise_an_unrelated_schema_error(
     result = runner.invoke(app, ["init-db", "--config", str(_write_config(tmp_path))])
     assert isinstance(result.exception, RuntimeError)
     assert "cannot open the database" not in result.output
+
+
+def test_run_starts_the_media_worker(collector: _Collector):
+    """The attachments of a message are downloaded in the background."""
+    result = collector.run()
+    assert result.exit_code == 0, result.output
+    assert collector.media_workers[0].started
+    assert collector.media_workers[0].stopped
+
+
+def test_run_gives_the_media_worker_the_size_limit_of_the_configuration(
+    collector: _Collector,
+):
+    """The worker does not read the configuration: the limit comes with it."""
+    result = collector.run()
+    assert result.exit_code == 0, result.output
+    assert collector.media_workers[0].kwargs["max_bytes"] == 100 * 1024 * 1024
+
+
+def test_run_does_not_start_an_analysis_worker_when_the_ai_is_disabled(
+    collector: _Collector,
+):
+    """A disabled AI is not called at all, so there is no worker for it."""
+    result = collector.run()
+    assert result.exit_code == 0, result.output
+    assert collector.analysis_workers == []
+
+
+@pytest.mark.parametrize("ai_enabled", [True], indirect=True)
+def test_run_starts_the_analysis_worker_when_the_ai_is_enabled(
+    collector: _Collector,
+):
+    result = collector.run()
+    assert result.exit_code == 0, result.output
+    assert collector.analysis_workers[0].started
+    assert collector.analysis_workers[0].stopped
+
+
+@pytest.mark.parametrize("ai_enabled", [True], indirect=True)
+def test_run_stops_the_analysis_worker_before_the_media_worker(
+    collector: _Collector,
+):
+    """The analysis is the slowest work: it stops first."""
+    result = collector.run()
+    assert result.exit_code == 0, result.output
+    events = collector.events
+    assert events.index("analysis.stop") < events.index("media.stop")
+    assert events.index("media.stop") < events.index("writer.stop")
+
+
+@pytest.mark.parametrize("ai_enabled", [True], indirect=True)
+def test_run_queues_the_messages_that_wait_for_their_analysis(
+    collector: _Collector,
+):
+    """A restart must not leave the messages that were never analysed.
+
+    A message whose analysis never happened keeps the status `pending`,
+    so the collector queues it again when it starts.
+    """
+    _seed_pending_messages(collector.db_path, count=2)
+
+    result = collector.run()
+
+    assert result.exit_code == 0, result.output
+    submitted = collector.analysis_workers[0].submitted
+    assert sorted(submitted) == [(1, "waiting 0"), (2, "waiting 1")]
+
+
+def test_run_does_not_queue_anything_without_an_analysis_worker(
+    collector: _Collector,
+):
+    """Without the AI there is no worker that could analyse a message."""
+    _seed_pending_messages(collector.db_path, count=2)
+
+    result = collector.run()
+
+    assert result.exit_code == 0, result.output
+    assert collector.analysis_workers == []

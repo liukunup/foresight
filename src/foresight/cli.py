@@ -7,7 +7,7 @@ import logging
 import os
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, NoReturn, Optional
+from typing import Any, NamedTuple, NoReturn, Optional
 
 import typer
 
@@ -17,6 +17,11 @@ from foresight.logging_setup import setup_logging
 logger = logging.getLogger(__name__)
 
 app = typer.Typer(add_completion=False, help="ForeSight — Discord message dump service")
+
+# The number of messages that are queued for the analysis again when the
+# collector starts. A message that was never analysed must not wait for
+# the next restart of the operator (spec §10.3).
+PENDING_REQUEUE_LIMIT = 1000
 
 
 def _load(config_path: Optional[str]) -> Config:
@@ -88,13 +93,45 @@ def init_db(
     typer.echo(f"schema ready at {settings.database.path}")
 
 
-async def _build_collector(settings: Config) -> tuple[Any, Any, Any]:
+class _CollectorResources(NamedTuple):
+    """Everything a running collector owns.
+
+    The command that built them releases them again, in the order the
+    service needs: the bot first, so that no event arrives any more, then
+    the workers, then the writer and finally the engine.
+    """
+
+    engine: Any
+    writer: Any
+    bot: Any
+    media_worker: Any
+    analysis_worker: Any
+
+
+async def _requeue_pending_analysis(repo: Any, worker: Any) -> int:
+    """Queue the messages that are still waiting for their analysis.
+
+    A message that was captured while the AI was disabled — or while the
+    worker was down — keeps the status `pending`. A restart must not
+    leave it there for good, so the pending messages are queued again
+    (spec §10.3).
+    """
+    pending = await repo.pending_messages(limit=PENDING_REQUEUE_LIMIT)
+    for message_id, content in pending:
+        worker.submit(message_id, content)
+    if pending:
+        logger.info("queued %d messages for the analysis again", len(pending))
+    return len(pending)
+
+
+async def _build_collector(settings: Config) -> _CollectorResources:
     """Build the engine, the writer and the bot of the collector.
 
     Both commands that collect messages use this helper, so the two of
     them cannot drift apart: the database is opened, the schema is
-    created, the failure file is replayed, the writer is started and the
-    bot is built — always in that order.
+    created, the failure file is replayed, the writer is started, the
+    media and the analysis workers are started and the bot is built —
+    always in that order.
 
     The resources are returned to the caller, which releases them again.
     A failure in the middle releases what was already built, so a command
@@ -102,9 +139,13 @@ async def _build_collector(settings: Config) -> tuple[Any, Any, Any]:
     """
     from sqlalchemy.exc import SQLAlchemyError
 
+    from foresight.analysis.llm import LlmClient
+    from foresight.analysis.worker import AnalysisWorker
     from foresight.bot import build_bot
     from foresight.events import EventHandler
+    from foresight.media_worker import MediaWorker
     from foresight.storage.db import create_engine, init_db as create_tables
+    from foresight.storage.media import build_media_store
     from foresight.storage.repository import Repository
     from foresight.writer import Writer, recover_failed_batches
 
@@ -114,6 +155,9 @@ async def _build_collector(settings: Config) -> tuple[Any, Any, Any]:
 
     engine: Any = None
     writer: Any = None
+    bot: Any = None
+    media_worker: Any = None
+    analysis_worker: Any = None
     try:
         try:
             engine = create_engine(settings.database)
@@ -145,19 +189,73 @@ async def _build_collector(settings: Config) -> tuple[Any, Any, Any]:
             # the operator, not a crash of the collector.
             _fail(f"cannot replay the failure file {failure_path}: {exc}")
         await writer.start()
-        handler = EventHandler(settings, writer)
+        media_worker = MediaWorker(
+            repo,
+            build_media_store(settings.media),
+            max_concurrency=settings.media.download_concurrency,
+            max_bytes=settings.media.max_download_size_mb * 1024 * 1024,
+        )
+        await media_worker.start()
+        if settings.ai.enabled:
+            analysis_worker = AnalysisWorker(
+                repo,
+                LlmClient(settings.ai),
+                max_concurrency=settings.ai.max_concurrency,
+            )
+            await analysis_worker.start()
+            # The messages that were never analysed are queued again, so
+            # that a restart does not leave them behind for good.
+            await _requeue_pending_analysis(repo, analysis_worker)
+        handler = EventHandler(
+            settings,
+            writer,
+            media_sink=media_worker.submit,
+            analysis_sink=(
+                analysis_worker.submit if analysis_worker is not None else None
+            ),
+        )
         bot = build_bot(settings, handler)
-        return engine, writer, bot
+        return _CollectorResources(
+            engine, writer, bot, media_worker, analysis_worker
+        )
     except BaseException:
         # The resources that were already built are released again, so
         # that a command that does not start leaves nothing behind.
-        try:
-            if writer is not None:
-                await writer.stop()
-        finally:
-            if engine is not None:
-                await engine.dispose()
+        await _release(
+            _CollectorResources(engine, writer, bot, media_worker, analysis_worker)
+        )
         raise
+
+
+async def _release(resources: _CollectorResources | None) -> None:
+    """Release the resources of a collector.
+
+    Every step runs, even when the one before it failed: a bot that
+    cannot be closed must not keep the writer from being stopped. The
+    order is the one the service needs — the bot first, so that no event
+    arrives any more, then the workers, then the writer and finally the
+    engine.
+    """
+    if resources is None:
+        return
+    try:
+        if resources.bot is not None:
+            await resources.bot.close()
+    finally:
+        try:
+            if resources.analysis_worker is not None:
+                await resources.analysis_worker.stop()
+        finally:
+            try:
+                if resources.media_worker is not None:
+                    await resources.media_worker.stop()
+            finally:
+                try:
+                    if resources.writer is not None:
+                        await resources.writer.stop()
+                finally:
+                    if resources.engine is not None:
+                        await resources.engine.dispose()
 
 
 @app.command()
@@ -180,32 +278,21 @@ def run(
     async def _run() -> None:
         # Every resource that was created is released again, even when the
         # step before it failed.
-        engine: Any = None
-        writer: Any = None
-        bot: Any = None
+        resources: _CollectorResources | None = None
         try:
-            engine, writer, bot = await _build_collector(settings)
+            resources = await _build_collector(settings)
             logger.info(
                 "collector starting: channels=%s database=%s",
                 ", ".join(str(cid) for cid in settings.discord.channel_ids),
                 settings.database.path,
             )
-            await bot.start(token)
+            await resources.bot.start(token)
         finally:
             logger.info("collector stopping")
             # Every step runs, even when the one before it failed: the bot
-            # is closed first, then the writer is stopped, then the engine
-            # is disposed.
-            try:
-                if bot is not None:
-                    await bot.close()
-            finally:
-                try:
-                    if writer is not None:
-                        await writer.stop()
-                finally:
-                    if engine is not None:
-                        await engine.dispose()
+            # is closed first, then the workers are stopped, then the
+            # writer is stopped, then the engine is disposed.
+            await _release(resources)
 
     asyncio.run(_run())
 
@@ -324,13 +411,11 @@ def both(
     async def _run() -> None:
         # Every resource that was created is released again, even when the
         # step before it failed.
-        engine: Any = None
+        resources: _CollectorResources | None = None
         api_engine: Any = None
-        writer: Any = None
-        bot: Any = None
         server_task: Any = None
         try:
-            engine, writer, bot = await _build_collector(settings)
+            resources = await _build_collector(settings)
             # The API gets an engine of its own, one that can only read.
             # The engine of the collector writes, and the API must not be
             # able to write even when both run in the same process.
@@ -354,7 +439,7 @@ def both(
             # The collector and the API are watched together: when the API
             # dies, the collector stops as well instead of running on
             # without it.
-            bot_task = asyncio.create_task(bot.start(token))
+            bot_task = asyncio.create_task(resources.bot.start(token))
             server_task = asyncio.create_task(_run_server(server))
             done, _pending = await asyncio.wait(
                 {bot_task, server_task}, return_when=asyncio.FIRST_COMPLETED
@@ -376,25 +461,18 @@ def both(
             logger.info("collector and API stopping")
             # Every step runs, even when the one before it failed: the API
             # server is stopped first, then the bot is closed, then the
-            # writer is stopped, then the engines are disposed.
+            # workers are stopped, then the writer is stopped and the
+            # engines are disposed.
             try:
                 if server_task is not None:
                     await _stop_server(server_task)
             finally:
                 try:
-                    if bot is not None:
-                        await bot.close()
+                    await _release(resources)
                 finally:
-                    try:
-                        if writer is not None:
-                            await writer.stop()
-                    finally:
-                        try:
-                            if api_engine is not None:
-                                await api_engine.dispose()
-                        finally:
-                            if engine is not None:
-                                await engine.dispose()
+                    if api_engine is not None:
+                        await api_engine.dispose()
+
 
     asyncio.run(_run())
 

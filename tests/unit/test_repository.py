@@ -750,3 +750,65 @@ async def test_unknown_op_kind_writes_nothing_of_the_batch(repo_and_engine):
     assert message_rows == []
     assert user_rows == []
 
+
+async def test_pending_messages_are_the_ones_that_wait_for_their_analysis(
+    repo_and_engine,
+):
+    """Only the messages whose status is `pending` are still to be analysed."""
+    repo, engine = repo_and_engine
+    await repo.apply_batch(
+        [
+            WriteOp(OpKind.MESSAGE, _message(content="waiting", message_id=1)),
+            WriteOp(OpKind.MESSAGE, _message(content="done", message_id=2)),
+        ]
+    )
+    await repo.apply_batch([WriteOp(OpKind.ANALYSIS_STATUS, (2, "done"))])
+
+    pending = await repo.pending_messages()
+
+    assert pending == [(1, "waiting")]
+
+
+async def test_pending_messages_are_the_oldest_first(repo_and_engine):
+    """The oldest message waits the shortest time."""
+    repo, engine = repo_and_engine
+    for index, created in enumerate(
+        ["2026-11-12T00:00:00+00:00", "2026-11-10T00:00:00+00:00"]
+    ):
+        record = _message(content=f"message {index}", message_id=index + 1)
+        record.created_at = created
+        await repo.apply_batch([WriteOp(OpKind.MESSAGE, record)])
+
+    pending = await repo.pending_messages()
+
+    assert [content for _, content in pending] == ["message 1", "message 0"]
+
+
+async def test_pending_messages_can_be_bounded(repo_and_engine):
+    """The queue of the analysis worker is bounded, so the list is too."""
+    repo, engine = repo_and_engine
+    for index in range(3):
+        record = _message(content=f"message {index}", message_id=index + 1)
+        record.created_at = f"2026-11-1{index}T00:00:00+00:00"
+        await repo.apply_batch([WriteOp(OpKind.MESSAGE, record)])
+
+    assert await repo.pending_messages(limit=2) == [
+        (1, "message 0"),
+        (2, "message 1"),
+    ]
+    assert await repo.pending_messages(limit=0) == []
+
+
+async def test_pending_messages_can_be_bounded_by_time(repo_and_engine):
+    """The lower bound is the creation of the message."""
+    repo, engine = repo_and_engine
+    for index, created in enumerate(
+        ["2026-11-01T00:00:00+00:00", "2026-11-10T00:00:00+00:00"]
+    ):
+        record = _message(content=f"message {index}", message_id=index + 1)
+        record.created_at = created
+        await repo.apply_batch([WriteOp(OpKind.MESSAGE, record)])
+
+    pending = await repo.pending_messages(since="2026-11-05T00:00:00+00:00")
+
+    assert pending == [(2, "message 1")]

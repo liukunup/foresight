@@ -56,11 +56,13 @@ class EventHandler:
         config: Any,
         writer: Any,
         media_sink: Callable[[AttachmentRecord], None] | None = None,
+        analysis_sink: Callable[[int, str], None] | None = None,
         bot_user_id: int | None = None,
     ) -> None:
         self._whitelist = set(config.discord.channel_ids)
         self._writer = writer
         self._media_sink = media_sink
+        self._analysis_sink = analysis_sink
         self._bot_user_id = bot_user_id
         self._media_backend = getattr(getattr(config, "media", None), "backend", "local")
 
@@ -84,6 +86,11 @@ class EventHandler:
                     channel_id=_label(record.channel_id),
                     guild_id=_label(record.guild_id),
                 ).inc()
+                if self._analysis_sink is not None and record.content.strip():
+                    # Only a message that reached the writer is analysed: a
+                    # message the queue refused has no row in the database,
+                    # so its analysis would be an analysis of nothing.
+                    self._analysis_sink(record.message_id, record.content)
             self._writer.submit(
                 WriteOp(OpKind.USER, map_user(message.author, updated_at=captured_at))
             )
