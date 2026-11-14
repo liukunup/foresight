@@ -21,6 +21,30 @@ MediaBackend = Literal["local", "s3"]
 DEFAULT_CONFIG_PATH = "config.toml"
 
 
+def sqlite_readonly_uri(path: str) -> str:
+    """The URI that opens a SQLite database read-only.
+
+    The path is escaped, so that a path that carries a `?` or a `#` does
+    not break the URI: those two characters start the query string and
+    the fragment of a URI, and the driver would read the rest of the
+    path as a parameter of the connection.
+    """
+    return f"file:{quote(path, safe='/')}?mode=ro"
+
+
+def sqlite_readonly_url(path: str) -> str:
+    """The URL of the engine that opens a SQLite database read-only.
+
+    The path is escaped twice: the first escaping is for the URI of
+    SQLite, the second one for the URL of SQLAlchemy — which unquotes
+    the part of the URL it hands to the driver. Without the second
+    escaping the driver would read the `?` of the path as the start of
+    the query string of the URI, and would open another database.
+    """
+    escaped = quote(quote(path, safe="/"), safe="/")
+    return f"sqlite+aiosqlite:///file:{escaped}?mode=ro&uri=true"
+
+
 class ConfigError(Exception):
     """Raised when configuration is missing or invalid."""
 
@@ -67,7 +91,7 @@ class DatabaseConfig:
         at query time by a read-only transaction in the query runner.
         """
         if self.backend == "sqlite":
-            return f"sqlite+aiosqlite:///file:{self.path}?mode=ro&uri=true"
+            return sqlite_readonly_url(self.path)
         return self.sqlalchemy_url
 
 

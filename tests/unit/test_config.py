@@ -1,10 +1,19 @@
+import asyncio
 import logging
+import sqlite3
 from pathlib import Path
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import create_async_engine
 
-from foresight.config import ConfigError, load_config
+from foresight.config import (
+    ConfigError,
+    DatabaseConfig,
+    load_config,
+    sqlite_readonly_uri,
+)
 from foresight.logging_setup import setup_logging
 
 
@@ -227,6 +236,54 @@ def test_readonly_sqlalchemy_url_for_sqlite_is_read_only_uri(tmp_path: Path) -> 
         config.database.readonly_sqlalchemy_url
         == "sqlite+aiosqlite:///file:data/foresight.db?mode=ro&uri=true"
     )
+
+
+def test_the_read_only_uri_escapes_the_path_of_the_database(tmp_path: Path) -> None:
+    """A path with a `?` or a `#` in it still opens the right file.
+
+    Those two characters start the query string and the fragment of a
+    URI: without the escaping the driver would read the rest of the path
+    as a parameter of the connection, and the database of the path would
+    never be opened.
+    """
+    path = tmp_path / "a?b#c.db"
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("CREATE TABLE t (a INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    uri = sqlite_readonly_uri(str(path))
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_the_read_only_uri_of_the_config_escapes_the_path(tmp_path: Path) -> None:
+    """The URL of the engine opens the file the path names."""
+    path = tmp_path / "a?b#c.db"
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("CREATE TABLE t (a INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    config = DatabaseConfig(backend="sqlite", path=str(path))
+    engine = create_async_engine(config.readonly_sqlalchemy_url)
+
+    async def _count() -> int:
+        async with engine.connect() as conn:
+            result = await conn.execute(text("SELECT COUNT(*) FROM t"))
+            return int(result.scalar_one())
+
+    try:
+        assert asyncio.run(_count()) == 0
+    finally:
+        asyncio.run(engine.dispose())
 
 
 def test_readonly_sqlalchemy_url_for_postgres_matches_sqlalchemy_url(

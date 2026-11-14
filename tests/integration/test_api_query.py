@@ -7,8 +7,11 @@ ways of writing to the database are refused.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 
 from foresight.api.app import create_app
 from foresight.api.query import (
@@ -19,50 +22,9 @@ from foresight.api.query import (
 )
 from foresight.config import DatabaseConfig
 
+from fakes import RecordingEngine
+
 from .conftest import api_config, api_message
-
-
-class _RecordingResult:
-    """The result of a statement that returned no rows."""
-
-    def keys(self) -> list[str]:
-        return ["x"]
-
-    def fetchmany(self, size: int) -> list[list[object]]:
-        return []
-
-
-class _RecordingConnection:
-    """A connection that records the statements it was asked to run."""
-
-    def __init__(self, statements: list[str]) -> None:
-        self._statements = statements
-
-    async def __aenter__(self) -> "_RecordingConnection":
-        return self
-
-    async def __aexit__(self, *exc_info: object) -> bool:
-        return False
-
-    async def execute(
-        self, statement: object, parameters: object = None
-    ) -> _RecordingResult:
-        self._statements.append(str(statement))
-        return _RecordingResult()
-
-
-class _RecordingEngine:
-    """An engine that records the statements it was asked to run."""
-
-    def __init__(self) -> None:
-        self.statements: list[str] = []
-        self.disposed = False
-
-    def connect(self) -> _RecordingConnection:
-        return _RecordingConnection(self.statements)
-
-    async def dispose(self) -> None:
-        self.disposed = True
 
 
 async def test_query_returns_rows(api_client, auth):
@@ -307,6 +269,44 @@ async def test_query_reports_a_broken_statement(api_client, auth):
     assert response.status_code == 400
 
 
+async def test_the_endpoint_stops_a_statement_that_runs_too_long(
+    api_harness, monkeypatch
+):
+    """A statement that never ends is answered, not waited for.
+
+    The endpoint is often open, so a caller that repeats a statement
+    that never ends would take the service down with it: every
+    statement is bounded by a deadline.
+    """
+    monkeypatch.setattr("foresight.api.query.QUERY_TIMEOUT_SECONDS", 0.5)
+    harness = await api_harness()
+    async with harness.engine.begin() as conn:
+        await conn.execute(text("CREATE TABLE big (i INTEGER)"))
+        await conn.execute(
+            text("INSERT INTO big (i) VALUES (:i)"),
+            [{"i": index} for index in range(2000)],
+        )
+
+    started = time.perf_counter()
+    response = await harness.client.post(
+        "/api/query",
+        headers={"Authorization": "Bearer secret-token"},
+        json={"sql": "SELECT COUNT(*) FROM big a, big b, big c", "params": {}},
+    )
+    elapsed = time.perf_counter() - started
+
+    assert response.status_code == 400
+    assert elapsed < 20
+    # The endpoint is still alive: the next statement is answered.
+    counted = await harness.client.post(
+        "/api/query",
+        headers={"Authorization": "Bearer secret-token"},
+        json={"sql": "SELECT COUNT(*) FROM big", "params": {}},
+    )
+    assert counted.status_code == 200
+    assert counted.json()["rows"] == [[2000]]
+
+
 async def test_query_reports_a_broken_database_as_a_server_error(
     tmp_path, monkeypatch
 ):
@@ -337,14 +337,14 @@ async def test_the_read_only_transaction_matches_the_dialect():
     stays writable. MySQL needs the session form, and the backend is
     known when the runner is built, so the statement is chosen then.
     """
-    engine = _RecordingEngine()
+    engine = RecordingEngine()
     runner = SqlAlchemyQueryRunner(
         DatabaseConfig(backend="postgresql"), engine=engine
     )
     await runner.run("SELECT 1", {}, 10, 0)
     assert engine.statements[0] == "SET TRANSACTION READ ONLY"
 
-    engine = _RecordingEngine()
+    engine = RecordingEngine()
     runner = SqlAlchemyQueryRunner(DatabaseConfig(backend="mysql"), engine=engine)
     await runner.run("SELECT 1", {}, 10, 0)
     assert engine.statements[0] == "SET SESSION TRANSACTION READ ONLY"
@@ -364,7 +364,7 @@ async def test_the_runner_closes_the_engine_it_builds():
 
 async def test_the_runner_does_not_close_an_injected_engine():
     """An injected engine belongs to the caller, which may still use it."""
-    engine = _RecordingEngine()
+    engine = RecordingEngine()
     runner = SqlAlchemyQueryRunner(
         DatabaseConfig(backend="postgresql"), engine=engine
     )
