@@ -108,6 +108,8 @@ compose 另外用一个 `FORESIGHT_PORT` 决定宿主机上映射出来的端口
 
 每条命令都接受 `--config` 指定别的配置文件。
 
+`foresight stats` 的 `--since` / `--until` 与 API 的时间边界同义：纯日期表示整天，写法不对会直接报错退出（退出码 2）。
+
 ## 安装 AI Skill
 
 ```bash

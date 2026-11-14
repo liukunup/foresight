@@ -19,6 +19,12 @@ runner = CliRunner()
 
 
 def _seed_db(tmp_path: Path, count: int = 1) -> Path:
+    """Seed the database with `count` messages of the same day."""
+    return _seed_messages(tmp_path, ["2026-11-11T00:00:00+00:00"] * count)
+
+
+def _seed_messages(tmp_path: Path, created_at: list[str]) -> Path:
+    """Seed the database with one message per timestamp."""
     import asyncio
 
     from foresight.config import DatabaseConfig
@@ -44,11 +50,11 @@ def _seed_db(tmp_path: Path, count: int = 1) -> Path:
                         author_id=30,
                         content="hello",
                         message_type=0,
-                        created_at="2026-11-11T00:00:00+00:00",
+                        created_at=timestamp,
                         captured_at="2026-11-11T00:00:00+00:00",
                     ),
                 )
-                for index in range(count)
+                for index, timestamp in enumerate(created_at)
             ]
         )
         await engine.dispose()
@@ -129,6 +135,62 @@ def test_stats_command_reports_an_unusable_database(tmp_path: Path):
     # The operator gets a message, not a traceback.
     assert "Traceback" not in result.output
     assert "error:" in result.output
+
+
+def test_stats_command_until_with_a_bare_date_covers_the_whole_day(tmp_path: Path):
+    """A bare date names a day, and not the second after its start.
+
+    The bounds are compared as strings against the stored timestamps, so
+    the bare date `2026-11-01` would sort before every message of that
+    day and would drop the whole day from the answer. The command
+    normalizes the bounds the way the API does.
+    """
+    path = _seed_messages(
+        tmp_path,
+        [
+            "2026-11-01T00:00:00+00:00",
+            "2026-11-01T12:00:00+00:00",
+            "2026-11-01T23:59:59.999999+00:00",
+            "2026-11-02T00:00:00+00:00",
+        ],
+    )
+    result = runner.invoke(
+        app, ["stats", "--db", str(path), "--until", "2026-11-01"]
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["total_messages"] == 3
+
+
+def test_stats_command_since_with_a_bare_date_starts_at_midnight(tmp_path: Path):
+    """The lower bound of a bare date is the first second of the day."""
+    path = _seed_messages(
+        tmp_path,
+        [
+            "2026-10-31T23:59:59.999999+00:00",
+            "2026-11-01T00:00:00+00:00",
+            "2026-11-01T23:59:59.999999+00:00",
+        ],
+    )
+    result = runner.invoke(
+        app, ["stats", "--db", str(path), "--since", "2026-11-01"]
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["total_messages"] == 2
+
+
+def test_stats_command_refuses_a_malformed_bound(tmp_path: Path):
+    """A bound that cannot be read is an error, like it is in the API.
+
+    A bound that cannot be read must not answer with a silently empty
+    range: the operator is told which bound is wrong.
+    """
+    path = _seed_db(tmp_path)
+    result = runner.invoke(
+        app, ["stats", "--db", str(path), "--until", "yesterday"]
+    )
+    assert result.exit_code == 2
+    assert "until" in result.output
+    assert "Traceback" not in result.output
 
 
 def test_serve_refuses_remote_bind_without_token(tmp_path: Path, monkeypatch):

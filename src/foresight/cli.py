@@ -665,8 +665,8 @@ def query(
 @app.command()
 def stats(
     db: str = typer.Option(..., "--db", help="Path to the SQLite database file"),
-    since: Optional[str] = typer.Option(None, help="ISO timestamp lower bound"),
-    until: Optional[str] = typer.Option(None, help="ISO timestamp upper bound"),
+    since: Optional[str] = typer.Option(None, help="ISO date or timestamp lower bound"),
+    until: Optional[str] = typer.Option(None, help="ISO date or timestamp upper bound"),
 ) -> None:
     """Print an overview of the captured messages."""
     import json
@@ -674,7 +674,18 @@ def stats(
     from sqlalchemy.exc import SQLAlchemyError
     from sqlalchemy.ext.asyncio import create_async_engine
 
+    from foresight.api.deps import normalize_time_bounds
     from foresight.storage.stats import StatsService
+
+    # The bounds are normalized the way the API normalizes them: a bare
+    # date names a whole day, so `--until 2026-11-01` does not drop the
+    # day it names. A bound that cannot be read is reported instead of
+    # answering with an empty range.
+    try:
+        bounds = normalize_time_bounds(since, until)
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
 
     async def _run() -> dict:
         # The engine is built here and not through the storage layer: this
@@ -684,7 +695,9 @@ def stats(
         url = DatabaseConfig(backend="sqlite", path=db).readonly_sqlalchemy_url
         engine = create_async_engine(url)
         try:
-            return await StatsService(engine).overview(since=since, until=until)
+            return await StatsService(engine).overview(
+                since=bounds.since, until=bounds.until
+            )
         except SQLAlchemyError as exc:
             # A file that is not there, a database without the schema: the
             # operator gets the cause, not a traceback.

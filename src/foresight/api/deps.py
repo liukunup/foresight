@@ -1,4 +1,9 @@
-"""FastAPI dependencies: engine access, stats service, bearer auth, time bounds."""
+"""FastAPI dependencies: engine access, stats service, bearer auth, time bounds.
+
+The time bounds are normalized in one place, and the command line uses the
+same normalization, so a bound means the same thing in the API and in the
+terminal.
+"""
 
 from __future__ import annotations
 
@@ -64,12 +69,29 @@ def _normalize_bound(value: str, name: str, *, end_of_day: bool) -> str:
             pass
         else:
             return value
-    raise HTTPException(
-        status_code=422,
-        detail=(
-            f"invalid '{name}': {value!r} is neither an ISO-8601 timestamp "
-            "nor a date of the form YYYY-MM-DD"
-        ),
+    raise ValueError(
+        f"invalid '{name}': {value!r} is neither an ISO-8601 timestamp "
+        "nor a date of the form YYYY-MM-DD"
+    )
+
+
+def normalize_time_bounds(
+    since: str | None = None,
+    until: str | None = None,
+) -> TimeBounds:
+    """Read and normalize the time bounds.
+
+    The API and the CLI normalize the bounds the same way, so a bound
+    means the same thing in both: a bare date names a whole day, and a
+    bound that cannot be read is refused instead of answering with a
+    silently empty range.
+
+    Raises a `ValueError` when a bound cannot be read — the caller
+    decides how to report it.
+    """
+    return TimeBounds(
+        since=_normalize_bound(since, "since", end_of_day=False) if since else None,
+        until=_normalize_bound(until, "until", end_of_day=True) if until else None,
     )
 
 
@@ -82,11 +104,14 @@ def time_bounds(
     Every endpoint that filters by time takes this dependency, so the
     bounds are read and normalized in one place: an endpoint cannot
     forget the normalization, and the endpoints cannot drift apart.
+
+    A bound that cannot be read is refused with a 422 that names the
+    parameter that is wrong.
     """
-    return TimeBounds(
-        since=_normalize_bound(since, "since", end_of_day=False) if since else None,
-        until=_normalize_bound(until, "until", end_of_day=True) if until else None,
-    )
+    try:
+        return normalize_time_bounds(since, until)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def get_engine(request: Request) -> AsyncEngine:
