@@ -99,9 +99,9 @@ meant: pick the range out of the question ("this week", "since the
 launch", "in July") and say it in the answer.
 
 Use a **full timestamp with the offset**, e.g. `2026-11-11T00:00:00+00:00`.
-The bounds are compared as strings against the stored timestamps, so a
-bare date such as `2026-11-11` sorts before every message of that day and
-`until=2026-11-11` silently drops the whole day.
+A bare date such as `2026-11-11` works as well: it is the first second of
+the day for `since` and the last one for `until`, so it names the whole
+day. A value that is neither a timestamp nor a date is refused with a 422.
 
 ### Free-form SQL
 

@@ -44,9 +44,9 @@ the whole archive, which is almost never what the user meant — always pick
 a range and report it.
 
 Use a **full timestamp with the offset**, e.g. `2026-11-11T00:00:00+00:00`.
-The bounds are compared as strings against the stored timestamps, so a
-bare date such as `2026-11-11` sorts before every message of that day and
-`until=2026-11-11` silently drops the whole day.
+A bare date such as `2026-11-11` works as well: it is the first second of
+the day for `since` and the last one for `until`, so it names the whole
+day. A value that is neither a timestamp nor a date is refused with a 422.
 
 ## Endpoints
 
@@ -73,9 +73,10 @@ it was sent.
 | `order` | string | `asc` or `desc` by `created_at` (default `desc`) |
 | `limit`, `offset` | int | pagination |
 
-The bounds are compared as strings, so they must be full ISO-8601
-timestamps such as `2026-11-11T00:00:00+00:00`. A bare date compares
-before every message of that day and would drop it from an `until` bound.
+The bounds are compared as strings, so a full ISO-8601 timestamp such as
+`2026-11-11T00:00:00+00:00` is used as it is. A bare date
+(`2026-11-11`) is expanded to the first second of the day for `since` and
+to the last one for `until`, so it names the whole day.
 
 `q` matches a case insensitive substring. SQLite folds ASCII only, so a
 search for a non-ASCII upper case letter does not match its lower case

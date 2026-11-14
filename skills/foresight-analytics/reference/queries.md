@@ -5,8 +5,9 @@ them correctly with plain string comparison.
 
 The API filter `since`/`until` is the SQL bound `created_at >= '...'` /
 `created_at <= '...'`. Use a full timestamp with the offset
-(`2026-11-11T00:00:00+00:00`): a bare date compares before every message
-of that day and would drop it from an `until` bound.
+(`2026-11-11T00:00:00+00:00`). A bare date (`2026-11-11`) is expanded by
+the API to the first second of the day for `since` and to the last one for
+`until`, so it names the whole day.
 
 ## Who talks the most
 
