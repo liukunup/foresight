@@ -105,9 +105,21 @@ def _attachment(message_id: int = 1, attachment_id: int = 555) -> AttachmentReco
     )
 
 
-def _user(username: str = "alice") -> UserSnapshot:
+def _channel(name: str = "general", channel_id: int = 20) -> ChannelSnapshot:
+    return ChannelSnapshot(
+        channel_id=channel_id,
+        guild_id=10,
+        name=name,
+        topic="chat",
+        channel_type="text",
+        position=1,
+        captured_at="2026-11-11T00:00:00+00:00",
+    )
+
+
+def _user(username: str = "alice", user_id: int = 30) -> UserSnapshot:
     return UserSnapshot(
-        user_id=30,
+        user_id=user_id,
         username=username,
         global_name="Alice",
         display_name="alice#1",
@@ -155,6 +167,19 @@ async def _compiled_for(
 def _message_values() -> dict[str, Any]:
     """The values the repository writes for one message."""
     return Repository._message_values(_message())
+
+
+def _insert_rows(sql: str) -> int:
+    """The number of rows a multi-row insert statement carries.
+
+    The repository writes a group of one kind with a single statement, so
+    the number of its rows is the number of the records of the group. A
+    group that carries the same conflict key twice is a group PostgreSQL
+    refuses — "ON CONFLICT DO UPDATE command cannot affect row a second
+    time" — so the group must be reduced before the statement is built.
+    """
+    values = sql.split("VALUES", 1)[1]
+    return values.count("), (") + 1
 
 
 _ATTACHMENT_VALUES = {
@@ -236,7 +261,13 @@ async def test_message_delete_is_soft(repo_and_engine):
     assert row.content == "keep me"
 
 
-async def test_reaction_upsert_clears_removed_at(repo_and_engine):
+async def test_reaction_upsert_keeps_the_removed_at(repo_and_engine):
+    """A reaction that was taken back must not be resurrected.
+
+    The record of a reaction never carries a removal — the removal is its
+    own operation — so a record that is written again would clear the
+    removal of the row and resurrect a reaction the user took back.
+    """
     repo, engine = repo_and_engine
     reaction = ReactionRecord(1, 30, "🔥", None, False, "2026-11-11T00:00:00+00:00")
     await repo.apply_batch([WriteOp(OpKind.REACTION, reaction)])
@@ -249,7 +280,7 @@ async def test_reaction_upsert_clears_removed_at(repo_and_engine):
     async with engine.connect() as conn:
         rows = (await conn.execute(select(reactions))).all()
     assert len(rows) == 1
-    assert rows[0].removed_at is None
+    assert rows[0].removed_at == "2026-11-11T04:00:00+00:00"
 
 
 async def test_user_snapshot_is_upserted(repo_and_engine):
@@ -427,7 +458,7 @@ async def test_mysql_insert_only_only_sets_the_last_insert_id_for_auto_increment
     )
     assert "last_insert_id" in attachment_sql.lower()
     assert "last_insert_id" not in message_sql.lower()
-    assert "message_id = message_id" in message_sql
+    assert "message_id = messages.message_id" in message_sql
     set_clause = message_sql.lower().split("on duplicate key update", 1)[1]
     assert "values(" not in set_clause
 
@@ -812,3 +843,305 @@ async def test_pending_messages_can_be_bounded_by_time(repo_and_engine):
     pending = await repo.pending_messages(since="2026-11-05T00:00:00+00:00")
 
     assert pending == [(2, "message 1")]
+
+
+# -- a group that carries the same conflict key twice --------------------
+#
+# The collector writes a snapshot of the author, the channel and the guild
+# with every message, so two messages of the same author inside one flush
+# window carry the same key. PostgreSQL refuses such a statement and MySQL
+# refuses the insert-only form of it, so the group is reduced to one row
+# per key before the statement is built.
+
+
+async def test_a_batch_with_two_users_of_the_same_id_keeps_the_last_one(
+    repo_and_engine,
+):
+    repo, engine = repo_and_engine
+    await repo.apply_batch(
+        [
+            WriteOp(OpKind.USER, _user("alice")),
+            WriteOp(OpKind.USER, _user("alice2")),
+        ]
+    )
+    async with engine.connect() as conn:
+        rows = (await conn.execute(select(users))).all()
+    assert len(rows) == 1
+    assert rows[0].username == "alice2"
+
+
+async def test_a_batch_with_two_channels_of_the_same_id_keeps_the_last_one(
+    repo_and_engine,
+):
+    repo, engine = repo_and_engine
+    await repo.apply_batch(
+        [
+            WriteOp(OpKind.CHANNEL, _channel("general")),
+            WriteOp(OpKind.CHANNEL, _channel("general-v2")),
+        ]
+    )
+    async with engine.connect() as conn:
+        rows = (await conn.execute(select(channels))).all()
+    assert len(rows) == 1
+    assert rows[0].name == "general-v2"
+
+
+async def test_a_batch_with_two_messages_of_the_same_id_keeps_the_last_one(
+    repo_and_engine,
+):
+    repo, engine = repo_and_engine
+    await repo.apply_batch(
+        [
+            WriteOp(OpKind.MESSAGE, _message("v1")),
+            WriteOp(OpKind.MESSAGE, _message("v2")),
+        ]
+    )
+    async with engine.connect() as conn:
+        rows = (await conn.execute(select(messages))).all()
+    assert len(rows) == 1
+    assert rows[0].content == "v2"
+
+
+async def test_a_group_with_the_same_conflict_key_is_written_as_one_row(
+    repo_and_engine,
+):
+    """The statement of a group must carry one row per conflict key.
+
+    PostgreSQL refuses a statement that would touch the same row twice,
+    so the group is reduced before the statement is built.
+    """
+    repo, engine = repo_and_engine
+    statements = _record_statements(engine)
+    await repo.apply_batch(
+        [
+            WriteOp(OpKind.USER, _user("alice")),
+            WriteOp(OpKind.USER, _user("alice2")),
+        ]
+    )
+    assert len(statements) == 1
+    assert _insert_rows(statements[0]) == 1
+
+
+async def test_a_group_of_different_keys_is_still_written_as_one_statement(
+    repo_and_engine,
+):
+    """The reduction must not split a group into one statement per row."""
+    repo, engine = repo_and_engine
+    statements = _record_statements(engine)
+    await repo.apply_batch(
+        [
+            WriteOp(OpKind.USER, _user("alice")),
+            WriteOp(OpKind.USER, _user("bob", user_id=31)),
+        ]
+    )
+    assert len(statements) == 1
+    assert _insert_rows(statements[0]) == 2
+
+
+# -- the soft state survives a redelivery --------------------------------
+
+
+async def test_the_realtime_upsert_keeps_the_deleted_at(repo_and_engine):
+    """A message that was deleted stays deleted when it is written again.
+
+    The collector writes the whole message again when the gateway
+    redelivers it, and the record carries no deletion: the soft delete
+    must survive it, or the deleted ratio stops being analysable.
+    """
+    repo, engine = repo_and_engine
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message("keep me"))])
+    await repo.apply_batch(
+        [WriteOp(OpKind.MESSAGE_DELETE, MessageDelete(1, "2026-11-11T03:00:00+00:00"))]
+    )
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message("redelivered"))])
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(select(messages).where(messages.c.message_id == 1))
+        ).one()
+    assert row.deleted_at == "2026-11-11T03:00:00+00:00"
+    assert row.content == "redelivered"
+
+
+async def test_the_realtime_upsert_keeps_the_edit_count(repo_and_engine):
+    """The counter of the edits must not go down when a message is written."""
+    repo, engine = repo_and_engine
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
+    await repo.apply_batch(
+        [WriteOp(OpKind.MESSAGE_EDIT, MessageEdit(1, "edited", "2026-11-11T01:00:00+00:00"))]
+    )
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message("redelivered"))])
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(select(messages).where(messages.c.message_id == 1))
+        ).one()
+    assert row.edit_count == 1
+
+
+async def test_the_realtime_upsert_keeps_the_edit_marker(repo_and_engine):
+    """The marker of the last edit must survive a redelivery.
+
+    The marker is what tells a replayed edit from a new one, so it must
+    not be cleared by a message that carries none.
+    """
+    repo, engine = repo_and_engine
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
+    await repo.apply_batch(
+        [WriteOp(OpKind.MESSAGE_EDIT, MessageEdit(1, "edited", "2026-11-11T01:00:00+00:00"))]
+    )
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message("redelivered"))])
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(select(messages).where(messages.c.message_id == 1))
+        ).one()
+    assert row.edited_at == "2026-11-11T01:00:00+00:00"
+
+
+# -- a replayed write changes nothing ------------------------------------
+
+
+async def test_a_replayed_edit_does_not_count_twice(repo_and_engine):
+    """The failure replay can apply an edit that already reached the row.
+
+    The counter of the edits is a relative value, so an edit that is
+    applied twice counts twice. An edit that is not newer than the one
+    the row already carries is a replay, and it changes nothing.
+    """
+    repo, engine = repo_and_engine
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
+    edit = MessageEdit(1, "edited", "2026-11-11T01:00:00+00:00")
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE_EDIT, edit)])
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE_EDIT, edit)])
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(select(messages).where(messages.c.message_id == 1))
+        ).one()
+    assert row.edit_count == 1
+
+
+async def test_a_replayed_batch_of_edits_does_not_count_twice(repo_and_engine):
+    """The whole batch is replayed, not only its last edit."""
+    repo, engine = repo_and_engine
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
+    edits = [
+        WriteOp(OpKind.MESSAGE_EDIT, MessageEdit(1, "v1", "2026-11-11T01:00:00+00:00")),
+        WriteOp(OpKind.MESSAGE_EDIT, MessageEdit(1, "v2", "2026-11-11T02:00:00+00:00")),
+    ]
+    await repo.apply_batch(edits)
+    await repo.apply_batch(edits)
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(select(messages).where(messages.c.message_id == 1))
+        ).one()
+    assert row.edit_count == 2
+    assert row.content == "v2"
+    assert row.edited_at == "2026-11-11T02:00:00+00:00"
+
+
+async def test_a_replayed_edit_does_not_overwrite_a_newer_content(repo_and_engine):
+    """An edit that is older than the recorded one must not win."""
+    repo, engine = repo_and_engine
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])
+    await repo.apply_batch(
+        [WriteOp(OpKind.MESSAGE_EDIT, MessageEdit(1, "newer", "2026-11-11T02:00:00+00:00"))]
+    )
+    await repo.apply_batch(
+        [WriteOp(OpKind.MESSAGE_EDIT, MessageEdit(1, "older", "2026-11-11T01:00:00+00:00"))]
+    )
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(select(messages).where(messages.c.message_id == 1))
+        ).one()
+    assert row.content == "newer"
+    assert row.edited_at == "2026-11-11T02:00:00+00:00"
+    assert row.edit_count == 1
+
+
+async def test_a_replayed_reaction_does_not_resurrect_it(repo_and_engine):
+    """A reaction that was taken back must stay taken back."""
+    repo, engine = repo_and_engine
+    reaction = ReactionRecord(1, 30, "🔥", None, False, "2026-11-11T00:00:00+00:00")
+    await repo.apply_batch([WriteOp(OpKind.REACTION, reaction)])
+    await repo.apply_batch(
+        [
+            WriteOp(
+                OpKind.REACTION_REMOVE,
+                ReactionRemove(1, 30, "🔥", "2026-11-11T04:00:00+00:00"),
+            )
+        ]
+    )
+    await repo.apply_batch([WriteOp(OpKind.REACTION, reaction)])
+    async with engine.connect() as conn:
+        rows = (await conn.execute(select(reactions))).all()
+    assert len(rows) == 1
+    assert rows[0].removed_at == "2026-11-11T04:00:00+00:00"
+
+
+# -- the dialect specific rendering --------------------------------------
+
+
+async def test_mysql_insert_only_qualifies_the_column():
+    """MySQL refuses an unqualified column in the no-op update.
+
+    `INSERT INTO messages (...) VALUES (...) ON DUPLICATE KEY UPDATE
+    message_id = message_id` is rejected with "Column 'message_id' in
+    field list is ambiguous": the name stands for the row of the table and
+    for the row that would have been inserted. The reference has to name
+    the table.
+    """
+    sql = await _compiled_for(
+        "mysql",
+        lambda repo: repo._insert_only(messages, [_message_values()]),
+    )
+    set_clause = sql.lower().split("on duplicate key update", 1)[1]
+    assert "message_id = messages.message_id" in set_clause
+    assert "message_id = message_id" not in set_clause
+
+
+async def test_mysql_insert_only_of_an_attachment_keeps_the_last_insert_id():
+    """The surrogate key of the database may use the LAST_INSERT_ID idiom."""
+    sql = await _compiled_for(
+        "mysql",
+        lambda repo: repo._insert_only(attachments, [_ATTACHMENT_VALUES]),
+    )
+    assert "last_insert_id" in sql.lower()
+
+
+@pytest.mark.parametrize("dialect", ["sqlite", "postgresql", "mysql"])
+async def test_the_realtime_upsert_keeps_the_soft_state(dialect):
+    """The soft state of a message survives a redelivery on every backend.
+
+    The conflict update keeps the deletion of the row and never lowers the
+    counter of the edits.
+    """
+    sql = await _compiled_for(
+        dialect,
+        lambda repo: repo._message_upsert([_message_values()]),
+    )
+    assert "coalesce" in sql.lower()
+    assert "deleted_at" in sql.lower()
+    assert "edit_count" in sql.lower()
+    # The counter never goes down: the larger of the two wins.
+    assert "greatest" in sql.lower() or "max(" in sql.lower()
+
+
+@pytest.mark.parametrize("dialect", ["sqlite", "postgresql", "mysql"])
+async def test_the_reaction_upsert_keeps_the_removed_at(dialect):
+    """A reaction that was taken back stays taken back on every backend."""
+    sql = await _compiled_for(
+        dialect,
+        lambda repo: repo._reaction_upsert(
+            [
+                {
+                    "message_id": 1,
+                    "user_id": 30,
+                    "emoji": "🔥",
+                    "emoji_id": None,
+                    "is_custom": False,
+                    "added_at": "2026-11-11T00:00:00+00:00",
+                    "removed_at": None,
+                }
+            ]
+        ),
+    )
+    assert "coalesce" in sql.lower()
+    assert "removed_at" in sql.lower()

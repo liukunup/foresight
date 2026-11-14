@@ -364,3 +364,62 @@ def test_surrogate_primary_keys_declare_autoincrement_true():
             f"{table_name}.{column_name} must declare autoincrement=True, "
             f"got {column.autoincrement!r}"
         )
+
+
+# -- the columns that carry a key ----------------------------------------
+#
+# MySQL refuses a BLOB/TEXT column in a key: "BLOB/TEXT column
+# 'created_at' used in key specification without a key length". Every
+# column that an index or a unique constraint names therefore gets a
+# bounded type on MySQL, while SQLite and PostgreSQL keep the text type
+# the spec asks for.
+
+# The types MySQL refuses in a key specification.
+UNKEYABLE_TYPES = frozenset(
+    {"TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT", "BLOB", "TINYBLOB", "MEDIUMBLOB", "LONGBLOB"}
+)
+
+
+def _keyed_columns(table) -> set[str]:
+    """The columns an index or a unique constraint of the table names."""
+    keyed: set[str] = set()
+    for index in table.indexes:
+        keyed.update(column.name for column in index.columns)
+    for constraint in table.constraints:
+        if isinstance(constraint, UniqueConstraint):
+            keyed.update(column.name for column in constraint.columns)
+    return keyed
+
+
+def test_no_indexed_or_constrained_column_is_text_on_mysql():
+    """A key may not name a text column on MySQL.
+
+    The schema has to be creatable on every backend: `foresight init-db`
+    fails on the first statement otherwise, and only SQLite and
+    PostgreSQL are usable.
+    """
+    offenders = []
+    for table in ALL_TABLES:
+        for name in sorted(_keyed_columns(table)):
+            token = _column_type_token(table, name, mysql.dialect())
+            if token.upper() in UNKEYABLE_TYPES:
+                offenders.append(f"{table.name}.{name} renders as {token}")
+    assert offenders == [], (
+        "these columns carry a key and must not be text on MySQL: "
+        + ", ".join(offenders)
+    )
+
+
+def test_the_keyed_columns_stay_text_on_sqlite_and_postgresql():
+    """The spec asks for a text type, and the other backends can index it."""
+    for dialect in (sqlite.dialect(), postgresql.dialect()):
+        for table in ALL_TABLES:
+            for name in sorted(_keyed_columns(table)):
+                column = table.c[name]
+                if not isinstance(column.type, sa.Text):
+                    continue
+                token = _column_type_token(table, name, dialect)
+                assert token.upper() == "TEXT", (
+                    f"{table.name}.{name} must stay text on {dialect.name}, "
+                    f"got {token}"
+                )

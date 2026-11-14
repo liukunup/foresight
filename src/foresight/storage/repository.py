@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Callable, Mapping, Sequence
 
-from sqlalchemy import Table, bindparam, func, literal_column, select, update
+from sqlalchemy import Table, bindparam, case, func, literal_column, select, update
 from sqlalchemy.dialects.mysql import Insert as MySQLInsert
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import Insert as PGInsert
@@ -23,6 +23,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import Insert as SQLiteInsert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from sqlalchemy.sql.elements import ColumnElement
 
 from foresight.domain.models import (
     AttachmentRecord,
@@ -52,10 +53,14 @@ from foresight.storage.tables import (
 # Spec §7.1: the realtime path may only refresh these four columns. It must
 # never touch `analysis_status` (owned by the AI worker) or `captured_at`
 # (records when the message was first dumped), and it must not overwrite the
-# counters a fresh record happens to carry. The conflict update writes these
-# four columns from the incoming record unconditionally, so a message that is
-# re-reported without `edited_at` or `deleted_at` clears the soft-delete
-# timestamp a previous report had set.
+# counters a fresh record happens to carry.
+#
+# The conflict update of these four columns is not a plain copy of the
+# incoming record: the soft state of the row survives the write. A message
+# that was deleted stays deleted, the counter of the edits never goes down
+# and the marker of the last edit is never cleared. A record that is
+# written again — the gateway redelivers it, the collector sees it twice —
+# carries none of that state, and a plain copy would erase it.
 MESSAGE_UPDATABLE = (
     "content",
     "edited_at",
@@ -83,6 +88,31 @@ OP_ORDER: tuple[str, ...] = (
     OpKind.ANALYSIS_STATUS,
     OpKind.ANALYSIS,
 )
+
+
+def _dedupe(records: Sequence[Any], key: Callable[[Any], Any]) -> list[Any]:
+    """Keep the last record of every conflict key.
+
+    A batch can report the same key more than once. The collector writes a
+    snapshot of the author, the channel and the guild with every message, so
+    two messages of the same author inside one flush window carry the same
+    `user_id` — and the backfill writes one channel snapshot per message, so
+    every batch of a backfill carries the same `channel_id` about a hundred
+    times.
+
+    PostgreSQL refuses such a statement outright — "ON CONFLICT DO UPDATE
+    command cannot affect row a second time" — and MySQL refuses the
+    insert-only form of it, so the group is reduced to one row per key
+    before the statement is built.
+
+    The last record of a key wins: a later snapshot of a user, a channel or a
+    guild carries the newer name, and a later message carries the newer
+    content.
+    """
+    latest: dict[Any, Any] = {}
+    for record in records:
+        latest[key(record)] = record
+    return list(latest.values())
 
 
 class Repository:
@@ -187,24 +217,107 @@ class Repository:
             return mysql_insert(table)
         return sqlite_insert(table)
 
+    def _proposed(self, stmt: Any, column: str) -> ColumnElement[Any]:
+        """The value the row that would have been inserted carries.
+
+        SQLite and PostgreSQL name that row `excluded`, MySQL names it
+        `inserted` — which renders as `new.<column>` on MySQL 8.0.19 and
+        later, and as `VALUES(<column>)` on the older servers.
+        """
+        if isinstance(stmt, MySQLInsert):
+            return stmt.inserted[column]
+        return stmt.excluded[column]
+
+    def _greatest(self, left: ColumnElement[Any], right: ColumnElement[Any]) -> Any:
+        """The larger of two values.
+
+        PostgreSQL and MySQL have `GREATEST`, SQLite has not: it has the
+        scalar `max`, which takes two arguments.
+        """
+        if self._dialect == "sqlite":
+            return func.max(left, right)
+        return func.greatest(left, right)
+
     def _upsert(
         self,
         table: Table,
         values: list[dict[str, Any]],
         conflict_columns: list[str],
         update_columns: tuple[str, ...],
+        updates: Mapping[str, Callable[[Any], Any]] | None = None,
     ) -> SQLiteInsert | PGInsert | MySQLInsert:
-        """Build an upsert that refreshes `update_columns` on conflict."""
+        """Build an upsert that refreshes `update_columns` on conflict.
+
+        `updates` holds the columns whose conflict update is not a plain
+        copy of the row that would have been inserted: the soft state of a
+        message and the soft removal of a reaction survive a redelivery, so
+        their conflict update is a function of the row that is already
+        there. Every other column takes the value of the incoming row.
+        """
         stmt = self._insert(table).values(values)
+
+        def value_for(column: str) -> Any:
+            if updates is not None and column in updates:
+                return updates[column](stmt)
+            return self._proposed(stmt, column)
+
         if isinstance(stmt, MySQLInsert):
             # MySQL names the row that would have been inserted with
-            # VALUES(col), SQLite and PostgreSQL with the excluded table.
+            # `new.<column>`, SQLite and PostgreSQL with the excluded table.
             return stmt.on_duplicate_key_update(
-                **{col: stmt.inserted[col] for col in update_columns}
+                **{col: value_for(col) for col in update_columns}
             )
         return stmt.on_conflict_do_update(
             index_elements=conflict_columns,
-            set_={col: stmt.excluded[col] for col in update_columns},
+            set_={col: value_for(col) for col in update_columns},
+        )
+
+    def _message_upsert(
+        self, values: list[dict[str, Any]]
+    ) -> SQLiteInsert | PGInsert | MySQLInsert:
+        """Build the upsert of the realtime path.
+
+        The soft state of the row survives the write: a message that was
+        deleted stays deleted, the counter of the edits never goes down and
+        the marker of the last edit is never cleared.
+        """
+        return self._upsert(
+            messages,
+            values,
+            ["message_id"],
+            MESSAGE_UPDATABLE,
+            updates={
+                "edited_at": lambda stmt: func.coalesce(
+                    self._proposed(stmt, "edited_at"), messages.c.edited_at
+                ),
+                "edit_count": lambda stmt: self._greatest(
+                    messages.c.edit_count, self._proposed(stmt, "edit_count")
+                ),
+                "deleted_at": lambda stmt: func.coalesce(
+                    messages.c.deleted_at, self._proposed(stmt, "deleted_at")
+                ),
+            },
+        )
+
+    def _reaction_upsert(
+        self, values: list[dict[str, Any]]
+    ) -> SQLiteInsert | PGInsert | MySQLInsert:
+        """Build the upsert of a reaction.
+
+        A reaction that was taken back stays taken back: the conflict
+        update keeps the removal of the row instead of taking the value of
+        the incoming record, which never carries one.
+        """
+        return self._upsert(
+            reactions,
+            values,
+            ["message_id", "user_id", "emoji"],
+            ("emoji_id", "is_custom", "added_at", "removed_at"),
+            updates={
+                "removed_at": lambda stmt: func.coalesce(
+                    reactions.c.removed_at, self._proposed(stmt, "removed_at")
+                ),
+            },
         )
 
     def _insert_only(
@@ -225,6 +338,11 @@ class Repository:
         self-assignment (`<pk> = <pk>`): `LAST_INSERT_ID(<pk>)` would set the
         session's last insert id to a value the database never handed out,
         and every caller reading `cursor.lastrowid` would misread it.
+
+        The self-assignment names the table: MySQL refuses an unqualified
+        column in the clause with "Column '<pk>' in field list is ambiguous",
+        because the name stands for the row of the table and for the row that
+        would have been inserted at the same time.
         """
         stmt = self._insert(table).values(values)
         if isinstance(stmt, MySQLInsert):
@@ -241,7 +359,11 @@ class Repository:
                     }
                 )
             return stmt.on_duplicate_key_update(
-                **{primary_key.name: literal_column(primary_key.name)}
+                **{
+                    primary_key.name: literal_column(
+                        f"{table.name}.{primary_key.name}"
+                    )
+                }
             )
         return stmt.on_conflict_do_nothing()
 
@@ -251,29 +373,67 @@ class Repository:
     # UPDATE and would reject them as duplicate bind parameters.
 
     async def _handle_message(self, conn: AsyncConnection, records: list[MessageRecord]) -> None:
+        records = _dedupe(records, lambda record: record.message_id)
         values = [self._message_values(r) for r in records]
-        stmt = self._upsert(
-            messages,
-            values,
-            ["message_id"],
-            MESSAGE_UPDATABLE,
-        )
+        stmt = self._message_upsert(values)
         await conn.execute(stmt)
 
     async def _handle_message_insert_only(
         self, conn: AsyncConnection, records: list[MessageRecord]
     ) -> None:
+        records = _dedupe(records, lambda record: record.message_id)
         values = [self._message_values(r) for r in records]
         await conn.execute(self._insert_only(messages, values))
 
     async def _handle_message_edit(self, conn: AsyncConnection, edits: list[MessageEdit]) -> None:
+        """Write an edit, but only when it is newer than the last one.
+
+        The counter of the edits is a relative value: it can be raised, never
+        set, because the event carries no count. A write that is replayed —
+        the failure file replays a batch that may already have reached the
+        database — would therefore count the same edit twice.
+
+        The timestamp of the edit is the marker of "this edit is already
+        recorded". An edit that is not newer than the one the row carries is
+        a replay, and it changes nothing: not the counter, not the content
+        and not the marker. The timestamps are compared as strings, the way
+        the stored timestamps are compared everywhere else, and they are
+        written in one canonical form — the adapter renders them the same
+        way everywhere.
+        """
+        edited_at = bindparam("b_edited_at")
+        # The edit is newer than the one the row carries. An empty string
+        # stands for "never edited": it sorts before every timestamp.
+        newer = edited_at > func.coalesce(messages.c.edited_at, "")
         stmt = (
             update(messages)
             .where(messages.c.message_id == bindparam("b_message_id"))
-            .values(
-                content=bindparam("b_content"),
-                edited_at=bindparam("b_edited_at"),
-                edit_count=messages.c.edit_count + 1,
+            .ordered_values(
+                (
+                    # The order of the assignments matters on MySQL: it
+                    # evaluates them from left to right, so a column that is
+                    # read must not be written before it. The marker of the
+                    # last edit is therefore written last — every other
+                    # assignment reads the marker of the row as it was. The
+                    # other backends read the old row in every assignment,
+                    # whatever the order is.
+                    "content",
+                    case(
+                        (newer, bindparam("b_content")),
+                        else_=messages.c.content,
+                    ),
+                ),
+                (
+                    "edit_count",
+                    messages.c.edit_count + case((newer, 1), else_=0),
+                ),
+                (
+                    "edited_at",
+                    case(
+                        (newer, edited_at),
+                        else_=messages.c.edited_at,
+                    ),
+                ),
             )
         )
         await conn.execute(
@@ -310,6 +470,9 @@ class Repository:
     async def _handle_reaction(
         self, conn: AsyncConnection, records: list[ReactionRecord]
     ) -> None:
+        records = _dedupe(
+            records, lambda record: (record.message_id, record.user_id, record.emoji)
+        )
         values = [
             {
                 "message_id": r.message_id,
@@ -322,12 +485,7 @@ class Repository:
             }
             for r in records
         ]
-        stmt = self._upsert(
-            reactions,
-            values,
-            ["message_id", "user_id", "emoji"],
-            ("emoji_id", "is_custom", "added_at", "removed_at"),
-        )
+        stmt = self._reaction_upsert(values)
         await conn.execute(stmt)
 
     async def _handle_reaction_remove(
@@ -356,6 +514,7 @@ class Repository:
         )
 
     async def _handle_user(self, conn: AsyncConnection, records: list[UserSnapshot]) -> None:
+        records = _dedupe(records, lambda record: record.user_id)
         values = [
             {
                 "user_id": r.user_id,
@@ -394,6 +553,7 @@ class Repository:
     async def _handle_channel(
         self, conn: AsyncConnection, records: list[ChannelSnapshot]
     ) -> None:
+        records = _dedupe(records, lambda record: record.channel_id)
         values = [
             {
                 "channel_id": r.channel_id,
@@ -417,6 +577,7 @@ class Repository:
     async def _handle_guild(
         self, conn: AsyncConnection, records: list[GuildSnapshot]
     ) -> None:
+        records = _dedupe(records, lambda record: record.guild_id)
         values = [
             {
                 "guild_id": r.guild_id,
@@ -437,6 +598,9 @@ class Repository:
     async def _handle_attachment(
         self, conn: AsyncConnection, records: list[AttachmentRecord]
     ) -> None:
+        records = _dedupe(
+            records, lambda record: (record.message_id, record.attachment_id)
+        )
         values = [
             {
                 "message_id": r.message_id,

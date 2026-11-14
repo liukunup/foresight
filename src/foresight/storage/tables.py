@@ -33,6 +33,17 @@ metadata = MetaData()
 # bytes, so it gets the unbounded LONGTEXT variant there.
 JSON_TEXT = Text().with_variant(mysql.LONGTEXT, "mysql")
 
+# A column that carries an index or a unique constraint cannot be an
+# unbounded TEXT on MySQL: the server refuses it with "BLOB/TEXT column
+# 'created_at' used in key specification without a key length". The
+# columns that carry a key therefore get a bounded type there, while
+# SQLite and PostgreSQL keep the text type the spec asks for.
+#
+# The bound is generous enough for every value the service writes: an ISO
+# timestamp is 25 characters long, a status is a word and an emoji is a
+# name of at most a few characters.
+KEYED_TEXT = Text().with_variant(mysql.VARCHAR(64), "mysql")
+
 
 def _pk_type() -> BigInteger:
     """Auto-increment primary key type (SQLite needs INTEGER for rowid alias)."""
@@ -85,7 +96,7 @@ messages = Table(
     Column("author_id", BigInteger, nullable=False),
     Column("content", Text, nullable=False, default=""),
     Column("message_type", Integer, nullable=False, default=0),
-    Column("created_at", Text, nullable=False),
+    Column("created_at", KEYED_TEXT, nullable=False),
     Column("captured_at", Text, nullable=False),
     Column("edited_at", Text),
     Column("edit_count", Integer, nullable=False, default=0),
@@ -98,7 +109,7 @@ messages = Table(
     Column("attachments_json", JSON_TEXT),
     Column("embeds_json", JSON_TEXT),
     Column("is_bot", Boolean, nullable=False, default=False),
-    Column("analysis_status", Text, nullable=False, default="pending"),
+    Column("analysis_status", KEYED_TEXT, nullable=False, default="pending"),
 )
 
 reactions = Table(
@@ -107,7 +118,7 @@ reactions = Table(
     Column("id", _pk_type(), primary_key=True, autoincrement=True),
     Column("message_id", BigInteger, nullable=False),
     Column("user_id", BigInteger, nullable=False),
-    Column("emoji", Text, nullable=False),
+    Column("emoji", KEYED_TEXT, nullable=False),
     Column("emoji_id", BigInteger),
     Column("is_custom", Boolean, nullable=False, default=False),
     Column("added_at", Text, nullable=False),
@@ -129,7 +140,7 @@ attachments = Table(
     Column("storage_backend", Text, nullable=False, default="local"),
     Column("storage_key", Text),
     Column("storage_uri", Text),
-    Column("status", Text, nullable=False, default="pending"),
+    Column("status", KEYED_TEXT, nullable=False, default="pending"),
     Column("error", Text),
     Column("captured_at", Text, nullable=False),
     Column("stored_at", Text),
