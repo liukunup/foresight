@@ -261,12 +261,13 @@ async def test_message_delete_is_soft(repo_and_engine):
     assert row.content == "keep me"
 
 
-async def test_reaction_upsert_keeps_the_removed_at(repo_and_engine):
-    """A reaction that was taken back must not be resurrected.
+async def test_the_removal_of_a_record_does_not_take_away_a_live_row(
+    repo_and_engine,
+):
+    """The removal of a reaction is written by its own operation.
 
-    The record of a reaction never carries a removal — the removal is its
-    own operation — so a record that is written again would clear the
-    removal of the row and resurrect a reaction the user took back.
+    The record of a reaction describes an addition, so a record that is
+    written again over a row that is alive must not take the row away.
     """
     repo, engine = repo_and_engine
     reaction = ReactionRecord(1, 30, "🔥", None, False, "2026-11-11T00:00:00+00:00")
@@ -274,13 +275,10 @@ async def test_reaction_upsert_keeps_the_removed_at(repo_and_engine):
     removed = ReactionRecord(1, 30, "🔥", None, False, "2026-11-11T00:00:00+00:00")
     removed.removed_at = "2026-11-11T04:00:00+00:00"
     await repo.apply_batch([WriteOp(OpKind.REACTION, removed)])
-    await repo.apply_batch(
-        [WriteOp(OpKind.REACTION, reaction)]
-    )
     async with engine.connect() as conn:
         rows = (await conn.execute(select(reactions))).all()
     assert len(rows) == 1
-    assert rows[0].removed_at == "2026-11-11T04:00:00+00:00"
+    assert rows[0].removed_at is None
 
 
 async def test_user_snapshot_is_upserted(repo_and_engine):
@@ -1076,6 +1074,105 @@ async def test_a_replayed_reaction_does_not_resurrect_it(repo_and_engine):
     assert rows[0].removed_at == "2026-11-11T04:00:00+00:00"
 
 
+# -- the life cycle of a reaction ----------------------------------------
+#
+# Spec §5.5: the removal of a reaction is a soft removal — the row stays
+# and its `removed_at` is stamped. A reaction that is added again after
+# the removal is alive again, so the stamp is cleared. A record that
+# predates the removal is a replay of an old add: it must not revive the
+# reaction.
+
+
+async def test_a_reaction_is_written_alive(repo_and_engine):
+    """A reaction that was just added carries no removal."""
+    repo, engine = repo_and_engine
+    await repo.apply_batch(
+        [
+            WriteOp(
+                OpKind.REACTION,
+                ReactionRecord(1, 30, "🔥", None, False, "2026-11-11T00:00:00+00:00"),
+            )
+        ]
+    )
+    async with engine.connect() as conn:
+        row = (await conn.execute(select(reactions))).one()
+    assert row.removed_at is None
+
+
+async def test_a_re_add_brings_the_reaction_back(repo_and_engine):
+    """A reaction that was taken back and added again is alive again.
+
+    The row carries the time of the removal and the record carries the
+    time of the add. An add that is newer than the removal is a genuine
+    re-add, so the removal is cleared.
+    """
+    repo, engine = repo_and_engine
+    await repo.apply_batch(
+        [
+            WriteOp(
+                OpKind.REACTION,
+                ReactionRecord(1, 30, "🔥", None, False, "2026-11-11T00:00:00+00:00"),
+            )
+        ]
+    )
+    await repo.apply_batch(
+        [
+            WriteOp(
+                OpKind.REACTION_REMOVE,
+                ReactionRemove(1, 30, "🔥", "2026-11-11T04:00:00+00:00"),
+            )
+        ]
+    )
+    await repo.apply_batch(
+        [
+            WriteOp(
+                OpKind.REACTION,
+                ReactionRecord(1, 30, "🔥", None, False, "2026-11-11T06:00:00+00:00"),
+            )
+        ]
+    )
+    async with engine.connect() as conn:
+        row = (await conn.execute(select(reactions))).one()
+    assert row.removed_at is None
+    assert row.added_at == "2026-11-11T06:00:00+00:00"
+
+
+async def test_a_stale_re_add_does_not_bring_the_reaction_back(repo_and_engine):
+    """An add that predates the removal is a replay and revives nothing.
+
+    The add is older than the removal, so it is the record of an add that
+    was already taken back. The row keeps its removal.
+    """
+    repo, engine = repo_and_engine
+    await repo.apply_batch(
+        [
+            WriteOp(
+                OpKind.REACTION,
+                ReactionRecord(1, 30, "🔥", None, False, "2026-11-11T00:00:00+00:00"),
+            )
+        ]
+    )
+    await repo.apply_batch(
+        [
+            WriteOp(
+                OpKind.REACTION_REMOVE,
+                ReactionRemove(1, 30, "🔥", "2026-11-11T04:00:00+00:00"),
+            )
+        ]
+    )
+    await repo.apply_batch(
+        [
+            WriteOp(
+                OpKind.REACTION,
+                ReactionRecord(1, 30, "🔥", None, False, "2026-11-11T00:00:00+00:00"),
+            )
+        ]
+    )
+    async with engine.connect() as conn:
+        row = (await conn.execute(select(reactions))).one()
+    assert row.removed_at == "2026-11-11T04:00:00+00:00"
+
+
 # -- the dialect specific rendering --------------------------------------
 
 
@@ -1125,8 +1222,13 @@ async def test_the_realtime_upsert_keeps_the_soft_state(dialect):
 
 
 @pytest.mark.parametrize("dialect", ["sqlite", "postgresql", "mysql"])
-async def test_the_reaction_upsert_keeps_the_removed_at(dialect):
-    """A reaction that was taken back stays taken back on every backend."""
+async def test_the_reaction_upsert_compares_the_timestamps(dialect):
+    """The removal is only cleared by an add that is newer than it.
+
+    The conflict update compares the time of the incoming add with the
+    time of the removal of the row, so the statement must name both of
+    them on every backend.
+    """
     sql = await _compiled_for(
         dialect,
         lambda repo: repo._reaction_upsert(
@@ -1143,5 +1245,6 @@ async def test_the_reaction_upsert_keeps_the_removed_at(dialect):
             ]
         ),
     )
-    assert "coalesce" in sql.lower()
+    assert "case" in sql.lower()
     assert "removed_at" in sql.lower()
+    assert "added_at" in sql.lower()

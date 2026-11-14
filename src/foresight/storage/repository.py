@@ -304,9 +304,18 @@ class Repository:
     ) -> SQLiteInsert | PGInsert | MySQLInsert:
         """Build the upsert of a reaction.
 
-        A reaction that was taken back stays taken back: the conflict
-        update keeps the removal of the row instead of taking the value of
-        the incoming record, which never carries one.
+        A reaction that was taken back stays taken back — unless it is
+        added again. The row carries the time of the removal and the
+        incoming record carries the time of the add, so the two tell a
+        genuine re-add from a replay of an old record: an add that is
+        newer than the removal revives the reaction, an add that is older
+        than the removal is a replay and changes nothing.
+
+        The timestamps are UTC ISO-8601 strings of a fixed width, so
+        comparing them as strings compares them as moments in time. A row
+        that was never removed carries no removal: the comparison is
+        empty, the conditional falls to its second branch and the row
+        keeps no removal.
         """
         return self._upsert(
             reactions,
@@ -314,8 +323,12 @@ class Repository:
             ["message_id", "user_id", "emoji"],
             ("emoji_id", "is_custom", "added_at", "removed_at"),
             updates={
-                "removed_at": lambda stmt: func.coalesce(
-                    reactions.c.removed_at, self._proposed(stmt, "removed_at")
+                "removed_at": lambda stmt: case(
+                    (
+                        self._proposed(stmt, "added_at") > reactions.c.removed_at,
+                        None,
+                    ),
+                    else_=reactions.c.removed_at,
                 ),
             },
         )
