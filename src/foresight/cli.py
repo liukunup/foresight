@@ -124,6 +124,22 @@ async def _requeue_pending_analysis(repo: Any, worker: Any) -> int:
     return len(pending)
 
 
+async def _requeue_pending_attachments(repo: Any, worker: Any) -> int:
+    """Queue the attachments that are still waiting for their download.
+
+    An attachment whose download never happened — because the worker was
+    down, or because its status was lost — keeps the status `pending`. A
+    restart must not leave it there for good, so the pending attachments
+    are queued again.
+    """
+    pending = await repo.pending_attachments(limit=PENDING_REQUEUE_LIMIT)
+    for record in pending:
+        worker.submit(record)
+    if pending:
+        logger.info("queued %d attachments for the download again", len(pending))
+    return len(pending)
+
+
 async def _build_collector(settings: Config) -> _CollectorResources:
     """Build the engine, the writer and the bot of the collector.
 
@@ -196,6 +212,9 @@ async def _build_collector(settings: Config) -> _CollectorResources:
             max_bytes=settings.media.max_download_size_mb * 1024 * 1024,
         )
         await media_worker.start()
+        # The attachments that were never downloaded are queued again, so
+        # that a restart does not leave them behind for good.
+        await _requeue_pending_attachments(repo, media_worker)
         if settings.ai.enabled:
             analysis_worker = AnalysisWorker(
                 repo,

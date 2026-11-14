@@ -284,6 +284,41 @@ def _seed_pending_messages(db_path: Path, count: int = 2) -> None:
     asyncio.run(_run())
 
 
+def _seed_pending_attachments(db_path: Path, count: int = 2) -> None:
+    """Put attachments that wait for their download into the database."""
+    from foresight.config import DatabaseConfig
+    from foresight.domain.models import AttachmentRecord, OpKind, WriteOp
+    from foresight.storage.db import create_engine, init_db
+    from foresight.storage.repository import Repository
+
+    async def _run() -> None:
+        engine = create_engine(DatabaseConfig(backend="sqlite", path=str(db_path)))
+        await init_db(engine)
+        repo = Repository(engine)
+        await repo.apply_batch(
+            [
+                WriteOp(
+                    OpKind.ATTACHMENT,
+                    AttachmentRecord(
+                        message_id=index + 1,
+                        attachment_id=555 + index,
+                        filename="a.png",
+                        content_type="image/png",
+                        size=12,
+                        url=f"https://cdn.example/{index}.png",
+                        storage_backend="local",
+                        status="pending",
+                        captured_at="2026-11-11T00:00:00+00:00",
+                    ),
+                )
+                for index in range(count)
+            ]
+        )
+        await engine.dispose()
+
+    asyncio.run(_run())
+
+
 def test_init_db_creates_sqlite_file(tmp_path: Path):
     config_path = tmp_path / "config.toml"
     config_path.write_text(
@@ -593,6 +628,23 @@ def test_run_does_not_queue_anything_without_an_analysis_worker(
 
     assert result.exit_code == 0, result.output
     assert collector.analysis_workers == []
+
+
+def test_run_queues_the_attachments_that_wait_for_their_download(
+    collector: _Collector,
+):
+    """A restart must not leave the attachments that were never downloaded.
+
+    An attachment whose download never happened keeps the status
+    `pending`, so the collector queues it again when it starts.
+    """
+    _seed_pending_attachments(collector.db_path, count=2)
+
+    result = collector.run()
+
+    assert result.exit_code == 0, result.output
+    records = collector.media_workers[0].records
+    assert sorted(record.attachment_id for record in records) == [555, 556]
 
 
 class _FakeBackfillRunner:

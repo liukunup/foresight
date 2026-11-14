@@ -798,6 +798,36 @@ async def test_worker_refuses_a_message_after_it_was_stopped(db_engine):
     assert worker.submit(1, "hello") is False
 
 
+async def test_the_analysis_worker_stops_with_a_full_queue(db_engine):
+    """The shutdown must not hang on a backlog.
+
+    The worker puts the end of the queue behind the work that is still
+    to be done, so a long backlog would keep the process alive for a
+    long time — and the SIGTERM of the container would wait for it. The
+    wait is bounded, and the workers are cancelled when the bound is
+    reached.
+    """
+
+    class _SlowLlm:
+        model = "slow-model"
+
+        async def analyze(self, content: str):
+            await asyncio.sleep(30)
+            raise AssertionError("the analysis must not have been awaited")
+
+    repo = Repository(db_engine)
+    worker = AnalysisWorker(
+        repo, _SlowLlm(), max_concurrency=1, drain_timeout=0.5
+    )
+    await worker.start()
+    worker.submit(1, "hello")
+    started = time.monotonic()
+    await asyncio.wait_for(worker.stop(), timeout=20)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 10
+
+
 async def test_worker_reports_the_messages_that_wait(db_engine):
     """The command waits for the queue to be empty before it ends."""
     repo = Repository(db_engine)

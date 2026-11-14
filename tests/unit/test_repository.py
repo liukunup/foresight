@@ -303,6 +303,46 @@ async def test_attachment_insert_is_idempotent(repo_and_engine):
     assert rows[0].url == "https://cdn.example/a.png"
 
 
+async def test_pending_attachments_are_the_ones_that_wait_for_their_download(
+    repo_and_engine,
+):
+    """Only the attachments whose status is `pending` are still to be fetched.
+
+    A download that never happened — because the worker was down, or
+    because its status was lost — leaves the row in `pending`. The
+    collector queues these attachments again when it starts.
+    """
+    repo, engine = repo_and_engine
+    await repo.apply_batch([WriteOp(OpKind.ATTACHMENT, _attachment())])
+    await repo.apply_batch(
+        [
+            WriteOp(
+                OpKind.ATTACHMENT_STATUS,
+                AttachmentStatus(1, 556, "stored", None, "abc", "key", "uri", None),
+            )
+        ]
+    )
+
+    pending = await repo.pending_attachments()
+
+    assert [record.attachment_id for record in pending] == [555]
+    assert pending[0].url == "https://cdn.example/a.png"
+
+
+async def test_pending_attachments_can_be_bounded(repo_and_engine):
+    """The queue of the media worker is bounded, so the list is too."""
+    repo, engine = repo_and_engine
+    await repo.apply_batch(
+        [
+            WriteOp(OpKind.ATTACHMENT, _attachment(attachment_id=index + 1))
+            for index in range(3)
+        ]
+    )
+
+    assert len(await repo.pending_attachments(limit=2)) == 2
+    assert await repo.pending_attachments(limit=0) == []
+
+
 async def test_analysis_status_op_updates_the_message(repo_and_engine):
     repo, engine = repo_and_engine
     await repo.apply_batch([WriteOp(OpKind.MESSAGE, _message())])

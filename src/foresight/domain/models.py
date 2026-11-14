@@ -128,7 +128,7 @@ class GuildSnapshot:
 @dataclass
 class AttachmentRecord:
     message_id: int
-    attachment_id: int
+    attachment_id: int | None
     filename: str | None
     content_type: str | None
     size: int | None
@@ -143,7 +143,7 @@ class AttachmentStatus:
     """Terminal status update for one attachment row."""
 
     message_id: int
-    attachment_id: int
+    attachment_id: int | None
     status: str
     error: str | None = None
     sha256: str | None = None

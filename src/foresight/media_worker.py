@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -31,8 +33,43 @@ DOWNLOAD_MAX_RETRIES = 3
 # The delay between the attempts grows every time: 1 s, 2 s and 4 s.
 DOWNLOAD_RETRY_DELAYS = (1.0, 2.0, 4.0)
 
+# How long the worker waits for its queue to be empty when it is
+# stopped, in seconds. The queue is put behind the work that is still
+# to be done, so a backlog would keep the process alive for a long
+# time — and the shutdown of the container must not wait for it.
+DRAIN_TIMEOUT_SECONDS = 5.0
+
 # The end of the queue: it tells a worker that no more work is coming.
 _STOP = object()
+
+# The query string of a URL inside a message.
+_URL_QUERY = re.compile(r"(https?://[^\s'\"]*)\?[^\s'\"]*")
+
+
+class _TooLarge(Exception):
+    """Raised when the attachment is bigger than the configured limit."""
+
+
+def safe_url(url: str) -> str:
+    """The URL without its query string.
+
+    The query string of the URL of Discord is the capability that grants
+    read access to the file: it must not reach the log.
+    """
+    parsed = urlsplit(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def redact(text: str) -> str:
+    """Remove the query string of every URL in the text.
+
+    The error of a failed download carries the URL of the request: the
+    query string of that URL grants read access to the file, and it must
+    not reach the log nor the row of the attachment.
+    """
+    return _URL_QUERY.sub(r"\1?[redacted]", text)
 
 
 class MediaWorker:
@@ -58,6 +95,7 @@ class MediaWorker:
         max_bytes: int = 100 * 1024 * 1024,
         queue_maxsize: int = 1000,
         client_factory: Any = None,
+        drain_timeout: float = DRAIN_TIMEOUT_SECONDS,
     ) -> None:
         self._writer = writer
         self._store = store
@@ -68,6 +106,7 @@ class MediaWorker:
         self._client: httpx.AsyncClient | None = None
         self._tasks: list[asyncio.Task[None]] = []
         self._stopping = False
+        self._drain_timeout = drain_timeout
 
     async def start(self) -> None:
         if self._tasks:
@@ -85,18 +124,36 @@ class MediaWorker:
         ]
 
     async def stop(self) -> None:
-        """Stop the workers once the queue is empty.
+        """Stop the workers, with a bounded wait.
 
         The workers wait for the end of the queue, so the stop has to
         reach them: one end marker per worker is put on the queue, behind
-        the work that is still to be done.
+        the work that is still to be done. The wait is bounded — a
+        backlog that is long enough would keep the process alive for a
+        long time — and the workers are cancelled when the bound is
+        reached.
         """
         self._stopping = True
         for _ in self._tasks:
-            await self._queue.put(_STOP)
-        for task in self._tasks:
-            await task
+            try:
+                self._queue.put_nowait(_STOP)
+            except asyncio.QueueFull:
+                # The queue is full of work: the workers are cancelled
+                # instead of being waited for.
+                break
+        tasks = list(self._tasks)
         self._tasks = []
+        if tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=self._drain_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("the media queue was not drained in time")
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
         await self._close_client()
 
     async def _close_client(self) -> None:
@@ -113,13 +170,17 @@ class MediaWorker:
         the attachment is not downloaded in either case.
         """
         if self._stopping:
-            logger.warning("media worker is stopped, dropping attachment %s", record.url)
+            logger.warning(
+                "media worker is stopped, dropping attachment %s", safe_url(record.url)
+            )
             return False
         try:
             self._queue.put_nowait(record)
             return True
         except asyncio.QueueFull:
-            logger.warning("media queue is full, dropping attachment %s", record.url)
+            logger.warning(
+                "media queue is full, dropping attachment %s", safe_url(record.url)
+            )
             return False
 
     async def _worker(self, index: int) -> None:  # noqa: ARG002
@@ -131,7 +192,9 @@ class MediaWorker:
             try:
                 await self._process(record)
             except Exception:
-                logger.exception("media processing failed for %s", record.url)
+                logger.exception(
+                    "media processing failed for %s", safe_url(record.url)
+                )
             finally:
                 self._queue.task_done()
 
@@ -147,31 +210,58 @@ class MediaWorker:
                 error="attachment exceeds the configured size limit",
             )
             return
-        client = self._client
-        if client is None:
-            raise RuntimeError("the media worker is not started")
         last_error = "download failed"
         for attempt in range(DOWNLOAD_MAX_RETRIES + 1):
             try:
-                response = await client.get(record.url)
-                response.raise_for_status()
-                data = response.content
+                data = await self._download(record)
                 await self._store_bytes(record, data)
                 media_downloads_total.labels(status="ok").inc()
                 media_bytes_total.inc(len(data))
                 return
+            except _TooLarge:
+                # The server sent more bytes than the limit allows. That
+                # is a decision and not an error: the file is skipped and
+                # not failed.
+                media_downloads_total.labels(status="skipped").inc()
+                self._write_status(
+                    record,
+                    "skipped",
+                    error="the attachment is bigger than the configured size limit",
+                )
+                return
             except Exception as exc:
-                last_error = str(exc)
+                last_error = redact(str(exc))
                 logger.warning(
                     "attachment download failed (attempt %d/%d): %s",
                     attempt + 1,
                     DOWNLOAD_MAX_RETRIES + 1,
-                    exc,
+                    last_error,
                 )
                 if attempt < DOWNLOAD_MAX_RETRIES:
                     await asyncio.sleep(DOWNLOAD_RETRY_DELAYS[attempt])
         media_downloads_total.labels(status="failed").inc()
         self._write_status(record, "failed", error=last_error)
+
+    async def _download(self, record: AttachmentRecord) -> bytes:
+        """Download the bytes of an attachment, up to the limit.
+
+        The body is read as a stream and the bytes are counted as they
+        arrive: the size Discord announces is not trusted, and the whole
+        body is never held in memory when it is bigger than the limit.
+        """
+        client = self._client
+        if client is None:
+            raise RuntimeError("the media worker is not started")
+        chunks: list[bytes] = []
+        total = 0
+        async with client.stream("GET", record.url) as response:
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > self._max_bytes:
+                    raise _TooLarge
+                chunks.append(chunk)
+        return b"".join(chunks)
 
     async def _store_bytes(self, record: AttachmentRecord, data: bytes) -> None:
         stored_at = datetime.now(timezone.utc)
@@ -179,6 +269,7 @@ class MediaWorker:
             record.attachment_id,
             record.filename,
             _captured_at(record, stored_at),
+            seed=record.url,
         )
         uri = await self._store.put(
             key, data, record.content_type or "application/octet-stream"

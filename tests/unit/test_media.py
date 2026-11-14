@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import threading
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import aioboto3
@@ -40,14 +43,16 @@ from foresight.storage.tables import attachments
 from foresight.writer import Writer
 
 
-def _record(size: int = 10) -> AttachmentRecord:
+def _record(
+    size: int | None = 10, url: str = "https://cdn.example/a.png"
+) -> AttachmentRecord:
     return AttachmentRecord(
         message_id=1,
         attachment_id=555,
         filename="a.png",
         content_type="image/png",
         size=size,
-        url="https://cdn.example/a.png",
+        url=url,
         storage_backend="local",
         status="pending",
         captured_at="2026-11-11T00:00:00+00:00",
@@ -91,6 +96,22 @@ def test_media_key_uses_attachment_id_and_date():
 def test_media_key_without_filename():
     key = media_key(556, None, datetime(2026, 11, 11, tzinfo=timezone.utc))
     assert key == "2026/11/11/556"
+
+
+def test_media_key_without_an_attachment_id_is_unique():
+    """Two attachments without an id must not share a key.
+
+    The key of an attachment without an id is built from the hash of its
+    URL: the id alone would be the same for every one of them, and the
+    second file would overwrite the first.
+    """
+    now = datetime(2026, 11, 11, 12, 0, tzinfo=timezone.utc)
+    first = media_key(None, "a.png", now, seed="https://cdn.example/a.png")
+    second = media_key(None, "a.png", now, seed="https://cdn.example/b.png")
+
+    assert first != second
+    assert "None" not in first
+    assert first.endswith(".png")
 
 
 @pytest.mark.parametrize(
@@ -332,6 +353,116 @@ async def test_media_worker_skips_oversized(db_engine, tmp_path: Path):
         _sample("foresight_media_downloads_total", {"status": "skipped"})
         == skipped_before + 1
     )
+
+
+async def test_media_worker_skips_a_file_that_is_bigger_than_the_cap(
+    db_engine, tmp_path: Path
+):
+    """The server may send more bytes than it announced.
+
+    Discord does not always announce the size of an attachment, and the
+    server may send more bytes than it announced in any case: the bytes
+    are counted as they arrive, and the file is skipped as soon as it is
+    bigger than the cap.
+    """
+    writer = Writer(Repository(db_engine), batch_size=10, flush_interval_ms=10)
+    await writer.start()
+    writer.submit(WriteOp(OpKind.ATTACHMENT, _record(size=None)))
+
+    with respx.mock:
+        respx.get("https://cdn.example/a.png").mock(
+            return_value=httpx.Response(200, content=b"x" * 4096)
+        )
+        worker = MediaWorker(
+            writer, LocalMediaStore(tmp_path / "media"), max_concurrency=1, max_bytes=10
+        )
+        await worker.start()
+        worker.submit(_record(size=None))
+        await _stop(worker)
+        await writer.stop()
+
+    async with db_engine.connect() as conn:
+        row = (await conn.execute(select(attachments))).one()
+    assert row.status == "skipped"
+    assert row.storage_key is None
+    assert not (tmp_path / "media").exists() or not list(
+        (tmp_path / "media").rglob("*.png")
+    )
+
+
+async def test_the_log_does_not_carry_the_signature_of_the_cdn(
+    db_engine, tmp_path: Path, caplog, monkeypatch
+):
+    """The query string of the URL of Discord grants read access to the file.
+
+    It must not reach the log, and it must not reach the row of the
+    attachment either: the error of a failed download carries the URL.
+    """
+    monkeypatch.setattr(asyncio, "sleep", _no_wait)
+    url = "https://cdn.discordapp.com/attachments/1/2/a.png?ex=abc&sig=SECRET"
+    writer = Writer(Repository(db_engine), batch_size=10, flush_interval_ms=10)
+    await writer.start()
+    writer.submit(WriteOp(OpKind.ATTACHMENT, _record(url=url)))
+
+    with caplog.at_level(logging.WARNING):
+        with respx.mock:
+            respx.get(url).mock(return_value=httpx.Response(404, text="nope"))
+            worker = MediaWorker(
+                writer, LocalMediaStore(tmp_path / "media"), max_concurrency=1
+            )
+            await worker.start()
+            worker.submit(_record(url=url))
+            await _stop(worker)
+            await writer.stop()
+
+    assert "SECRET" not in caplog.text
+    async with db_engine.connect() as conn:
+        row = (await conn.execute(select(attachments))).one()
+    assert row.error
+    assert "SECRET" not in row.error
+
+
+async def test_the_media_worker_stops_with_a_full_queue(db_engine, tmp_path: Path):
+    """The shutdown must not hang on a backlog.
+
+    The worker puts the end of the queue behind the work that is still
+    to be done, so a long backlog would keep the process alive for a
+    long time. The wait is bounded, and the workers are cancelled when
+    the bound is reached.
+    """
+    writer = Writer(Repository(db_engine), batch_size=10, flush_interval_ms=10)
+    await writer.start()
+
+    class _SlowClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.closed = False
+
+        async def get(self, url: str) -> Any:
+            await asyncio.sleep(30)
+            raise AssertionError("the download must not have been awaited")
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    with respx.mock:
+        respx.get("https://cdn.example/a.png").mock(
+            return_value=httpx.Response(200, content=b"payload")
+        )
+        worker = MediaWorker(
+            writer,
+            LocalMediaStore(tmp_path / "media"),
+            max_concurrency=1,
+            client_factory=_SlowClient,
+            drain_timeout=0.5,
+        )
+        await worker.start()
+        worker.submit(_record())
+        started = time.monotonic()
+        await asyncio.wait_for(worker.stop(), timeout=20)
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 10
+    await writer.stop()
 
 
 # --- the S3 store, against a real S3 API -------------------------------

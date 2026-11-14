@@ -30,6 +30,12 @@ RETRY_DELAYS = (1.0, 2.0, 4.0)
 # A message with less text than this has nothing to analyse.
 SKIP_MIN_LENGTH = 2
 
+# How long the worker waits for its queue to be empty when it is
+# stopped, in seconds. The queue is put behind the work that is still
+# to be done, so a backlog would keep the process alive for a long
+# time — and the shutdown of the container must not wait for it.
+DRAIN_TIMEOUT_SECONDS = 5.0
+
 # The characters of an emoji, and the two that glue them together. A
 # message that carries nothing else is a message of emojis.
 EMOJI = re.compile(
@@ -99,6 +105,7 @@ class AnalysisWorker:
         max_concurrency: int = 2,
         queue_maxsize: int = 1000,
         sleep: Sleep | None = None,
+        drain_timeout: float = DRAIN_TIMEOUT_SECONDS,
     ) -> None:
         self._repo = repo
         self._llm = llm
@@ -110,6 +117,9 @@ class AnalysisWorker:
         # The seam of the wait between two attempts: None means the
         # default wait of the module.
         self._sleep = sleep
+        # How long the worker waits for its queue to be empty when it is
+        # stopped, in seconds.
+        self._drain_timeout = drain_timeout
 
     async def start(self) -> None:
         if self._tasks:
@@ -126,18 +136,35 @@ class AnalysisWorker:
         ]
 
     async def stop(self) -> None:
-        """Stop the workers once the queue is empty.
+        """Stop the workers, with a bounded wait.
 
         The workers wait for the end of the queue, so the stop has to
         reach them: one end marker per worker is put on the queue, behind
-        the work that is still to be done.
+        the work that is still to be done. The wait is bounded — a
+        backlog of a thousand messages would keep the process alive for
+        hours — and the workers are cancelled when the bound is reached.
         """
         self._stopping = True
         for _ in self._tasks:
-            await self._queue.put(_STOP)
-        for task in self._tasks:
-            await task
+            try:
+                self._queue.put_nowait(_STOP)
+            except asyncio.QueueFull:
+                # The queue is full of work: the workers are cancelled
+                # instead of being waited for.
+                break
+        tasks = list(self._tasks)
         self._tasks = []
+        if tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=self._drain_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("the analysis queue was not drained in time")
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
         # Nothing waits any more: the end markers of the queue are not
         # work, so they must not show up as a backlog.
         self._pending = 0

@@ -202,6 +202,53 @@ class Repository:
             rows = (await conn.execute(stmt)).all()
         return [(int(row.message_id), row.content or "") for row in rows]
 
+    async def pending_attachments(self, *, limit: int = 1000) -> list[AttachmentRecord]:
+        """The attachments that still wait for their download.
+
+        An attachment whose download never happened — because the worker
+        was down, or because its status was lost when the queue of the
+        writer was full — keeps the status `pending`. The collector
+        queues these attachments again when it starts, so that a restart
+        does not leave them behind for good.
+
+        The attachments are ordered by the moment they were captured, so
+        that the oldest ones wait the shortest time.
+        """
+        if limit <= 0:
+            return []
+        stmt = (
+            select(
+                attachments.c.message_id,
+                attachments.c.attachment_id,
+                attachments.c.filename,
+                attachments.c.content_type,
+                attachments.c.size,
+                attachments.c.url,
+                attachments.c.storage_backend,
+                attachments.c.status,
+                attachments.c.captured_at,
+            )
+            .where(attachments.c.status == "pending")
+            .order_by(attachments.c.captured_at, attachments.c.message_id)
+            .limit(limit)
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(stmt)).all()
+        return [
+            AttachmentRecord(
+                message_id=int(row.message_id),
+                attachment_id=row.attachment_id,
+                filename=row.filename,
+                content_type=row.content_type,
+                size=int(row.size) if row.size is not None else None,
+                url=row.url or "",
+                storage_backend=row.storage_backend or "local",
+                status=row.status or "pending",
+                captured_at=row.captured_at or "",
+            )
+            for row in rows
+        ]
+
     # -- insert helpers -------------------------------------------------
 
     def _insert(self, table: Table) -> SQLiteInsert | PGInsert | MySQLInsert:

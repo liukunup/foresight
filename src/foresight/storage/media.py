@@ -24,19 +24,34 @@ class MediaStore(Protocol):
     def open(self, key: str) -> AsyncIterator[bytes]: ...
 
 
-def media_key(attachment_id: int, filename: str | None, now: datetime) -> str:
+def media_key(
+    attachment_id: int | None,
+    filename: str | None,
+    now: datetime,
+    *,
+    seed: str | None = None,
+) -> str:
     """Build a collision free storage key from the attachment id.
 
     The name of the file is not part of the key: two attachments may carry
     the same name, and a name may carry a path. Only a short and harmless
     extension is kept, so the key stays inside its directory.
+
+    An attachment without an id gets the hash of its URL: the id alone
+    would be the same for every attachment of that kind, and every file
+    would overwrite the one that was stored before it.
     """
     extension = ""
     if filename and "." in filename:
         suffix = filename.rsplit(".", 1)[-1]
         if suffix.isalnum() and len(suffix) <= 8:
             extension = f".{suffix.lower()}"
-    return f"{now:%Y/%m/%d}/{attachment_id}{extension}"
+    identifier = (
+        str(attachment_id)
+        if attachment_id is not None
+        else hashlib.sha256((seed or "").encode("utf-8")).hexdigest()[:16]
+    )
+    return f"{now:%Y/%m/%d}/{identifier}{extension}"
 
 
 class LocalMediaStore:
