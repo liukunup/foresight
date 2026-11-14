@@ -94,3 +94,9 @@ ai_tokens_total = Counter(
     ["type"],
     registry=REGISTRY,
 )
+backfill_messages_total = Counter(
+    "foresight_backfill_messages_total",
+    "Messages imported by the backfill",
+    ["channel_id"],
+    registry=REGISTRY,
+)

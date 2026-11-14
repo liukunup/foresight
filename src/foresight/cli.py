@@ -478,6 +478,159 @@ def both(
 
 
 @app.command()
+def backfill(
+    days: Optional[int] = typer.Option(None, "--days", help="Import the last N days"),
+    since: Optional[str] = typer.Option(None, "--since", help="ISO date lower bound"),
+    channel: Optional[int] = typer.Option(
+        None, "--channel", help="Only this channel"
+    ),
+    limit: int = typer.Option(20000, help="Maximum messages per channel"),
+    config: Optional[str] = typer.Option(None, "--config", help="Path to config.toml"),
+) -> None:
+    """Import historical messages from Discord."""
+    from foresight.backfill import BackfillRunner, parse_window, require_token
+    from foresight.storage.db import create_engine, init_db as create_tables
+    from foresight.storage.repository import Repository
+    from foresight.writer import Writer, recover_failed_batches
+
+    settings = _load(config)
+    if days is None and since is None:
+        days = 7
+    try:
+        window = parse_window(days, since)
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    try:
+        # The token is checked before the database is opened: an import
+        # that cannot log in must not write anything.
+        require_token()
+    except RuntimeError as exc:
+        _fail(str(exc))
+
+    channel_ids = (
+        [channel] if channel is not None else list(settings.discord.channel_ids)
+    )
+
+    async def _run() -> dict[str, int]:
+        from sqlalchemy.exc import SQLAlchemyError
+
+        engine: Any = None
+        try:
+            try:
+                engine = create_engine(settings.database)
+            except (OSError, SQLAlchemyError) as exc:
+                # A directory that cannot be created, an unwritable path, a
+                # backend that is not there: the operator gets the cause,
+                # not a traceback.
+                _fail(f"cannot open the database: {exc}")
+            try:
+                await create_tables(engine)
+            except (OSError, SQLAlchemyError) as exc:
+                _fail(f"cannot open the database: {exc}")
+            repo = Repository(engine)
+            # The failure file lives next to the database, so that a
+            # database and its pending writes are always found together.
+            failure_path = Path(settings.database.path).parent / "failed_batch.jsonl"
+            writer = Writer(
+                repo,
+                batch_size=settings.writer.batch_size,
+                flush_interval_ms=settings.writer.flush_interval_ms,
+                queue_maxsize=settings.writer.queue_maxsize,
+                failure_path=failure_path,
+            )
+            # The replay writes on this coroutine and bypasses the queue,
+            # so it belongs to the startup: the background task of the
+            # writer is not running yet, so it cannot race the replay for
+            # the database lock.
+            await recover_failed_batches(writer, failure_path)
+            await writer.start()
+            try:
+                runner = BackfillRunner(settings, writer)
+                return await runner.run(channel_ids, window, limit=limit)
+            finally:
+                await writer.stop()
+        finally:
+            # The command is done with the database: the connection is
+            # closed, so nothing is left behind.
+            if engine is not None:
+                await engine.dispose()
+
+    counts = asyncio.run(_run())
+    typer.echo(
+        f"backfilled {counts['messages']} messages from {counts['channels']} channels"
+    )
+
+
+@app.command()
+def analyze(
+    since: Optional[str] = typer.Option(
+        None, "--since", help="ISO timestamp lower bound"
+    ),
+    limit: int = typer.Option(1000, help="Maximum messages to analyse"),
+    config: Optional[str] = typer.Option(None, "--config", help="Path to config.toml"),
+) -> None:
+    """Analyse the messages that are still waiting for their analysis."""
+    from foresight.analysis.llm import LlmClient
+    from foresight.analysis.worker import AnalysisWorker
+    from foresight.storage.db import create_engine, init_db as create_tables
+    from foresight.storage.repository import Repository
+
+    settings = _load(config)
+    if not settings.ai.enabled:
+        typer.secho(
+            "[ai].enabled is false, nothing to do", fg=typer.colors.YELLOW, err=True
+        )
+        raise typer.Exit(code=2)
+
+    async def _run() -> int:
+        from sqlalchemy.exc import SQLAlchemyError
+
+        engine: Any = None
+        try:
+            try:
+                engine = create_engine(settings.database)
+            except (OSError, SQLAlchemyError) as exc:
+                _fail(f"cannot open the database: {exc}")
+            try:
+                await create_tables(engine)
+            except (OSError, SQLAlchemyError) as exc:
+                _fail(f"cannot open the database: {exc}")
+            repo = Repository(engine)
+            pending = await repo.pending_messages(since=since, limit=limit)
+            llm = LlmClient(settings.ai)
+            worker = AnalysisWorker(
+                repo,
+                llm,
+                max_concurrency=settings.ai.max_concurrency,
+                # The queue holds every message the command hands over, so
+                # that none of them is dropped on the way.
+                queue_maxsize=max(limit, 1),
+            )
+            await worker.start()
+            try:
+                for message_id, content in pending:
+                    worker.submit(message_id, content)
+                # The command waits for the analysis: the messages that are
+                # still queued are analysed before the worker is stopped.
+                while worker.pending():
+                    await asyncio.sleep(0.5)
+            finally:
+                # The worker is stopped before the client of the model is
+                # closed: a message that is still analysed must not lose
+                # its connection.
+                await worker.stop()
+                await llm.close()
+        finally:
+            if engine is not None:
+                await engine.dispose()
+        return len(pending)
+
+    count = asyncio.run(_run())
+    typer.echo(f"analysed {count} messages")
+
+
+@app.command()
 def query(
     sql: str = typer.Option(..., "--sql", help="Read-only SQL statement"),
     db: str = typer.Option(..., "--db", help="Path to the SQLite database file"),

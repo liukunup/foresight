@@ -118,6 +118,14 @@ class AnalysisWorker:
         self._publish_depth()
         return True
 
+    def pending(self) -> int:
+        """The number of messages that still wait for their analysis.
+
+        The count is the one of the gauge: the end markers of the queue
+        are not work, so they must not show up as a backlog.
+        """
+        return self._pending
+
     def _publish_depth(self) -> None:
         """Publish the number of messages that wait for their analysis.
 

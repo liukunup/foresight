@@ -671,3 +671,31 @@ async def test_worker_refuses_a_message_after_it_was_stopped(db_engine):
     await worker.start()
     await worker.stop()
     assert worker.submit(1, "hello") is False
+
+
+async def test_worker_reports_the_messages_that_wait(db_engine):
+    """The command waits for the queue to be empty before it ends."""
+    repo = Repository(db_engine)
+
+    with respx.mock:
+        respx.post("https://llm.example/v1/chat/completions").mock(
+            return_value=_response(
+                {
+                    "translation": "你好",
+                    "sentiment": "neutral",
+                    "sentiment_score": 0.5,
+                    "issues": [],
+                }
+            )
+        )
+        worker = AnalysisWorker(repo, LlmClient(_config()), max_concurrency=1)
+        await worker.start()
+        assert worker.pending() == 0
+        assert worker.submit(1, "hello") is True
+        # The worker cannot take the message before the event loop gets a
+        # turn, so the message is still waiting here.
+        assert worker.pending() == 1
+        await worker.stop()
+
+    # Nothing waits any more: the end markers of the queue are not work.
+    assert worker.pending() == 0

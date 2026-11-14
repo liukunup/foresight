@@ -10,6 +10,7 @@ that is wired up in the documented order and closed again on the way out.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 import sys
@@ -251,8 +252,6 @@ def collector(
 
 def _seed_pending_messages(db_path: Path, count: int = 2) -> None:
     """Put messages that wait for their analysis into the database."""
-    import asyncio
-
     from foresight.config import DatabaseConfig
     from foresight.domain.models import MessageRecord, OpKind, WriteOp
     from foresight.storage.db import create_engine, init_db
@@ -594,3 +593,299 @@ def test_run_does_not_queue_anything_without_an_analysis_worker(
 
     assert result.exit_code == 0, result.output
     assert collector.analysis_workers == []
+
+
+class _FakeBackfillRunner:
+    """A backfill runner that never talks to Discord."""
+
+    def __init__(self, settings: Any, writer: Any, **kwargs: Any) -> None:
+        self.settings = settings
+        self.writer = writer
+        self.calls: list[tuple[list[int], tuple[Any, Any], int]] = []
+
+    async def run(
+        self, channel_ids: Any, window: Any, limit: int = 20000
+    ) -> dict[str, int]:
+        self.calls.append((list(channel_ids), window, limit))
+        return {"messages": 2, "channels": 1}
+
+
+@dataclass
+class _BackfillCommand:
+    """The fakes behind one ``foresight backfill``."""
+
+    run: Callable[[list[str]], Any]
+    runners: list[_FakeBackfillRunner]
+    writers: list[_FakeWriter]
+    replay_paths: list[Path | None]
+    events: list[str]
+    db_path: Path
+
+
+@pytest.fixture
+def backfill(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _BackfillCommand:
+    """A ``foresight backfill`` whose Discord side is faked."""
+    events: list[str] = []
+    replay_paths: list[Path | None] = []
+    writers: list[_FakeWriter] = []
+    runners: list[_FakeBackfillRunner] = []
+    config_path = _write_config(tmp_path)
+    db_path = tmp_path / "data" / "foresight.db"
+
+    async def fake_recover(writer: Any, path: Path | None) -> int:
+        replay_paths.append(path)
+        events.append("replay")
+        return 0
+
+    def make_writer(repo: Any, **kwargs: Any) -> _FakeWriter:
+        writer = _FakeWriter(repo, events, **kwargs)
+        writers.append(writer)
+        return writer
+
+    def make_runner(settings: Any, writer: Any, **kwargs: Any) -> _FakeBackfillRunner:
+        runner = _FakeBackfillRunner(settings, writer, **kwargs)
+        runners.append(runner)
+        return runner
+
+    real_create_engine = storage_db.create_engine
+
+    def fake_create_engine(config: Any) -> Any:
+        return _EngineProxy(real_create_engine(config), events)
+
+    monkeypatch.setattr("foresight.writer.Writer", make_writer)
+    monkeypatch.setattr("foresight.writer.recover_failed_batches", fake_recover)
+    monkeypatch.setattr("foresight.storage.db.create_engine", fake_create_engine)
+    monkeypatch.setattr("foresight.backfill.BackfillRunner", make_runner)
+    monkeypatch.setenv("DISCORD_TOKEN", "token")
+
+    def run(args: list[str] | None = None) -> Any:
+        return runner.invoke(
+            app, ["backfill", "--config", str(config_path), *(args or [])]
+        )
+
+    return _BackfillCommand(run, runners, writers, replay_paths, events, db_path)
+
+
+def test_backfill_imports_the_history_of_the_configured_channels(
+    backfill: _BackfillCommand,
+):
+    result = backfill.run()
+    assert result.exit_code == 0, result.output
+    assert backfill.runners[0].calls[0][0] == [1]
+    assert "backfilled 2 messages from 1 channels" in result.output
+
+
+def test_backfill_imports_only_the_channel_that_was_asked_for(
+    backfill: _BackfillCommand,
+):
+    result = backfill.run(["--channel", "42"])
+    assert result.exit_code == 0, result.output
+    assert backfill.runners[0].calls[0][0] == [42]
+
+
+def test_backfill_imports_the_last_seven_days_by_default(backfill: _BackfillCommand):
+    result = backfill.run()
+    assert result.exit_code == 0, result.output
+    _channels, window, _limit = backfill.runners[0].calls[0]
+    assert (window[1] - window[0]).days == 7
+
+
+def test_backfill_imports_the_days_that_were_asked_for(backfill: _BackfillCommand):
+    result = backfill.run(["--days", "3"])
+    assert result.exit_code == 0, result.output
+    _channels, window, _limit = backfill.runners[0].calls[0]
+    assert (window[1] - window[0]).days == 3
+
+
+def test_backfill_imports_the_messages_since_a_date(backfill: _BackfillCommand):
+    result = backfill.run(["--since", "2026-11-01"])
+    assert result.exit_code == 0, result.output
+    _channels, window, _limit = backfill.runners[0].calls[0]
+    assert window[0].isoformat() == "2026-11-01T00:00:00+00:00"
+
+
+def test_backfill_refuses_days_and_since_together(backfill: _BackfillCommand):
+    result = backfill.run(["--days", "3", "--since", "2026-11-01"])
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.output
+
+
+def test_backfill_bounds_the_import_with_the_limit(backfill: _BackfillCommand):
+    result = backfill.run(["--limit", "10"])
+    assert result.exit_code == 0, result.output
+    assert backfill.runners[0].calls[0][2] == 10
+
+
+def test_backfill_replays_the_failure_file_next_to_the_database(
+    backfill: _BackfillCommand,
+):
+    result = backfill.run()
+    assert result.exit_code == 0, result.output
+    assert backfill.replay_paths == [backfill.db_path.parent / "failed_batch.jsonl"]
+
+
+def test_backfill_replays_the_failure_file_before_the_writer_starts(
+    backfill: _BackfillCommand,
+):
+    result = backfill.run()
+    assert result.exit_code == 0, result.output
+    # The replay writes on this coroutine, so it must not race the
+    # background task of the writer for the database lock.
+    assert backfill.events.index("replay") < backfill.events.index("writer.start")
+
+
+def test_backfill_stops_the_writer_before_it_disposes_the_engine(
+    backfill: _BackfillCommand,
+):
+    result = backfill.run()
+    assert result.exit_code == 0, result.output
+    assert backfill.writers[0].stopped
+    assert backfill.events[-2:] == ["writer.stop", "engine.dispose"]
+
+
+def test_backfill_reports_a_missing_discord_token(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("DISCORD_TOKEN", raising=False)
+    config_path = _write_config(tmp_path)
+    result = runner.invoke(app, ["backfill", "--config", str(config_path)])
+    assert result.exit_code != 0
+    assert "DISCORD_TOKEN" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_backfill_reports_an_unusable_database(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("DISCORD_TOKEN", "token")
+    config_path = _write_config(tmp_path)
+    # The parent of the database is a file, so the engine cannot be built.
+    (tmp_path / "data").write_text("not a directory", encoding="utf-8")
+    result = runner.invoke(app, ["backfill", "--config", str(config_path)])
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "error:" in result.output
+
+
+class _FakeAnalysingWorker:
+    """An analysis worker that takes the messages it is given."""
+
+    def __init__(self, repo: Any, llm: Any, events: list[str], **kwargs: Any) -> None:
+        self.repo = repo
+        self.llm = llm
+        self.kwargs = kwargs
+        self.events = events
+        self.submitted: list[tuple[int, str]] = []
+        self._pending = 0
+        self.started = False
+        self.stopped = False
+
+    async def start(self) -> None:
+        self.started = True
+        self.events.append("analysis.start")
+
+    async def stop(self) -> None:
+        self.stopped = True
+        self.events.append("analysis.stop")
+
+    def submit(self, message_id: int, content: str) -> bool:
+        self.submitted.append((message_id, content))
+        self._pending += 1
+        # The worker takes the message on the next turn of the event loop.
+        asyncio.get_running_loop().call_soon(self._finish)
+        return True
+
+    def _finish(self) -> None:
+        self._pending -= 1
+
+    def pending(self) -> int:
+        return self._pending
+
+
+@dataclass
+class _AnalyzeCommand:
+    """The fakes behind one ``foresight analyze``."""
+
+    run: Callable[[list[str]], Any]
+    workers: list[_FakeAnalysingWorker]
+    events: list[str]
+    db_path: Path
+
+
+@pytest.fixture
+def analyze(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _AnalyzeCommand:
+    """A ``foresight analyze`` whose model is faked."""
+    events: list[str] = []
+    workers: list[_FakeAnalysingWorker] = []
+    config_path = _write_config(tmp_path, ai_enabled=True)
+    db_path = tmp_path / "data" / "foresight.db"
+
+    def make_worker(repo: Any, llm: Any, **kwargs: Any) -> _FakeAnalysingWorker:
+        worker = _FakeAnalysingWorker(repo, llm, events, **kwargs)
+        workers.append(worker)
+        return worker
+
+    real_create_engine = storage_db.create_engine
+
+    def fake_create_engine(config: Any) -> Any:
+        return _EngineProxy(real_create_engine(config), events)
+
+    monkeypatch.setattr("foresight.analysis.worker.AnalysisWorker", make_worker)
+    monkeypatch.setattr("foresight.storage.db.create_engine", fake_create_engine)
+
+    def run(args: list[str] | None = None) -> Any:
+        return runner.invoke(
+            app, ["analyze", "--config", str(config_path), *(args or [])]
+        )
+
+    return _AnalyzeCommand(run, workers, events, db_path)
+
+
+def test_analyze_analyses_the_messages_that_wait(analyze: _AnalyzeCommand):
+    _seed_pending_messages(analyze.db_path, count=2)
+
+    result = analyze.run()
+
+    assert result.exit_code == 0, result.output
+    assert analyze.workers[0].submitted == [(1, "waiting 0"), (2, "waiting 1")]
+    assert "analysed 2 messages" in result.output
+
+
+def test_analyze_bounds_the_work_with_since(analyze: _AnalyzeCommand):
+    _seed_pending_messages(analyze.db_path, count=3)
+
+    result = analyze.run(["--since", "2026-11-11"])
+
+    assert result.exit_code == 0, result.output
+    assert analyze.workers[0].submitted == [(2, "waiting 1"), (3, "waiting 2")]
+
+
+def test_analyze_bounds_the_work_with_the_limit(analyze: _AnalyzeCommand):
+    _seed_pending_messages(analyze.db_path, count=3)
+
+    result = analyze.run(["--limit", "1"])
+
+    assert result.exit_code == 0, result.output
+    assert analyze.workers[0].submitted == [(1, "waiting 0")]
+
+
+def test_analyze_stops_the_worker_before_it_disposes_the_engine(
+    analyze: _AnalyzeCommand,
+):
+    result = analyze.run()
+    assert result.exit_code == 0, result.output
+    assert analyze.workers[0].stopped
+    assert analyze.events[-2:] == ["analysis.stop", "engine.dispose"]
+
+
+def test_analyze_refuses_when_the_ai_is_disabled(tmp_path: Path):
+    config_path = _write_config(tmp_path, ai_enabled=False)
+    result = runner.invoke(app, ["analyze", "--config", str(config_path)])
+    assert result.exit_code == 2
+    assert "ai" in result.output
+
+
+def test_analyze_reports_an_unusable_database(tmp_path: Path):
+    config_path = _write_config(tmp_path, ai_enabled=True)
+    # The parent of the database is a file, so the engine cannot be built.
+    (tmp_path / "data").write_text("not a directory", encoding="utf-8")
+    result = runner.invoke(app, ["analyze", "--config", str(config_path)])
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "error:" in result.output

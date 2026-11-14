@@ -26,6 +26,7 @@ from foresight.metrics import (
     ai_request_duration_seconds,
     ai_requests_total,
     ai_tokens_total,
+    backfill_messages_total,
     media_bytes_total,
     media_downloads_total,
     messages_captured,
@@ -61,12 +62,6 @@ __all__ = [
     "writer_queue_depth",
 ]
 
-backfill_messages_total = Counter(
-    "foresight_backfill_messages_total",
-    "Messages imported by backfill",
-    ["channel_id"],
-    registry=REGISTRY,
-)
 api_requests_total = Counter(
     "foresight_api_requests_total",
     "API requests",
