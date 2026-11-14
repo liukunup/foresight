@@ -259,3 +259,105 @@ async def test_messages_search_matches_a_non_ascii_needle(api_harness, auth):
     assert response.status_code == 200
     assert response.json()["total"] == 1
     assert response.json()["items"][0]["message_id"] == 1
+
+
+async def test_messages_until_with_a_bare_date_covers_the_whole_day(api_harness, auth):
+    """A bare date names a day, not the second after its start.
+
+    The bounds are compared as strings against the stored timestamps, so
+    the bare date `2026-11-01` would sort before every message of that
+    day and would drop the whole day from the answer.
+    """
+    records = [
+        api_message(1, "midnight", "2026-11-01T00:00:00+00:00"),
+        api_message(2, "noon", "2026-11-01T12:00:00+00:00"),
+        api_message(3, "last second", "2026-11-01T23:59:59.999999+00:00"),
+        api_message(4, "next day", "2026-11-02T00:00:00+00:00"),
+    ]
+    harness = await api_harness(records)
+
+    response = await harness.client.get(
+        "/api/messages", headers=auth, params={"until": "2026-11-01"}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 3
+    assert {item["message_id"] for item in body["items"]} == {1, 2, 3}
+
+
+async def test_messages_since_with_a_bare_date_starts_at_midnight(api_harness, auth):
+    """The lower bound of a bare date is the first second of the day."""
+    records = [
+        api_message(1, "before", "2026-10-31T23:59:59.999999+00:00"),
+        api_message(2, "midnight", "2026-11-01T00:00:00+00:00"),
+        api_message(3, "after", "2026-11-01T00:00:01+00:00"),
+    ]
+    harness = await api_harness(records)
+
+    response = await harness.client.get(
+        "/api/messages", headers=auth, params={"since": "2026-11-01"}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    assert {item["message_id"] for item in body["items"]} == {2, 3}
+
+
+async def test_messages_rejects_a_malformed_bound(api_harness, auth):
+    """A bound that is neither a timestamp nor a date is an error.
+
+    A bound that cannot be read must not be answered with a silently
+    empty range: the message names the parameter that is wrong.
+    """
+    harness = await api_harness([api_message(1, "hello")])
+
+    response = await harness.client.get(
+        "/api/messages", headers=auth, params={"since": "last-tuesday"}
+    )
+    assert response.status_code == 422
+    assert "since" in response.text
+
+    response = await harness.client.get(
+        "/api/messages", headers=auth, params={"until": "last-tuesday"}
+    )
+    assert response.status_code == 422
+    assert "until" in response.text
+
+
+async def test_messages_rejects_a_date_that_does_not_exist(api_harness, auth):
+    """A date of the right shape but of no day is an error.
+
+    The 30th of February has the shape of a date and is not one: a bound
+    that names no day cannot answer with a range.
+    """
+    harness = await api_harness([api_message(1, "hello")])
+
+    response = await harness.client.get(
+        "/api/messages", headers=auth, params={"until": "2026-02-30"}
+    )
+    assert response.status_code == 422
+    assert "until" in response.text
+
+
+async def test_messages_until_with_a_full_timestamp_is_used_as_it_is(api_harness, auth):
+    """A full timestamp keeps its meaning and stays inclusive.
+
+    The bound is compared as a string against the stored timestamp, so
+    the message that sits exactly on the bound belongs to the answer.
+    """
+    records = [
+        api_message(1, "before", "2026-11-01T09:59:59+00:00"),
+        api_message(2, "on the bound", "2026-11-01T10:00:00+00:00"),
+        api_message(3, "after", "2026-11-01T10:00:01+00:00"),
+    ]
+    harness = await api_harness(records)
+
+    response = await harness.client.get(
+        "/api/messages",
+        headers=auth,
+        params={"until": "2026-11-01T10:00:00+00:00"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    assert {item["message_id"] for item in body["items"]} == {1, 2}

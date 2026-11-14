@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
 
-from foresight.api.deps import get_stats
+from foresight.api.deps import TimeBounds, get_stats, time_bounds
 
 # The pagination rules live with the router that established them, so every
 # list endpoint of the API pages the same way.
@@ -16,25 +16,28 @@ router = APIRouter()
 
 @router.get("/stats/overview")
 async def stats_overview(
-    since: str | None = None,
-    until: str | None = None,
     channel_id: int | None = None,
+    bounds: TimeBounds = Depends(time_bounds),
     stats: StatsService = Depends(get_stats),
 ) -> dict:
     """Report the totals of the dump.
 
     The overview is a summary and not a list: it answers with the counters
     themselves instead of with an envelope.
+
+    The `since`/`until` bounds are normalized by the dependency, so a
+    bound of the form `YYYY-MM-DD` names a whole day.
     """
-    return await stats.overview(since=since, until=until, channel_id=channel_id)
+    return await stats.overview(
+        since=bounds.since, until=bounds.until, channel_id=channel_id
+    )
 
 
 @router.get("/stats/top-talkers")
 async def stats_top_talkers(
-    since: str | None = None,
-    until: str | None = None,
     channel_id: int | None = None,
     limit: int = Query(DEFAULT_LIMIT, ge=1),
+    bounds: TimeBounds = Depends(time_bounds),
     stats: StatsService = Depends(get_stats),
 ) -> dict:
     """Rank the authors by the number of messages they wrote.
@@ -48,7 +51,10 @@ async def stats_top_talkers(
     # the caller asked for a page, not for an error.
     limit = min(limit, MAX_LIMIT)
     rows = await stats.top_talkers(
-        since=since, until=until, channel_id=channel_id, limit=limit
+        since=bounds.since,
+        until=bounds.until,
+        channel_id=channel_id,
+        limit=limit,
     )
     truncated = len(rows) >= limit
     return {
@@ -63,11 +69,10 @@ async def stats_top_talkers(
 
 @router.get("/stats/activity")
 async def stats_activity(
-    since: str | None = None,
-    until: str | None = None,
     channel_id: int | None = None,
     bucket: str = Query("day", pattern="^(hour|day)$"),
     limit: int = Query(DEFAULT_LIMIT, ge=1),
+    bounds: TimeBounds = Depends(time_bounds),
     stats: StatsService = Depends(get_stats),
 ) -> dict:
     """Report how many messages were written per hour or per day.
@@ -84,7 +89,10 @@ async def stats_activity(
     # the caller asked for a page, not for an error.
     limit = min(limit, MAX_LIMIT)
     buckets = await stats.activity(
-        since=since, until=until, bucket=bucket, channel_id=channel_id
+        since=bounds.since,
+        until=bounds.until,
+        bucket=bucket,
+        channel_id=channel_id,
     )
     # The service returns the whole series and the page is cut here: the
     # query that buckets the messages lives in the storage layer, and the
@@ -103,10 +111,9 @@ async def stats_activity(
 
 @router.get("/stats/topics")
 async def stats_topics(
-    since: str | None = None,
-    until: str | None = None,
     channel_id: int | None = None,
     limit: int = Query(DEFAULT_LIMIT, ge=1),
+    bounds: TimeBounds = Depends(time_bounds),
     stats: StatsService = Depends(get_stats),
 ) -> dict:
     """Report the topics of the dump.
@@ -124,7 +131,10 @@ async def stats_topics(
     # the caller asked for a page, not for an error.
     limit = min(limit, MAX_LIMIT)
     rows = await stats.topics(
-        since=since, until=until, channel_id=channel_id, limit=limit
+        since=bounds.since,
+        until=bounds.until,
+        channel_id=channel_id,
+        limit=limit,
     )
     truncated = len(rows) >= limit
     return {

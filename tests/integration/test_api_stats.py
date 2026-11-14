@@ -327,3 +327,46 @@ async def test_stats_activity_reports_a_complete_page(api_harness, auth):
     assert body["total"] == 3
     assert body["truncated"] is False
     assert body["has_more"] is False
+
+
+async def test_stats_overview_until_with_a_bare_date_covers_the_whole_day(
+    api_harness, auth
+):
+    """The bounds are normalized the same way on every endpoint.
+
+    A bare date names a day: `until=2026-11-01` has to count the
+    messages of that day and not drop them.
+    """
+    records = [
+        message(1, created_at="2026-11-01T00:00:00+00:00"),
+        message(2, created_at="2026-11-01T23:59:59.999999+00:00"),
+        message(3, created_at="2026-11-02T00:00:00+00:00"),
+    ]
+    harness = await api_harness(records)
+
+    response = await harness.client.get(
+        "/api/stats/overview", headers=auth, params={"until": "2026-11-01"}
+    )
+    assert response.status_code == 200
+    assert response.json()["total_messages"] == 2
+
+
+async def test_stats_endpoints_reject_a_malformed_bound(api_harness, auth):
+    """A bound that cannot be read is an error on every endpoint.
+
+    The message names the parameter that is wrong, so the caller knows
+    which one to fix.
+    """
+    harness = await api_harness([message(1)])
+
+    for path in (
+        "/api/stats/overview",
+        "/api/stats/top-talkers",
+        "/api/stats/activity",
+        "/api/stats/topics",
+    ):
+        response = await harness.client.get(
+            path, headers=auth, params={"until": "yesterday"}
+        )
+        assert response.status_code == 422, path
+        assert "until" in response.text, path

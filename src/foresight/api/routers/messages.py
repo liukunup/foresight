@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from foresight.api.deps import get_engine
+from foresight.api.deps import TimeBounds, get_engine, time_bounds
 from foresight.api.schemas import AnalysisOut, MessageDetail, MessageOut, Page
 from foresight.storage.tables import message_analysis, messages
 
@@ -39,8 +39,6 @@ async def list_messages(
     channel_id: int | None = None,
     author_id: int | None = None,
     guild_id: int | None = None,
-    since: str | None = None,
-    until: str | None = None,
     q: str | None = None,
     min_len: int | None = None,
     has_attachment: bool | None = None,
@@ -49,13 +47,16 @@ async def list_messages(
     order: str = Query("desc", pattern="^(asc|desc)$"),
     limit: int = Query(DEFAULT_LIMIT, ge=1),
     offset: int = Query(0, ge=0),
+    bounds: TimeBounds = Depends(time_bounds),
     engine: AsyncEngine = Depends(get_engine),
 ) -> Page[MessageOut]:
     """List the dumped messages, newest first unless `order=asc`.
 
     The timestamps are stored as fixed-width UTC ISO-8601 strings, so the
     `since`/`until` bounds are compared as strings and the interval is
-    closed on both ends.
+    closed on both ends. A bound of the form `YYYY-MM-DD` names a whole
+    day: it is the first second of the day for `since` and the last one
+    for `until`.
     """
     # A request for more than the maximum is clamped instead of rejected:
     # the caller asked for a page, not for an error.
@@ -68,10 +69,10 @@ async def list_messages(
         clauses.append(messages.c.author_id == author_id)
     if guild_id is not None:
         clauses.append(messages.c.guild_id == guild_id)
-    if since:
-        clauses.append(messages.c.created_at >= since)
-    if until:
-        clauses.append(messages.c.created_at <= until)
+    if bounds.since:
+        clauses.append(messages.c.created_at >= bounds.since)
+    if bounds.until:
+        clauses.append(messages.c.created_at <= bounds.until)
     if min_len is not None:
         clauses.append(messages.c.char_count >= min_len)
     if has_attachment is True:
