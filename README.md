@@ -1,1 +1,187 @@
 # ForeSight
+
+Discord 频道消息转储服务：只要用户在受监控的频道发言，消息就会连同编辑、删除、表情回应和附件一起落库，并通过 HTTP API、Prometheus 指标和一个可安装的 Agent Skill 供人和 AI 查询分析。
+
+## 特性
+
+- **实时采集**：消息、编辑、删除、表情回应全部捕获（编辑只保留最新内容，删除是软删除）
+- **附件归档**：图片/视频/音频下载到本地或任意 S3 兼容存储（MinIO、R2、OSS）
+- **AI 分析**：一次模型调用同时产出翻译、情绪、问题提取
+- **查询 API**：资源端点 + 统计端点 + 只读 SQL 端点，全部只读连接
+- **Agent Skill**：装上之后 AI 就能自己查、自己分析、自己出结论
+- **Prometheus 指标**：采集、写入队列、AI、媒体、API 全链路可观测
+- **三种数据库**：SQLite（默认）/ PostgreSQL / MySQL
+- **历史补录**：一条命令把过去 N 天的消息导入
+
+## ⚠️ 开始之前：必须开启 MESSAGE CONTENT INTENT
+
+> [!WARNING]
+> **没有开启 MESSAGE CONTENT INTENT，采集到的每条消息正文都是空的，而且不会有任何报错。**
+>
+> 这个坑非常安静：bot 照样连上 Discord、照样收到「有人发言了」的事件、照样把消息写进数据库——只是每条消息的 `content` 都是空字符串。日志一片正常，只有对着数据库看一眼才发现「有消息但没内容」。
+>
+> 开启路径：**Discord 开发者后台 → 你的 Application → Bot 页签 → 找到 `MESSAGE CONTENT INTENT` → 打开开关 → 保存**。
+> 改完必须**重启 bot**（`docker compose restart foresight` 或重启进程）才生效。
+
+## 快速开始（Docker，推荐）
+
+```bash
+git clone https://github.com/liukunup/foresight.git
+cd foresight
+
+cp config.example.toml config.toml   # 填入 [discord].channel_ids
+cp .env.example .env                 # 填入 DISCORD_TOKEN 与 FORESIGHT_API_TOKEN
+
+docker compose up -d
+docker compose logs -f foresight
+```
+
+服务会在 <http://127.0.0.1:8000> 提供 API，接口文档在 <http://127.0.0.1:8000/docs>。
+
+- 数据库和下载的附件都落在仓库里的 `./data` 目录（容器内 `/app/data`）。
+- 端口默认 `8000`；想换就设环境变量 `FORESIGHT_PORT=8080 docker compose up -d`。
+- 停止：`docker compose down`（加 `-v` 会连同数据卷一起删掉）。
+
+## 快速开始（本地）
+
+```bash
+uv venv
+uv sync
+
+cp config.example.toml config.toml
+export DISCORD_TOKEN="你的 bot token"
+export FORESIGHT_API_TOKEN="随便生成一个随机串"
+
+uv run foresight init-db
+uv run foresight both        # 采集器 + API 同时跑
+```
+
+## 准备 Discord 机器人
+
+1. 打开 [Discord 开发者后台](https://discord.com/developers/applications)，新建 Application
+2. 在 **Bot** 页签点 **Reset Token**，复制这个 token —— 它就是 `DISCORD_TOKEN`
+3. 打开 **Privileged Gateway Intents**，**必须开启 MESSAGE CONTENT INTENT**（不开的话正文永远是空的，而且不报错）
+4. 在 **OAuth2 → URL Generator** 勾选 `bot` + `Read Message History` + `Send Messages`，用生成的链接邀请 bot 进服务器
+5. 在 Discord 客户端右键目标频道 → 复制频道 ID（开发者模式：设置 → 高级 → 开发者模式），填进 `config.toml` 的 `[discord].channel_ids`
+
+## 配置
+
+`config.toml` 完整示例见 [`config.example.toml`](config.example.toml)。
+
+| 段 | 关键项 | 说明 |
+|---|---|---|
+| `[discord]` | `channel_ids` | 白名单频道 ID 列表，非空 |
+| `[database]` | `backend` | `sqlite` / `postgresql` / `mysql` |
+| `[media]` | `backend` | `local`（默认）/ `s3` |
+| `[api]` | `host` / `port` | 默认 `127.0.0.1:8000` |
+| `[api]` | `metrics_token` | 给 `/metrics` 加一道单独的令牌 |
+| `[ai]` | `enabled` / `base_url` / `model` | OpenAI 兼容接口 |
+| `[writer]` | `batch_size` / `flush_interval_ms` | 批量落库参数 |
+
+**所有密钥只能走环境变量**，不要写进 `config.toml`：
+
+| 环境变量 | 什么时候必须设置 | 说明 |
+|---|---|---|
+| `DISCORD_TOKEN` | 采集 / `backfill` 时 | Discord bot token |
+| `FORESIGHT_API_TOKEN` | API 不在本机监听时 | API 的 Bearer token；不设置且绑定 `0.0.0.0` 时服务拒绝启动 |
+| `FORESIGHT_LLM_API_KEY` | 开启 AI 分析时 | 模型服务的 key |
+| `FORESIGHT_DB_PASSWORD` | PostgreSQL / MySQL 时 | 数据库密码 |
+| `FORESIGHT_S3_ACCESS_KEY_ID` | `media.backend = "s3"` 时 | 对象存储的 access key |
+| `FORESIGHT_S3_SECRET_ACCESS_KEY` | `media.backend = "s3"` 时 | 对象存储的 secret |
+| `FORESIGHT_CONFIG` | 可选 | 配置文件路径，默认 `config.toml` |
+| `FORESIGHT_API_HOST` / `FORESIGHT_API_PORT` | 可选 | 覆盖 `[api].host` / `[api].port` |
+
+## 命令
+
+| 命令 | 作用 |
+|---|---|
+| `foresight init-db` | 建表 |
+| `foresight run` | 只跑采集器 |
+| `foresight serve` | 只跑 HTTP API（`--host` / `--port` 可覆盖） |
+| `foresight both` | 单进程同时跑采集器和 API（compose 默认） |
+| `foresight backfill --days 7` | 导入最近 7 天的历史消息（不补表情、不跑 AI） |
+| `foresight analyze` | 分析还没分析过的消息（需要 `[ai].enabled = true`） |
+| `foresight query --sql "SELECT ..." --db data/foresight.db` | 只读查询 |
+| `foresight stats --db data/foresight.db` | 概览统计 |
+
+每条命令都接受 `--config` 指定别的配置文件。
+
+## 安装 AI Skill
+
+```bash
+./scripts/install_skill.sh --target opencode     # 或 --target claude
+export FORESIGHT_API_TOKEN="..."                 # 脚本会提示下一步
+```
+
+脚本把 skill 复制到 agent 的 skills 目录，并把连接信息写在 `~/.config/foresight/connection.toml`（里面只有 API 地址和**环境变量名**，不存 token 明文）。
+
+装好之后 AI 就能自己查这个归档：「上周谁发言最多」「大家都在抱怨什么」「这个频道的活跃时间是什么时候」——它会自己去调 API、自己算、自己给结论，而不是让你手动翻数据库。
+
+## API
+
+除 `/metrics` 外，所有请求都需要 `Authorization: Bearer <FORESIGHT_API_TOKEN>`。
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/health` | 状态与计数 |
+| `GET /api/messages` | 消息列表，支持频道/作者/时间/关键词过滤 |
+| `GET /api/messages/{id}` | 单条消息（带 AI 分析结果） |
+| `GET /api/users` | 发言排行 |
+| `GET /api/users/{id}` | 单个用户 |
+| `GET /api/channels` | 频道统计 |
+| `GET /api/reactions` | 表情明细 |
+| `GET /api/stats/overview` | 总量、活跃人数、删除率、编辑率 |
+| `GET /api/stats/top-talkers` | 发言排行 |
+| `GET /api/stats/activity` | 时间分布（`bucket=hour\|day`） |
+| `GET /api/stats/topics` | 高频议题 |
+| `POST /api/query` | 只读 SQL（单条 SELECT/WITH，写操作被数据库引擎拒绝） |
+| `GET /metrics` | Prometheus 指标（不在 `/api` 下，不需要 token） |
+
+分页信封：`{"total": N, "limit": 50, "offset": 0, "has_more": true, "items": []}`。
+
+时间边界 `since` / `until` 两种写法都可以：
+
+- 完整时间戳，如 `2026-11-01T10:00:00+00:00` —— 按字面比较，两端都是闭区间；
+- 纯日期，如 `2026-11-01` —— `since` 取这天 `00:00:00` 起点，`until` 取这天 `23:59:59.999999` 终点，也就是**整天都算在内**。
+
+其他写法（比如 `since=last-tuesday`）会被拒绝，返回 422 并在报错里点名是哪个参数不对。
+
+## Prometheus 指标
+
+`GET /metrics` 暴露全部指标，例如 `foresight_messages_captured_total`、`foresight_writer_queue_depth`、`foresight_api_requests_total`、`foresight_db_messages_total`。
+
+> 指标标签不会使用 `user_id`（基数太高会打爆 Prometheus），用户维度请查 API。
+
+## 常见问题
+
+**正文是空的 / 抓不到消息**
+Discord 开发者后台的 **MESSAGE CONTENT INTENT** 没开。在 Bot 页面打开后重启 bot。这是唯一一个「看起来一切正常但数据是空的」的坑。
+
+**`SQLite is locked`**
+服务在写库时又有人查。SQLite 已启用 WAL 和 5 秒 busy timeout；长时间锁通常是有别的进程在写同一个文件，确认没有多个容器共享同一个库文件。
+
+**`FORESIGHT_API_TOKEN` 必须设置**
+API 绑定到 `0.0.0.0`（非本机）时必须设置 token，否则服务拒绝启动。Docker compose 就是绑定 `0.0.0.0`，所以 `.env` 里的 `FORESIGHT_API_TOKEN` 必须填。
+
+**容器起来但写不了数据库（permission denied）**
+容器内的服务用 uid `10001` 运行，`./data` 必须对它可写。Linux 上建目录时用 `sudo chown -R 10001:10001 data`；macOS / Windows 的 Docker Desktop 一般不用管。
+
+**机器人报 403 / 看不到频道**
+bot 没被邀请进服务器，或没有该频道的读取权限（`Read Message History`）。
+
+**LLM 分析一直失败**
+检查 `FORESIGHT_LLM_API_KEY` 和 `base_url` 是否指向 OpenAI 兼容接口。失败的行会在 `message_analysis.error` 里留下原因，`messages.analysis_status` 标记为 `failed`。
+
+**下载附件 403**
+Discord CDN 链接带签名且会过期，收到消息时应立即下载。如果附件一直是 `failed`，用 `foresight backfill` 重新导入。
+
+## 开发
+
+```bash
+uv run pytest -v
+uv run foresight init-db --config config.example.toml
+```
+
+## 许可
+
+见 [LICENSE](LICENSE)。
