@@ -1008,8 +1008,11 @@ class _FailingBot:
 
     async def start(self, token: str) -> None:
         self.starts += 1
-        # Whether the API was still serving when the collector died.
-        self._state["api_was_up"] = bool(self._state.get("server_running"))
+        if self._state.get("server_running"):
+            # The collector died while the API was serving. The flag is
+            # never taken back: the collector is tried again, and the
+            # first attempt can come before the server is up.
+            self._state["api_was_up"] = True
         raise self._state["bot_error"]
 
     async def close(self) -> None:
