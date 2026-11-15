@@ -1,0 +1,44 @@
+[project]
+name = "foresight"
+version = "0.1.0"
+description = "Discord channel message dump service for analytics"
+requires-python = ">=3.13"
+dependencies = [
+    "discord.py>=2.7",
+    "SQLAlchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
+    "asyncpg>=0.30",
+    "asyncmy>=0.2",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "httpx>=0.27",
+    "aioboto3>=13.4",
+    "prometheus-client>=0.21",
+    "typer>=0.12",
+    "rich>=13.9",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "respx>=0.21",
+    "moto[s3,server]>=5.0",
+]
+
+[project.scripts]
+foresight = "foresight.cli:main"
+foresight-healthcheck = "foresight.healthcheck:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/foresight"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

@@ -218,3 +218,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Superpowers scratch directory
+.superpowers/
+
+# Local runtime artifacts
+#   SQLite database, downloaded media and the locally created config file
+#   (config.toml is copied from config.example.toml and never committed).
+#   The rule is anchored to the repository root so that it does not shadow
+#   the "!.pixi/config.toml" negation above.
+data/
+/config.toml

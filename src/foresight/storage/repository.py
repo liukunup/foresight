@@ -1,0 +1,798 @@
+"""The write side of the storage layer.
+
+This module owns the writes: it applies the batches of the collector, the
+AI worker and the API to the tables of `storage/tables.py`. The read side
+lives next door in `storage/stats.py`, which issues its own SELECT
+statements.
+
+The one read it owns is the list of the messages that still wait for
+their analysis: the analysis worker repairs them, so the query belongs
+next to the write that marks a message as analysed.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from typing import Any, Callable, Mapping, Sequence
+
+from sqlalchemy import Table, bindparam, case, func, literal_column, select, update
+from sqlalchemy.dialects.mysql import Insert as MySQLInsert
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import Insert as PGInsert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import Insert as SQLiteInsert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from sqlalchemy.sql.elements import ColumnElement
+
+from foresight.domain.models import (
+    AttachmentRecord,
+    AttachmentStatus,
+    ChannelSnapshot,
+    GuildSnapshot,
+    MessageAnalysis,
+    MessageDelete,
+    MessageEdit,
+    MessageRecord,
+    OpKind,
+    ReactionRecord,
+    ReactionRemove,
+    UserSnapshot,
+    WriteOp,
+)
+from foresight.storage.tables import (
+    attachments,
+    channels,
+    guilds,
+    message_analysis,
+    messages,
+    reactions,
+    users,
+)
+
+# Spec §7.1: the realtime path may only refresh these four columns. It must
+# never touch `analysis_status` (owned by the AI worker) or `captured_at`
+# (records when the message was first dumped), and it must not overwrite the
+# counters a fresh record happens to carry.
+#
+# The conflict update of these four columns is not a plain copy of the
+# incoming record: the soft state of the row survives the write. A message
+# that was deleted stays deleted, the counter of the edits never goes down
+# and the marker of the last edit is never cleared. A record that is
+# written again — the gateway redelivers it, the collector sees it twice —
+# carries none of that state, and a plain copy would erase it.
+MESSAGE_UPDATABLE = (
+    "content",
+    "edited_at",
+    "edit_count",
+    "deleted_at",
+)
+
+# The order in which the groups of a batch are applied. A batch can report a
+# message, an edit and a delete for the same `message_id`; the message is
+# written first, then its edit, then its delete, so the freshest information
+# wins no matter in which order the operations arrived. Every kind the
+# repository handles must appear here.
+OP_ORDER: tuple[str, ...] = (
+    OpKind.MESSAGE,
+    OpKind.MESSAGE_INSERT_ONLY,
+    OpKind.MESSAGE_EDIT,
+    OpKind.MESSAGE_DELETE,
+    OpKind.REACTION,
+    OpKind.REACTION_REMOVE,
+    OpKind.USER,
+    OpKind.CHANNEL,
+    OpKind.GUILD,
+    OpKind.ATTACHMENT,
+    OpKind.ATTACHMENT_STATUS,
+    OpKind.ANALYSIS_STATUS,
+    OpKind.ANALYSIS,
+)
+
+
+def _dedupe(records: Sequence[Any], key: Callable[[Any], Any]) -> list[Any]:
+    """Keep the last record of every conflict key.
+
+    A batch can report the same key more than once. The collector writes a
+    snapshot of the author, the channel and the guild with every message, so
+    two messages of the same author inside one flush window carry the same
+    `user_id` — and the backfill writes one channel snapshot per message, so
+    every batch of a backfill carries the same `channel_id` about a hundred
+    times.
+
+    PostgreSQL refuses such a statement outright — "ON CONFLICT DO UPDATE
+    command cannot affect row a second time" — and MySQL refuses the
+    insert-only form of it, so the group is reduced to one row per key
+    before the statement is built.
+
+    The last record of a key wins: a later snapshot of a user, a channel or a
+    guild carries the newer name, and a later message carries the newer
+    content.
+    """
+    latest: dict[Any, Any] = {}
+    for record in records:
+        latest[key(record)] = record
+    return list(latest.values())
+
+
+class Repository:
+    """Batched, dialect-aware write access."""
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._engine = engine
+        self._dialect = engine.dialect.name
+        self._handlers: dict[str, Callable[[AsyncConnection, list[Any]], Any]] = {
+            OpKind.MESSAGE: self._handle_message,
+            OpKind.MESSAGE_INSERT_ONLY: self._handle_message_insert_only,
+            OpKind.MESSAGE_EDIT: self._handle_message_edit,
+            OpKind.MESSAGE_DELETE: self._handle_message_delete,
+            OpKind.REACTION: self._handle_reaction,
+            OpKind.REACTION_REMOVE: self._handle_reaction_remove,
+            OpKind.USER: self._handle_user,
+            OpKind.CHANNEL: self._handle_channel,
+            OpKind.GUILD: self._handle_guild,
+            OpKind.ATTACHMENT: self._handle_attachment,
+            OpKind.ATTACHMENT_STATUS: self._handle_attachment_status,
+            OpKind.ANALYSIS_STATUS: self._handle_analysis_status,
+            OpKind.ANALYSIS: self._handle_analysis,
+        }
+
+    async def apply_batch(self, ops: Sequence[WriteOp]) -> None:
+        """Apply a batch of operations inside a single transaction.
+
+        The operations are grouped by kind and every group is applied with a
+        single statement. The groups are applied in the order given by
+        `OP_ORDER`: a message is written before its edit and before its
+        delete, so a batch that reports the same `message_id` more than once
+        ends with the freshest information. The result therefore does not
+        depend on the order in which the operations arrived.
+        """
+        if not ops:
+            return
+        groups: dict[str, list[Any]] = defaultdict(list)
+        for op in ops:
+            if op.kind not in self._handlers:
+                raise ValueError(
+                    f"unknown op kind {op.kind!r}; "
+                    f"valid kinds are: "
+                    f"{', '.join(repr(kind) for kind in sorted(self._handlers))}"
+                )
+            groups[op.kind].append(op.payload)
+        async with self._engine.begin() as conn:
+            for kind in self._ordered_kinds(groups):
+                await self._handlers[kind](conn, groups[kind])
+
+    @staticmethod
+    def _ordered_kinds(groups: Mapping[str, list[Any]]) -> list[str]:
+        """The kinds of a batch, in the order in which they are applied.
+
+        `OP_ORDER` is the canonical order. A kind that is missing from it
+        (a programming error, guarded by a test) is applied last, so that
+        no operation of a batch is ever silently dropped.
+        """
+        ordered = [kind for kind in OP_ORDER if kind in groups]
+        return ordered + [kind for kind in groups if kind not in OP_ORDER]
+
+    async def pending_messages(
+        self, *, since: str | None = None, limit: int = 1000
+    ) -> list[tuple[int, str]]:
+        """The messages that still wait for their analysis.
+
+        A message whose `analysis_status` is still `pending` was never
+        analysed: it was captured while the AI was disabled, or while the
+        worker was down, or its status update was written before its row
+        existed. The collector queues these messages again when it starts,
+        so that a restart does not leave them behind for good.
+
+        The messages are ordered by their creation, so that the oldest
+        ones wait the shortest time.
+        """
+        if limit <= 0:
+            return []
+        clauses: list[Any] = [messages.c.analysis_status == "pending"]
+        if since:
+            clauses.append(messages.c.created_at >= since)
+        stmt = (
+            select(messages.c.message_id, messages.c.content)
+            .where(*clauses)
+            .order_by(messages.c.created_at)
+            .limit(limit)
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(stmt)).all()
+        return [(int(row.message_id), row.content or "") for row in rows]
+
+    async def pending_attachments(self, *, limit: int = 1000) -> list[AttachmentRecord]:
+        """The attachments that still wait for their download.
+
+        An attachment whose download never happened — because the worker
+        was down, or because its status was lost when the queue of the
+        writer was full — keeps the status `pending`. The collector
+        queues these attachments again when it starts, so that a restart
+        does not leave them behind for good.
+
+        The attachments are ordered by the moment they were captured, so
+        that the oldest ones wait the shortest time.
+        """
+        if limit <= 0:
+            return []
+        stmt = (
+            select(
+                attachments.c.message_id,
+                attachments.c.attachment_id,
+                attachments.c.filename,
+                attachments.c.content_type,
+                attachments.c.size,
+                attachments.c.url,
+                attachments.c.storage_backend,
+                attachments.c.status,
+                attachments.c.captured_at,
+            )
+            .where(attachments.c.status == "pending")
+            .order_by(attachments.c.captured_at, attachments.c.message_id)
+            .limit(limit)
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(stmt)).all()
+        return [
+            AttachmentRecord(
+                message_id=int(row.message_id),
+                attachment_id=row.attachment_id,
+                filename=row.filename,
+                content_type=row.content_type,
+                size=int(row.size) if row.size is not None else None,
+                url=row.url or "",
+                storage_backend=row.storage_backend or "local",
+                status=row.status or "pending",
+                captured_at=row.captured_at or "",
+            )
+            for row in rows
+        ]
+
+    # -- insert helpers -------------------------------------------------
+
+    def _insert(self, table: Table) -> SQLiteInsert | PGInsert | MySQLInsert:
+        """Return the insert statement builder of the current dialect.
+
+        The concrete class carries the dialect specific API: MySQL offers
+        `on_duplicate_key_update` and `inserted`, SQLite and PostgreSQL offer
+        `on_conflict_do_update`, `on_conflict_do_nothing` and `excluded`.
+        """
+        if self._dialect == "postgresql":
+            return pg_insert(table)
+        if self._dialect == "mysql":
+            return mysql_insert(table)
+        return sqlite_insert(table)
+
+    def _proposed(self, stmt: Any, column: str) -> ColumnElement[Any]:
+        """The value the row that would have been inserted carries.
+
+        SQLite and PostgreSQL name that row `excluded`, MySQL names it
+        `inserted` — which renders as `new.<column>` on MySQL 8.0.19 and
+        later, and as `VALUES(<column>)` on the older servers.
+        """
+        if isinstance(stmt, MySQLInsert):
+            return stmt.inserted[column]
+        return stmt.excluded[column]
+
+    def _greatest(self, left: ColumnElement[Any], right: ColumnElement[Any]) -> Any:
+        """The larger of two values.
+
+        PostgreSQL and MySQL have `GREATEST`, SQLite has not: it has the
+        scalar `max`, which takes two arguments.
+        """
+        if self._dialect == "sqlite":
+            return func.max(left, right)
+        return func.greatest(left, right)
+
+    def _upsert(
+        self,
+        table: Table,
+        values: list[dict[str, Any]],
+        conflict_columns: list[str],
+        update_columns: tuple[str, ...],
+        updates: Mapping[str, Callable[[Any], Any]] | None = None,
+    ) -> SQLiteInsert | PGInsert | MySQLInsert:
+        """Build an upsert that refreshes `update_columns` on conflict.
+
+        `updates` holds the columns whose conflict update is not a plain
+        copy of the row that would have been inserted: the soft state of a
+        message and the soft removal of a reaction survive a redelivery, so
+        their conflict update is a function of the row that is already
+        there. Every other column takes the value of the incoming row.
+        """
+        stmt = self._insert(table).values(values)
+
+        def value_for(column: str) -> Any:
+            if updates is not None and column in updates:
+                return updates[column](stmt)
+            return self._proposed(stmt, column)
+
+        if isinstance(stmt, MySQLInsert):
+            # MySQL names the row that would have been inserted with
+            # `new.<column>`, SQLite and PostgreSQL with the excluded table.
+            return stmt.on_duplicate_key_update(
+                **{col: value_for(col) for col in update_columns}
+            )
+        return stmt.on_conflict_do_update(
+            index_elements=conflict_columns,
+            set_={col: value_for(col) for col in update_columns},
+        )
+
+    def _message_upsert(
+        self, values: list[dict[str, Any]]
+    ) -> SQLiteInsert | PGInsert | MySQLInsert:
+        """Build the upsert of the realtime path.
+
+        The soft state of the row survives the write: a message that was
+        deleted stays deleted, the counter of the edits never goes down and
+        the marker of the last edit is never cleared.
+        """
+        return self._upsert(
+            messages,
+            values,
+            ["message_id"],
+            MESSAGE_UPDATABLE,
+            updates={
+                "edited_at": lambda stmt: func.coalesce(
+                    self._proposed(stmt, "edited_at"), messages.c.edited_at
+                ),
+                "edit_count": lambda stmt: self._greatest(
+                    messages.c.edit_count, self._proposed(stmt, "edit_count")
+                ),
+                "deleted_at": lambda stmt: func.coalesce(
+                    messages.c.deleted_at, self._proposed(stmt, "deleted_at")
+                ),
+            },
+        )
+
+    def _reaction_upsert(
+        self, values: list[dict[str, Any]]
+    ) -> SQLiteInsert | PGInsert | MySQLInsert:
+        """Build the upsert of a reaction.
+
+        A reaction that was taken back stays taken back — unless it is
+        added again. The row carries the time of the removal and the
+        incoming record carries the time of the add, so the two tell a
+        genuine re-add from a replay of an old record: an add that is
+        newer than the removal revives the reaction, an add that is older
+        than the removal is a replay and changes nothing.
+
+        The timestamps are UTC ISO-8601 strings of a fixed width, so
+        comparing them as strings compares them as moments in time. A row
+        that was never removed carries no removal: the comparison is
+        empty, the conditional falls to its second branch and the row
+        keeps no removal.
+        """
+        return self._upsert(
+            reactions,
+            values,
+            ["message_id", "user_id", "emoji"],
+            ("emoji_id", "is_custom", "added_at", "removed_at"),
+            updates={
+                "removed_at": lambda stmt: case(
+                    (
+                        self._proposed(stmt, "added_at") > reactions.c.removed_at,
+                        None,
+                    ),
+                    else_=reactions.c.removed_at,
+                ),
+            },
+        )
+
+    def _insert_only(
+        self, table: Table, values: list[dict[str, Any]]
+    ) -> SQLiteInsert | PGInsert | MySQLInsert:
+        """Build an insert that keeps rows which already exist.
+
+        On MySQL this is `ON DUPLICATE KEY UPDATE <pk> = ...` — a true no-op:
+        the conflicting row keeps its key and the connection's last insert id
+        stays usable. Writing `<pk> = VALUES(<pk>)` instead would copy the
+        freshly allocated value onto the existing row and rewrite its key.
+
+        The right hand side depends on who allocated the key. A table with an
+        auto-increment surrogate (`autoincrement=True`) uses
+        `LAST_INSERT_ID(<pk>)`, the documented MySQL idiom that keeps the last
+        insert id pointing at the existing row. A table whose key the
+        application generated — a snowflake, for instance — uses a plain
+        self-assignment (`<pk> = <pk>`): `LAST_INSERT_ID(<pk>)` would set the
+        session's last insert id to a value the database never handed out,
+        and every caller reading `cursor.lastrowid` would misread it.
+
+        The self-assignment names the table: MySQL refuses an unqualified
+        column in the clause with "Column '<pk>' in field list is ambiguous",
+        because the name stands for the row of the table and for the row that
+        would have been inserted at the same time.
+        """
+        stmt = self._insert(table).values(values)
+        if isinstance(stmt, MySQLInsert):
+            # MySQL has no "do nothing": a no-op update on the primary key
+            # leaves the conflicting row as it is. Only a key the database
+            # allocates may use the LAST_INSERT_ID idiom.
+            primary_key = list(table.primary_key.columns)[0]
+            if primary_key.autoincrement is True:
+                return stmt.on_duplicate_key_update(
+                    **{
+                        primary_key.name: func.last_insert_id(
+                            literal_column(primary_key.name)
+                        )
+                    }
+                )
+            return stmt.on_duplicate_key_update(
+                **{
+                    primary_key.name: literal_column(
+                        f"{table.name}.{primary_key.name}"
+                    )
+                }
+            )
+        return stmt.on_conflict_do_nothing()
+
+    # -- handlers -------------------------------------------------------
+    # Update statements bind their parameters under a `b_` prefixed name:
+    # SQLAlchemy reserves the plain column names for the parameters of an
+    # UPDATE and would reject them as duplicate bind parameters.
+
+    async def _handle_message(self, conn: AsyncConnection, records: list[MessageRecord]) -> None:
+        records = _dedupe(records, lambda record: record.message_id)
+        values = [self._message_values(r) for r in records]
+        stmt = self._message_upsert(values)
+        await conn.execute(stmt)
+
+    async def _handle_message_insert_only(
+        self, conn: AsyncConnection, records: list[MessageRecord]
+    ) -> None:
+        records = _dedupe(records, lambda record: record.message_id)
+        values = [self._message_values(r) for r in records]
+        await conn.execute(self._insert_only(messages, values))
+
+    async def _handle_message_edit(self, conn: AsyncConnection, edits: list[MessageEdit]) -> None:
+        """Write an edit, but only when it is newer than the last one.
+
+        The counter of the edits is a relative value: it can be raised, never
+        set, because the event carries no count. A write that is replayed —
+        the failure file replays a batch that may already have reached the
+        database — would therefore count the same edit twice.
+
+        The timestamp of the edit is the marker of "this edit is already
+        recorded". An edit that is not newer than the one the row carries is
+        a replay, and it changes nothing: not the counter, not the content
+        and not the marker. The timestamps are compared as strings, the way
+        the stored timestamps are compared everywhere else, and they are
+        written in one canonical form — the adapter renders them the same
+        way everywhere.
+        """
+        edited_at = bindparam("b_edited_at")
+        # The edit is newer than the one the row carries. An empty string
+        # stands for "never edited": it sorts before every timestamp.
+        newer = edited_at > func.coalesce(messages.c.edited_at, "")
+        stmt = (
+            update(messages)
+            .where(messages.c.message_id == bindparam("b_message_id"))
+            .ordered_values(
+                (
+                    # The order of the assignments matters on MySQL: it
+                    # evaluates them from left to right, so a column that is
+                    # read must not be written before it. The marker of the
+                    # last edit is therefore written last — every other
+                    # assignment reads the marker of the row as it was. The
+                    # other backends read the old row in every assignment,
+                    # whatever the order is.
+                    "content",
+                    case(
+                        (newer, bindparam("b_content")),
+                        else_=messages.c.content,
+                    ),
+                ),
+                (
+                    "edit_count",
+                    messages.c.edit_count + case((newer, 1), else_=0),
+                ),
+                (
+                    "edited_at",
+                    case(
+                        (newer, edited_at),
+                        else_=messages.c.edited_at,
+                    ),
+                ),
+            )
+        )
+        await conn.execute(
+            stmt,
+            [
+                {
+                    "b_message_id": edit.message_id,
+                    "b_content": edit.content,
+                    "b_edited_at": edit.edited_at,
+                }
+                for edit in edits
+            ],
+        )
+
+    async def _handle_message_delete(
+        self, conn: AsyncConnection, deletes: list[MessageDelete]
+    ) -> None:
+        stmt = (
+            update(messages)
+            .where(messages.c.message_id == bindparam("b_message_id"))
+            .values(deleted_at=bindparam("b_deleted_at"))
+        )
+        await conn.execute(
+            stmt,
+            [
+                {
+                    "b_message_id": deletion.message_id,
+                    "b_deleted_at": deletion.deleted_at,
+                }
+                for deletion in deletes
+            ],
+        )
+
+    async def _handle_reaction(
+        self, conn: AsyncConnection, records: list[ReactionRecord]
+    ) -> None:
+        records = _dedupe(
+            records, lambda record: (record.message_id, record.user_id, record.emoji)
+        )
+        values = [
+            {
+                "message_id": r.message_id,
+                "user_id": r.user_id,
+                "emoji": r.emoji,
+                "emoji_id": r.emoji_id,
+                "is_custom": r.is_custom,
+                "added_at": r.added_at,
+                "removed_at": r.removed_at,
+            }
+            for r in records
+        ]
+        stmt = self._reaction_upsert(values)
+        await conn.execute(stmt)
+
+    async def _handle_reaction_remove(
+        self, conn: AsyncConnection, removes: list[ReactionRemove]
+    ) -> None:
+        stmt = (
+            update(reactions)
+            .where(
+                (reactions.c.message_id == bindparam("b_message_id"))
+                & (reactions.c.user_id == bindparam("b_user_id"))
+                & (reactions.c.emoji == bindparam("b_emoji"))
+            )
+            .values(removed_at=bindparam("b_removed_at"))
+        )
+        await conn.execute(
+            stmt,
+            [
+                {
+                    "b_message_id": remove.message_id,
+                    "b_user_id": remove.user_id,
+                    "b_emoji": remove.emoji,
+                    "b_removed_at": remove.removed_at,
+                }
+                for remove in removes
+            ],
+        )
+
+    async def _handle_user(self, conn: AsyncConnection, records: list[UserSnapshot]) -> None:
+        records = _dedupe(records, lambda record: record.user_id)
+        values = [
+            {
+                "user_id": r.user_id,
+                "username": r.username,
+                "global_name": r.global_name,
+                "display_name": r.display_name,
+                "discriminator": r.discriminator,
+                "avatar_url": r.avatar_url,
+                "is_bot": r.is_bot,
+                "account_created_at": r.account_created_at,
+                "guild_joined_at": r.guild_joined_at,
+                "roles_json": r.roles_json,
+                "updated_at": r.updated_at,
+            }
+            for r in records
+        ]
+        stmt = self._upsert(
+            users,
+            values,
+            ["user_id"],
+            (
+                "username",
+                "global_name",
+                "display_name",
+                "discriminator",
+                "avatar_url",
+                "is_bot",
+                "account_created_at",
+                "guild_joined_at",
+                "roles_json",
+                "updated_at",
+            ),
+        )
+        await conn.execute(stmt)
+
+    async def _handle_channel(
+        self, conn: AsyncConnection, records: list[ChannelSnapshot]
+    ) -> None:
+        records = _dedupe(records, lambda record: record.channel_id)
+        values = [
+            {
+                "channel_id": r.channel_id,
+                "guild_id": r.guild_id,
+                "name": r.name,
+                "topic": r.topic,
+                "channel_type": r.channel_type,
+                "position": r.position,
+                "captured_at": r.captured_at,
+            }
+            for r in records
+        ]
+        stmt = self._upsert(
+            channels,
+            values,
+            ["channel_id"],
+            ("guild_id", "name", "topic", "channel_type", "position", "captured_at"),
+        )
+        await conn.execute(stmt)
+
+    async def _handle_guild(
+        self, conn: AsyncConnection, records: list[GuildSnapshot]
+    ) -> None:
+        records = _dedupe(records, lambda record: record.guild_id)
+        values = [
+            {
+                "guild_id": r.guild_id,
+                "name": r.name,
+                "member_count": r.member_count,
+                "captured_at": r.captured_at,
+            }
+            for r in records
+        ]
+        stmt = self._upsert(
+            guilds,
+            values,
+            ["guild_id"],
+            ("name", "member_count", "captured_at"),
+        )
+        await conn.execute(stmt)
+
+    async def _handle_attachment(
+        self, conn: AsyncConnection, records: list[AttachmentRecord]
+    ) -> None:
+        records = _dedupe(
+            records, lambda record: (record.message_id, record.attachment_id)
+        )
+        values = [
+            {
+                "message_id": r.message_id,
+                "attachment_id": r.attachment_id,
+                "filename": r.filename,
+                "content_type": r.content_type,
+                "size": r.size,
+                "url": r.url,
+                "storage_backend": r.storage_backend,
+                "status": r.status,
+                "captured_at": r.captured_at,
+            }
+            for r in records
+        ]
+        await conn.execute(self._insert_only(attachments, values))
+
+    async def _handle_attachment_status(
+        self, conn: AsyncConnection, records: list[AttachmentStatus]
+    ) -> None:
+        """Write a complete status snapshot to the matching attachment row.
+
+        `AttachmentStatus` is a snapshot of the status of one attachment:
+        every status column is written unconditionally, so a payload that
+        omits a field clears it. That is deliberate — an attachment row is
+        either stored or failed, never both — so a row that ends up
+        `skipped` must not keep the file columns of an earlier attempt.
+        """
+        stmt = (
+            update(attachments)
+            .where(
+                (attachments.c.message_id == bindparam("b_message_id"))
+                & (attachments.c.attachment_id == bindparam("b_attachment_id"))
+            )
+            .values(
+                status=bindparam("b_status"),
+                error=bindparam("b_error"),
+                sha256=bindparam("b_sha256"),
+                storage_key=bindparam("b_storage_key"),
+                storage_uri=bindparam("b_storage_uri"),
+                stored_at=bindparam("b_stored_at"),
+            )
+        )
+        await conn.execute(
+            stmt,
+            [
+                {
+                    "b_message_id": record.message_id,
+                    "b_attachment_id": record.attachment_id,
+                    "b_status": record.status,
+                    "b_error": record.error,
+                    "b_sha256": record.sha256,
+                    "b_storage_key": record.storage_key,
+                    "b_storage_uri": record.storage_uri,
+                    "b_stored_at": record.stored_at,
+                }
+                for record in records
+            ],
+        )
+
+    async def _handle_analysis_status(
+        self, conn: AsyncConnection, records: list[tuple[int, str]]
+    ) -> None:
+        stmt = (
+            update(messages)
+            .where(messages.c.message_id == bindparam("b_message_id"))
+            .values(analysis_status=bindparam("b_status"))
+        )
+        await conn.execute(
+            stmt,
+            [
+                {"b_message_id": message_id, "b_status": status}
+                for message_id, status in records
+            ],
+        )
+
+    async def _handle_analysis(
+        self, conn: AsyncConnection, records: list[MessageAnalysis]
+    ) -> None:
+        values = [
+            {
+                "message_id": r.message_id,
+                "translated_text": r.translated_text,
+                "sentiment": r.sentiment,
+                "sentiment_score": r.sentiment_score,
+                "issues_json": r.issues_json,
+                "model": r.model,
+                "prompt_version": r.prompt_version,
+                "latency_ms": r.latency_ms,
+                "error": r.error,
+                "analyzed_at": r.analyzed_at,
+            }
+            for r in records
+        ]
+        stmt = self._upsert(
+            message_analysis,
+            values,
+            ["message_id"],
+            (
+                "translated_text",
+                "sentiment",
+                "sentiment_score",
+                "issues_json",
+                "model",
+                "prompt_version",
+                "latency_ms",
+                "error",
+                "analyzed_at",
+            ),
+        )
+        await conn.execute(stmt)
+
+    @staticmethod
+    def _message_values(record: MessageRecord) -> dict[str, Any]:
+        return {
+            "message_id": record.message_id,
+            "guild_id": record.guild_id,
+            "channel_id": record.channel_id,
+            "author_id": record.author_id,
+            "content": record.content,
+            "message_type": record.message_type,
+            "created_at": record.created_at,
+            "captured_at": record.captured_at,
+            "edited_at": record.edited_at,
+            "edit_count": record.edit_count,
+            "deleted_at": record.deleted_at,
+            "reply_to_message_id": record.reply_to_message_id,
+            "mentions_count": record.mentions_count,
+            "char_count": record.char_count,
+            "word_count": record.word_count,
+            "attachment_count": record.attachment_count,
+            "attachments_json": record.attachments_json,
+            "embeds_json": record.embeds_json,
+            "is_bot": record.is_bot,
+            "analysis_status": record.analysis_status,
+        }

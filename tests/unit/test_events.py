@@ -1,0 +1,441 @@
+"""Tests for the Discord event handler.
+
+The handler is the only place that decides what a Discord event means for
+the database, so these tests pin the rules the rest of the service relies
+on: only whitelisted channels are captured, the bot's own messages are
+skipped, every event becomes the write operation the repository expects,
+and a malformed event can never take the bot down.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
+
+from foresight.domain.models import OpKind
+from foresight.events import EventHandler
+from foresight.metrics import REGISTRY
+
+
+class RecordingWriter:
+    """A writer that keeps the operations instead of writing them."""
+
+    def __init__(self):
+        self.ops = []
+
+    def submit(self, op):
+        self.ops.append(op)
+        return True
+
+    def kinds(self):
+        return [op.kind for op in self.ops]
+
+
+def _sample_value(name: str, labels: dict[str, str] | None = None) -> float:
+    """The current value of a sample of the metric registry.
+
+    The registry is process wide, so a test reads the value before and
+    after the event and compares the two: the counters of one test must
+    not disturb the counters of another one.
+    """
+    value = REGISTRY.get_sample_value(name, labels or {})
+    return 0.0 if value is None else value
+
+
+def _config(channel_ids=(20,)):
+    return SimpleNamespace(discord=SimpleNamespace(channel_ids=tuple(channel_ids)),
+                           media=SimpleNamespace(backend="local"))
+
+
+def _author(user_id=30):
+    return SimpleNamespace(
+        id=user_id,
+        name="alice",
+        global_name="Alice",
+        display_name="alice",
+        discriminator="0",
+        bot=False,
+        avatar=None,
+        created_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        joined_at=None,
+        roles=[],
+    )
+
+
+def _message(channel_id=20, message_id=100, content="hello"):
+    return SimpleNamespace(
+        id=message_id,
+        content=content,
+        type=0,
+        created_at=datetime(2026, 11, 11, tzinfo=timezone.utc),
+        edited_at=None,
+        author=_author(),
+        channel=SimpleNamespace(
+            id=channel_id,
+            name="general",
+            topic=None,
+            type="text",
+            position=1,
+            guild=SimpleNamespace(id=10, name="Foresight", member_count=1),
+        ),
+        guild=SimpleNamespace(id=10, name="Foresight", member_count=1),
+        reference=None,
+        mentions=[],
+        attachments=[],
+        embeds=[],
+    )
+
+
+def _raw_payload(channel_id=20, message_id=100, user_id=31, emoji="🔥"):
+    """A payload shaped like the raw events discord.py delivers."""
+    return SimpleNamespace(
+        channel_id=channel_id,
+        message_id=message_id,
+        user_id=user_id,
+        emoji=SimpleNamespace(name=emoji, id=None, is_custom_emoji=lambda: False),
+        data={"content": "edited", "edited_timestamp": "2026-11-11T01:00:00+00:00"},
+        cached_message=None,
+    )
+
+
+class ExplodingAuthorMessage:
+    """A message whose ``author`` raises as soon as the handler reads it."""
+
+    guild = None
+    channel = SimpleNamespace(id=20)
+
+    @property
+    def author(self):
+        raise AttributeError("malformed message: author is not readable")
+
+
+class ExplodingChannelMessage:
+    """A message whose ``channel`` raises as soon as the handler reads it."""
+
+    guild = None
+
+    @property
+    def channel(self):
+        raise AttributeError("malformed message: channel is not readable")
+
+
+def test_message_outside_whitelist_is_ignored():
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    handler.handle_message(_message(channel_id=999))
+    assert writer.ops == []
+
+
+def test_message_inside_whitelist_is_captured():
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    handler.handle_message(_message())
+
+    assert writer.kinds() == [OpKind.MESSAGE, OpKind.USER, OpKind.CHANNEL, OpKind.GUILD]
+
+    record = writer.ops[0].payload
+    assert record.content == "hello"
+    assert record.channel_id == 20
+    assert record.author_id == 30
+
+
+def test_own_messages_are_skipped():
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer, bot_user_id=30)
+    handler.handle_message(_message())
+    assert writer.ops == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [ExplodingAuthorMessage(), ExplodingChannelMessage()],
+    ids=["author", "channel"],
+)
+def test_malformed_message_does_not_escape_the_handler(message, caplog):
+    """A malformed message is logged, never raised and never written."""
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    caplog.set_level(logging.ERROR)
+
+    handler.handle_message(message)
+
+    assert writer.ops == []
+    assert "failed to handle message" in caplog.text
+
+
+def test_raw_edit_queues_edit_op():
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    payload = SimpleNamespace(
+        channel_id=20,
+        message_id=100,
+        data={"content": "edited", "edited_timestamp": "2026-11-11T01:00:00+00:00"},
+    )
+    handler.handle_raw_edit(payload)
+    op = writer.ops[0]
+    assert op.kind == OpKind.MESSAGE_EDIT
+    assert op.payload.content == "edited"
+
+
+def test_raw_edit_without_content_is_skipped():
+    """An embed-only update carries no body, so nothing is written."""
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    payload = SimpleNamespace(
+        channel_id=20,
+        message_id=100,
+        data={"edited_timestamp": "2026-11-11T01:00:00+00:00"},
+    )
+    handler.handle_raw_edit(payload)
+    assert writer.ops == []
+
+
+def test_raw_edit_outside_whitelist_is_ignored():
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    payload = SimpleNamespace(
+        channel_id=999,
+        message_id=100,
+        data={"content": "edited", "edited_timestamp": "2026-11-11T01:00:00+00:00"},
+    )
+    handler.handle_raw_edit(payload)
+    assert writer.ops == []
+
+
+def test_raw_delete_queues_delete_op():
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    payload = SimpleNamespace(channel_id=20, message_id=100, cached_message=None)
+    handler.handle_raw_delete(payload)
+    assert writer.ops[0].kind == OpKind.MESSAGE_DELETE
+
+
+@pytest.mark.parametrize(
+    "handler_name",
+    ["handle_raw_delete", "handle_raw_reaction_add", "handle_raw_reaction_remove"],
+)
+def test_raw_handlers_outside_whitelist_are_ignored(handler_name):
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    payload = _raw_payload(channel_id=999)
+    getattr(handler, handler_name)(payload)
+    assert writer.ops == []
+
+
+def test_reaction_add_and_remove():
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    payload = _raw_payload()
+
+    handler.handle_raw_reaction_add(payload)
+    handler.handle_raw_reaction_remove(payload)
+
+    assert writer.kinds() == [OpKind.REACTION, OpKind.REACTION_REMOVE]
+
+    added, removed = writer.ops
+    assert added.payload.emoji == "🔥"
+    assert added.payload.removed_at is None
+    assert removed.payload.emoji == "🔥"
+    assert removed.payload.removed_at is not None
+
+
+def test_a_captured_message_is_counted():
+    """The metric of the captured messages must follow the events."""
+    labels = {"channel_id": "20", "guild_id": "10"}
+    before = _sample_value("foresight_messages_captured_total", labels)
+
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    handler.handle_message(_message())
+
+    assert (
+        _sample_value("foresight_messages_captured_total", labels) == before + 1
+    )
+
+
+def test_a_message_outside_the_whitelist_is_not_counted():
+    labels = {"channel_id": "999", "guild_id": "10"}
+    before = _sample_value("foresight_messages_captured_total", labels)
+
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    handler.handle_message(_message(channel_id=999))
+
+    assert _sample_value("foresight_messages_captured_total", labels) == before
+
+
+def test_a_message_the_writer_refuses_is_not_counted():
+    """A message the queue refused is not captured, so it is not counted."""
+
+    class FullWriter:
+        """A writer whose queue is full: it refuses every operation."""
+
+        def submit(self, op):
+            return False
+
+    labels = {"channel_id": "20", "guild_id": "10"}
+    before = _sample_value("foresight_messages_captured_total", labels)
+
+    handler = EventHandler(_config(), FullWriter())
+    handler.handle_message(_message())
+
+    assert _sample_value("foresight_messages_captured_total", labels) == before
+
+
+def test_an_edited_message_is_counted():
+    labels = {"channel_id": "20"}
+    before = _sample_value("foresight_messages_edited_total", labels)
+
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    handler.handle_raw_edit(
+        SimpleNamespace(
+            channel_id=20,
+            message_id=100,
+            data={"content": "edited", "edited_timestamp": "2026-11-11T01:00:00+00:00"},
+        )
+    )
+
+    assert _sample_value("foresight_messages_edited_total", labels) == before + 1
+
+
+def test_a_deleted_message_is_counted():
+    labels = {"channel_id": "20"}
+    before = _sample_value("foresight_messages_deleted_total", labels)
+
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    handler.handle_raw_delete(
+        SimpleNamespace(channel_id=20, message_id=100, cached_message=None)
+    )
+
+    assert _sample_value("foresight_messages_deleted_total", labels) == before + 1
+
+
+def test_a_received_reaction_is_counted():
+    labels = {"channel_id": "20"}
+    before = _sample_value("foresight_reactions_total", labels)
+
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    handler.handle_raw_reaction_add(_raw_payload())
+
+    assert _sample_value("foresight_reactions_total", labels) == before + 1
+
+
+def test_a_removed_reaction_is_not_a_received_reaction():
+    """A reaction that is taken back is not a reaction that was received."""
+    labels = {"channel_id": "20"}
+    before = _sample_value("foresight_reactions_total", labels)
+
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    handler.handle_raw_reaction_remove(_raw_payload())
+
+    assert _sample_value("foresight_reactions_total", labels) == before
+
+
+def test_the_raw_edit_timestamp_is_written_in_the_canonical_form():
+    """The database compares the timestamps of the edits as strings.
+
+    Discord sends the moment of the last edit as an ISO-8601 string with
+    microseconds; the mapper writes the canonical form of the service. Two
+    spellings of the same moment would compare as two different edits, and
+    the replay of an edit would count as a new one.
+    """
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    payload = SimpleNamespace(
+        channel_id=20,
+        message_id=100,
+        data={
+            "content": "edited",
+            "edited_timestamp": "2026-11-11T01:00:00.000000+00:00",
+        },
+    )
+    handler.handle_raw_edit(payload)
+    assert writer.ops[0].payload.edited_at == "2026-11-11T01:00:00+00:00"
+
+
+def test_a_raw_edit_timestamp_in_another_offset_is_moved_to_utc():
+    """The timestamps are compared as strings, so they must be in one zone."""
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    payload = SimpleNamespace(
+        channel_id=20,
+        message_id=100,
+        data={
+            "content": "edited",
+            "edited_timestamp": "2026-11-11T03:00:00+02:00",
+        },
+    )
+    handler.handle_raw_edit(payload)
+    assert writer.ops[0].payload.edited_at == "2026-11-11T01:00:00+00:00"
+
+
+def test_a_raw_edit_without_a_timestamp_is_stamped_with_the_moment():
+    """A payload without a timestamp still carries one."""
+    writer = RecordingWriter()
+    handler = EventHandler(_config(), writer)
+    payload = SimpleNamespace(
+        channel_id=20,
+        message_id=100,
+        data={"content": "edited"},
+    )
+    handler.handle_raw_edit(payload)
+    assert writer.ops[0].payload.edited_at.endswith("+00:00")
+
+
+# -- the attachments ------------------------------------------------------
+
+
+def _message_with_an_attachment():
+    message = _message()
+    message.attachments = [
+        SimpleNamespace(
+            id=555,
+            filename="a.png",
+            content_type="image/png",
+            size=12,
+            url="https://cdn.example/a.png",
+        )
+    ]
+    return message
+
+
+def test_a_captured_attachment_is_downloaded():
+    """An attachment that reached the writer is downloaded."""
+    writer = RecordingWriter()
+    downloaded = []
+    handler = EventHandler(_config(), writer, media_sink=downloaded.append)
+    handler.handle_message(_message_with_an_attachment())
+    assert [record.attachment_id for record in downloaded] == [555]
+
+
+def test_a_dropped_attachment_is_not_downloaded():
+    """A row the writer refused must not leave a file behind.
+
+    The writer drops the operation when its queue is full. The download
+    would then store a file that no row refers to, and the status update
+    that follows would match no row at all.
+    """
+
+    class FullWriter:
+        """A writer whose queue is full: it refuses every operation."""
+
+        def __init__(self):
+            self.ops = []
+
+        def submit(self, op):
+            self.ops.append(op)
+            return False
+
+    writer = FullWriter()
+    downloaded = []
+    handler = EventHandler(_config(), writer, media_sink=downloaded.append)
+    handler.handle_message(_message_with_an_attachment())
+    assert writer.ops, "the attachment was offered to the writer"
+    assert downloaded == [], "a dropped attachment must not be downloaded"
