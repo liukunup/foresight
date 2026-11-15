@@ -1,0 +1,67 @@
+version: 2
+
+# The dependencies of the project are locked in uv.lock. Dependabot opens a
+# pull request for every new version, and the pull request carries the
+# updated lock file, so the version that is reviewed is the version that is
+# installed.
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+      prefix-development: "deps-dev"
+      include: "scope"
+    groups:
+      # The web stack moves together: a new FastAPI with the old Starlette
+      # is a broken combination.
+      web:
+        patterns:
+          - "fastapi"
+          - "starlette"
+          - "uvicorn"
+          - "pydantic"
+      # The Discord library has its own release rhythm.
+      discord:
+        patterns:
+          - "discord.py"
+      # The database drivers and the ORM have to stay in step with each other.
+      database:
+        patterns:
+          - "sqlalchemy"
+          - "asyncpg"
+          - "asyncmy"
+          - "aiosqlite"
+      development-dependencies:
+        dependency-type: "development"
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Shanghai"
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Shanghai"
+    commit-message:
+      prefix: "docker"

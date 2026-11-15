@@ -1,0 +1,177 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (for example v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify the image
+    runs-on: ubuntu-latest
+    # The image is built and started before it is published: a release that
+    # cannot serve the API is worse than no release.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # A manual run publishes the tag it was given, not the branch it
+          # was started from.
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: foresight:release
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The image creates its schema and answers its health check
+        run: |
+          cat > /tmp/foresight-release.toml <<'EOF'
+          [discord]
+          channel_ids = [1]
+
+          [database]
+          backend = "sqlite"
+          path = "data/foresight.db"
+
+          [api]
+          host = "0.0.0.0"
+          port = 8000
+          EOF
+
+          docker volume create foresight-release-data
+
+          # The API opens the database read-only, so the schema has to be
+          # created before the API can answer anything.
+          docker run --rm \
+            -v foresight-release-data:/app/data \
+            -v /tmp/foresight-release.toml:/app/config.toml:ro \
+            foresight:release init-db
+
+          docker run -d --name foresight-release \
+            -e DISCORD_TOKEN=release-token \
+            -e FORESIGHT_API_TOKEN=release-token \
+            -v foresight-release-data:/app/data \
+            -v /tmp/foresight-release.toml:/app/config.toml:ro \
+            -p 8000:8000 \
+            foresight:release serve
+
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/healthz > /dev/null; then
+              break
+            fi
+            sleep 2
+          done
+
+          # The liveness route is open, the API itself is not.
+          curl -sf http://127.0.0.1:8000/healthz > /dev/null
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/health)" = "401"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer release-token' http://127.0.0.1:8000/api/health)" = "200"
+          echo "the image serves the API"
+
+          docker rm -f foresight-release
+          docker volume rm foresight-release-data
+
+  publish:
+    name: Publish the image
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Work out the tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # The tag the release is made for, so that a manual run computes
+          # the same tags a push of the tag would.
+          ref: ${{ inputs.tag || github.ref }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Report what was published
+        run: |
+          {
+            echo "### The image"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo
+            echo "Pull it with:"
+            echo
+            echo '```bash'
+            echo "docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Create the release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --title "ForeSight $TAG" \
+            --generate-notes \
+            --notes "The image is published as \`ghcr.io/${{ github.repository }}:$TAG\`.
+
+          \`\`\`bash
+          docker pull ghcr.io/${{ github.repository }}:$TAG
+          \`\`\`"
