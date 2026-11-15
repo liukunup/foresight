@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 import pytest
 
 from foresight.api.query import (
@@ -113,6 +114,54 @@ async def test_the_timeout_of_the_runner_is_used_by_the_setting():
     await runner.run("SELECT 1", {}, 10, 0)
 
     assert "SET LOCAL statement_timeout = '2s'" in engine.statements
+
+
+async def test_the_deadline_does_not_depend_on_the_clock_of_the_event_loop(tmp_path):
+    """The deadline and the timeout are read from the same clock.
+
+    The clock of the event loop and the clock of the standard library are
+    not the same clock: `uvloop` measures the time on the uptime clock,
+    while `time.monotonic()` measures it on CLOCK_MONOTONIC. On macOS the
+    two differ by the sleep time of the machine — half an hour here — so
+    a deadline that is built on one clock and compared on the other is
+    always in the past, and every statement is stopped before it starts.
+
+    The clock of the runner is the one of the standard library, and the
+    test hands in a clock that lies about the time: the statement must
+    still run.
+    """
+    path = tmp_path / "clock.db"
+    _seed_big_table(str(path), rows=10)
+    behind = time.monotonic() - 10_000
+    runner = SqliteQueryRunner(str(path), timeout=5, clock=lambda: behind)
+
+    result = await runner.run("SELECT COUNT(*) FROM big", {}, 10, 0)
+
+    assert result.rows == [[10]]
+
+
+def test_the_runner_answers_under_a_uvloop_event_loop(tmp_path):
+    """The endpoint answers under the event loop that uvicorn uses.
+
+    `uvicorn` runs on `uvloop`, and the default loop of `pytest-asyncio`
+    cannot show the bug: the two clocks of the runner and of the loop
+    only drift apart on a machine that was not up for a long time.
+    """
+    uvloop = pytest.importorskip("uvloop")
+    path = tmp_path / "uvloop.db"
+    _seed_big_table(str(path), rows=10)
+
+    async def _run():
+        runner = SqliteQueryRunner(str(path), timeout=5)
+        return await runner.run("SELECT COUNT(*) FROM big", {}, 10, 0)
+
+    loop = uvloop.new_event_loop()
+    try:
+        result = loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+    assert result.rows == [[10]]
 
 
 # --- the errors of the database -------------------------------------------

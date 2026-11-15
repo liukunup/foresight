@@ -25,6 +25,11 @@ which has no such setting, is stopped from the inside by the progress
 handler of the driver and from the outside by an interrupt of the
 connection.
 
+The deadline and the time that is left are measured with one clock:
+`time.monotonic()`. The clock of the event loop is not that clock —
+`uvloop` measures the time on the uptime clock — and the two drift
+apart by the sleep time of the machine.
+
 SQLite runs on the standard library driver, because SQLAlchemy's async
 driver does not expose the authorizer hook. The connection is opened
 read-only (`file:...?mode=ro`), which makes a write fail in the driver
@@ -43,7 +48,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from foresight.config import DatabaseConfig, sqlite_readonly_uri
 
@@ -392,17 +397,21 @@ def _authorizer(
     return sqlite3.SQLITE_DENY
 
 
-def _deadline_handler(deadline: float) -> Any:
+def _deadline_handler(deadline: float, clock: Callable[[], float]) -> Any:
     """Return the progress handler that stops a statement in time.
 
     The handler is called by the driver while the statement runs: it
     raises as soon as the deadline has passed, and the driver aborts the
     statement. SQLite reports the abort as an interrupted statement, and
     the runner turns that into the answer of the deadline.
+
+    The handler reads the time from the same clock as the deadline: the
+    two must be measured with the same ruler, or the deadline is always
+    in the past.
     """
 
     def handler() -> int:
-        if time.monotonic() >= deadline:
+        if clock() >= deadline:
             raise sqlite3.OperationalError(DEADLINE_MESSAGE)
         return 0
 
@@ -429,9 +438,22 @@ async def _drain(future: Any) -> None:
 class SqliteQueryRunner:
     """Runs queries on a read-only SQLite connection."""
 
-    def __init__(self, path: str, *, timeout: float | None = None) -> None:
+    def __init__(
+        self,
+        path: str,
+        *,
+        timeout: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._path = path
         self._timeout = QUERY_TIMEOUT_SECONDS if timeout is None else timeout
+        # The clock of the deadline. It is the clock of the standard
+        # library and not the clock of the event loop: `uvloop` measures
+        # the time on the uptime clock, and the two clocks drift apart by
+        # the sleep time of the machine — on macOS by weeks. A deadline
+        # that is built on one clock and compared on the other is always
+        # in the past, and every statement is stopped before it starts.
+        self._clock = clock
 
     def _connect(self) -> sqlite3.Connection:
         # The connection is opened in the thread of the event loop and
@@ -452,7 +474,7 @@ class SqliteQueryRunner:
         statement = apply_window(
             validate_read_only(sql), clamp_limit(limit), clamp_offset(offset)
         )
-        started = time.perf_counter()
+        started = self._clock()
         deadline = started + self._timeout
         try:
             conn = self._connect()
@@ -470,7 +492,7 @@ class SqliteQueryRunner:
                 # The connection is already gone: there is nothing left
                 # to close, and the statement has been stopped anyway.
                 pass
-        result.elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+        result.elapsed_ms = round((self._clock() - started) * 1000, 3)
         return result
 
     async def _execute(
@@ -488,13 +510,20 @@ class SqliteQueryRunner:
         is enforced from the inside — by the progress handler of the
         driver — and from the outside, by the interrupt of the
         connection, which is what releases the thread.
+
+        The time that is left is read from the clock of the runner and
+        not from the clock of the event loop: the two are not the same
+        ruler, and a deadline that is compared with the wrong one is
+        always in the past.
         """
-        conn.set_progress_handler(_deadline_handler(deadline), PROGRESS_INTERVAL)
+        conn.set_progress_handler(
+            _deadline_handler(deadline, self._clock), PROGRESS_INTERVAL
+        )
         loop = asyncio.get_running_loop()
         future = loop.run_in_executor(None, self._run_sync, conn, statement, params)
         try:
             return await asyncio.wait_for(
-                asyncio.shield(future), timeout=max(0.0, deadline - loop.time())
+                asyncio.shield(future), timeout=max(0.0, deadline - self._clock())
             )
         except asyncio.TimeoutError:
             conn.interrupt()
