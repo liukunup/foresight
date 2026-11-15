@@ -120,8 +120,9 @@ in the connection file — so the command works from any directory you
 work in:
 
 ```bash
-helper="$(sed -n 's/^helper_path = "\(.*\)"$/\1/p' ~/.config/foresight/connection.toml)"
-python3 "$helper" \
+connection="${FORESIGHT_CONNECTION_FILE:-$HOME/.config/foresight/connection.toml}"
+helper="$(sed -n 's/^helper_path = "\(.*\)"$/\1/p' "$connection")"
+python3 "$helper" --connection "$connection" \
     --sql "SELECT channel_id, COUNT(*) c FROM messages GROUP BY 1"
 ```
 

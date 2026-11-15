@@ -135,3 +135,5 @@ def test_the_skill_calls_the_helper_with_a_path_of_its_own():
     content = skill.read_text(encoding="utf-8")
     assert "python3 scripts/query.py" not in content
     assert "helper_path" in content
+    # The helper and the path of the helper must read the same file.
+    assert "--connection" in content
