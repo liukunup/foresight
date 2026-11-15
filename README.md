@@ -108,6 +108,15 @@ compose 另外用一个 `FORESIGHT_PORT` 决定宿主机上映射出来的端口
 
 除 `query` 和 `stats` 外，每条命令都接受 `--config` 指定别的配置文件 —— 这两条命令直接读数据库文件，用 `--db` 指定路径。
 
+`serve` 用的是**只读连接**，它不会建表。单独跑 API 之前必须先建一次表：
+
+```bash
+uv run foresight init-db     # 或 docker run ... foresight init-db
+uv run foresight serve
+```
+
+`run` 和 `both` 自己会建表，不用手动执行。
+
 `foresight stats` 的 `--since` / `--until` 与 API 的时间边界同义：纯日期表示整天，写法不对会直接报错退出（退出码 2）。`foresight analyze --since` 和 `foresight backfill --since` 用的是同一套规则，写法不对同样报错退出，不会静悄悄地什么都没做。
 
 ## 安装 AI Skill

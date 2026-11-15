@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+# A new push to the same branch makes the running checks obsolete.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install the dependencies
+        run: uv sync --frozen
+
+      - name: Run the test suite
+        # The suite is run with the warnings turned into errors: a stray
+        # ResourceWarning from an unclosed connection must fail the build.
+        run: uv run pytest -q -W error
+
+  dialects:
+    name: Write paths on PostgreSQL and MySQL
+    runs-on: ubuntu-latest
+    # The suite of the project runs on SQLite only, so the dialect specific
+    # statements are never executed by the test job. This job runs the write
+    # paths against real servers, which is where the three backends differ.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: foresight
+          POSTGRES_PASSWORD: foresight
+          POSTGRES_DB: foresight
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U foresight"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      mysql:
+        image: mysql:8.0.46
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: foresight
+          MYSQL_USER: foresight
+          MYSQL_PASSWORD: foresight
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install the dependencies
+        run: uv sync --frozen
+
+      - name: Verify the write paths against PostgreSQL and MySQL
+        run: |
+          uv run python scripts/verify_dialects.py \
+            postgresql://foresight:foresight@127.0.0.1:5432/foresight \
+            mysql://foresight:foresight@127.0.0.1:3306/foresight
+
+  docker:
+    name: Build the image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: foresight:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The image creates its schema and answers its health check
+        run: |
+          cat > /tmp/foresight-ci.toml <<'EOF'
+          [discord]
+          channel_ids = [1]
+
+          [database]
+          backend = "sqlite"
+          path = "data/foresight.db"
+
+          [api]
+          host = "0.0.0.0"
+          port = 8000
+          EOF
+
+          docker volume create foresight-ci-data
+
+          # The API opens the database read-only, so the schema has to be
+          # created before the API can answer anything.
+          docker run --rm \
+            -v foresight-ci-data:/app/data \
+            -v /tmp/foresight-ci.toml:/app/config.toml:ro \
+            foresight:ci init-db
+
+          docker run -d --name foresight-ci \
+            -e DISCORD_TOKEN=ci-token \
+            -e FORESIGHT_API_TOKEN=ci-token \
+            -v foresight-ci-data:/app/data \
+            -v /tmp/foresight-ci.toml:/app/config.toml:ro \
+            -p 8000:8000 \
+            foresight:ci serve
+
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/healthz > /dev/null; then
+              break
+            fi
+            sleep 2
+          done
+
+          # The liveness route is open, the API itself is not.
+          curl -sf http://127.0.0.1:8000/healthz > /dev/null
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/health)" = "401"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ci-token' http://127.0.0.1:8000/api/health)" = "200"
+          echo "the container serves the API"
+
+          docker rm -f foresight-ci
+          docker volume rm foresight-ci-data
