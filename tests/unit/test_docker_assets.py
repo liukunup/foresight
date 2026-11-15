@@ -61,3 +61,15 @@ def test_the_runtime_image_does_not_carry_the_sources():
     _, _, runtime = content.partition("AS runtime")
     assert runtime, "the image has no runtime stage"
     assert "src" not in runtime
+
+
+def test_compose_gives_the_data_directory_to_the_service():
+    """The service writes as uid 10001: the directory must belong to it.
+
+    The directory of the host belongs to the user of the host, so the
+    compose file gives it to the user of the container before the
+    service starts. Without that the collector cannot write.
+    """
+    content = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "chown 10001:10001 /app/data" in content
+    assert "service_completed_successfully" in content

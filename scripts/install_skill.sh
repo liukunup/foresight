@@ -2,6 +2,10 @@
 # Install the foresight-analytics skill into an agent's skills directory.
 set -euo pipefail
 
+# The connection file belongs to the operator alone: it is written with
+# the mode of a private file, and not with the mode of the umask.
+umask 077
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SKILL_NAME="foresight-analytics"
@@ -56,6 +60,19 @@ if [[ ! -d "${SOURCE_DIR}" ]]; then
     exit 1
 fi
 
+# The skill is removed before it is copied into place, so the target
+# must be a directory of its own: an empty target or the root would
+# remove a directory that does not belong to the skill.
+if [[ -z "${TARGET_DIR}" || "${TARGET_DIR}" == "/" ]]; then
+    echo "the target directory must not be empty and must not be the root" >&2
+    exit 2
+fi
+
+if [[ -z "${CONNECTION_FILE}" || "${CONNECTION_FILE}" == "/" ]]; then
+    echo "the connection file must not be empty and must not be the root" >&2
+    exit 2
+fi
+
 mkdir -p "${TARGET_DIR}"
 DEST="${TARGET_DIR}/${SKILL_NAME}"
 
@@ -72,6 +89,7 @@ cat > "${CONNECTION_FILE}" <<EOF
 # Written by install_skill.sh
 api_base_url = "${API_BASE_URL}"
 token_env = "${TOKEN_ENV}"
+helper_path = "${DEST}/scripts/query.py"
 EOF
 
 cat <<EOF

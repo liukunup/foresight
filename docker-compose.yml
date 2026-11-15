@@ -1,9 +1,28 @@
 services:
+  # The data directory belongs to the user of the container and not to
+  # the user of the host: the service runs as uid 10001, and the
+  # directory is given to it before the service starts. Without this the
+  # collector cannot create its database on Linux.
+  init-data:
+    build: .
+    image: foresight:latest
+    user: root
+    entrypoint:
+      - sh
+      - -c
+      - mkdir -p /app/data && chown 10001:10001 /app/data
+    volumes:
+      - ./data:/app/data
+    restart: "no"
+
   foresight:
     build: .
     image: foresight:latest
     container_name: foresight
     command: ["both"]
+    depends_on:
+      init-data:
+        condition: service_completed_successfully
     ports:
       # The API is published on the host: the mapping is "8000:8000" by
       # default and FORESIGHT_PORT in the environment moves the host

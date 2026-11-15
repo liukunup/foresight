@@ -115,10 +115,13 @@ curl -s -X POST -H "Authorization: Bearer $FORESIGHT_API_TOKEN" \
 ```
 
 The helper that ships with this skill does the same thing and prints a
-table. It sits next to this file, in `scripts/query.py`:
+table. It sits next to this file, in `scripts/query.py`, and its path is
+in the connection file — so the command works from any directory you
+work in:
 
 ```bash
-python3 scripts/query.py \
+helper="$(sed -n 's/^helper_path = "\(.*\)"$/\1/p' ~/.config/foresight/connection.toml)"
+python3 "$helper" \
     --sql "SELECT channel_id, COUNT(*) c FROM messages GROUP BY 1"
 ```
 
