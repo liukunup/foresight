@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import discord
 import pytest
 from typer.testing import CliRunner
 
@@ -402,6 +403,24 @@ def test_run_reports_an_unusable_database(tmp_path: Path, monkeypatch):
     assert result.exit_code != 0
     assert "Traceback" not in result.output
     assert "error:" in result.stderr
+
+
+def test_run_reports_a_failed_discord_login(collector: _Collector, monkeypatch):
+    """A wrong token is a common mistake, and not a crash.
+
+    The operator gets one line and the exit code of the other errors.
+    """
+    async def failing_start(token: str) -> None:
+        raise discord.LoginFailure("Improper token has been passed.")
+
+    monkeypatch.setattr(collector.bot, "start", failing_start)
+
+    result = collector.run()
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "error: the Discord login failed" in result.stderr
+    assert "Improper token has been passed." in result.stderr
 
 
 def test_main_reports_configuration_error(tmp_path: Path, monkeypatch, capsys):
@@ -815,6 +834,25 @@ def test_backfill_reports_an_unusable_database(tmp_path: Path, monkeypatch):
     assert "error:" in result.output
 
 
+def test_backfill_reports_a_failed_discord_login(
+    backfill: _BackfillCommand, monkeypatch: pytest.MonkeyPatch
+):
+    """A wrong token is a common mistake, and not a crash."""
+    async def failing_run(
+        self: Any, channel_ids: Any, window: Any, limit: int = 20000
+    ) -> dict[str, int]:
+        raise discord.LoginFailure("Improper token has been passed.")
+
+    monkeypatch.setattr(_FakeBackfillRunner, "run", failing_run)
+
+    result = backfill.run()
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "error: the Discord login failed" in result.stderr
+    assert "Improper token has been passed." in result.stderr
+
+
 class _FakeAnalysingWorker:
     """An analysis worker that takes the messages it is given."""
 
@@ -941,3 +979,138 @@ def test_analyze_reports_an_unusable_database(tmp_path: Path):
     assert result.exit_code != 0
     assert "Traceback" not in result.output
     assert "error:" in result.output
+
+
+class _FailingBot:
+    """A bot that never talks to Discord."""
+
+    def __init__(self, events: list[str], state: dict[str, Any]) -> None:
+        self._events = events
+        self._state = state
+        self.starts = 0
+
+    async def start(self, token: str) -> None:
+        self.starts += 1
+        # Whether the API was still serving when the collector died.
+        self._state["api_was_up"] = bool(self._state.get("server_running"))
+        raise self._state["bot_error"]
+
+    async def close(self) -> None:
+        self._events.append("bot.close")
+
+
+class _FakeServer:
+    """A server that never binds a port."""
+
+    def __init__(self, config: Any, state: dict[str, Any]) -> None:
+        self.config = config
+        self._state = state
+
+    async def serve(self) -> None:
+        self._state["server_running"] = True
+        try:
+            await asyncio.sleep(self._state["server_lifetime"])
+        finally:
+            self._state["server_running"] = False
+
+
+@dataclass
+class _BothCommand:
+    """The fakes behind one ``foresight both``."""
+
+    run: Callable[[], Any]
+    bots: list[_FailingBot]
+    servers: list[_FakeServer]
+    events: list[str]
+    state: dict[str, Any]
+
+
+@pytest.fixture
+def both(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _BothCommand:
+    """A ``foresight both`` whose Discord side and whose API are faked."""
+    events: list[str] = []
+    bots: list[_FailingBot] = []
+    servers: list[_FakeServer] = []
+    state: dict[str, Any] = {
+        "server_running": False,
+        "server_lifetime": 0.5,
+        "bot_error": RuntimeError("the gateway is gone"),
+        "api_was_up": False,
+    }
+    config_path = _write_config(tmp_path)
+
+    async def fake_recover(writer: Any, path: Path | None) -> int:
+        events.append("replay")
+        return 0
+
+    def fake_build_bot(settings: Any, handler: Any) -> _FailingBot:
+        bot = _FailingBot(events, state)
+        bots.append(bot)
+        return bot
+
+    def make_writer(repo: Any, **kwargs: Any) -> _FakeWriter:
+        return _FakeWriter(repo, events, **kwargs)
+
+    def make_media_worker(repo: Any, store: Any, **kwargs: Any) -> _FakeMediaWorker:
+        return _FakeMediaWorker(repo, store, events, **kwargs)
+
+    def make_analysis_worker(repo: Any, llm: Any, **kwargs: Any) -> _FakeAnalysisWorker:
+        return _FakeAnalysisWorker(repo, llm, events, **kwargs)
+
+    real_create_engine = storage_db.create_engine
+
+    def fake_create_engine(config: Any, *, readonly: bool = False) -> Any:
+        return _EngineProxy(real_create_engine(config, readonly=readonly), events)
+
+    def fake_server(config: Any) -> _FakeServer:
+        server = _FakeServer(config, state)
+        servers.append(server)
+        return server
+
+    monkeypatch.setattr("foresight.bot.build_bot", fake_build_bot)
+    monkeypatch.setattr("foresight.bot.require_token", lambda: "token")
+    monkeypatch.setattr("foresight.writer.Writer", make_writer)
+    monkeypatch.setattr("foresight.writer.recover_failed_batches", fake_recover)
+    monkeypatch.setattr("foresight.storage.db.create_engine", fake_create_engine)
+    monkeypatch.setattr("foresight.media_worker.MediaWorker", make_media_worker)
+    monkeypatch.setattr("foresight.analysis.worker.AnalysisWorker", make_analysis_worker)
+    monkeypatch.setattr(
+        "foresight.storage.media.build_media_store", lambda config: "media-store"
+    )
+    monkeypatch.setattr("uvicorn.Server", fake_server)
+    monkeypatch.setattr("foresight.cli.COLLECTOR_RETRY_SECONDS", 0.01)
+
+    def run() -> Any:
+        return runner.invoke(app, ["both", "--config", str(config_path)])
+
+    return _BothCommand(run, bots, servers, events, state)
+
+
+def test_both_reports_a_failed_discord_login(both: _BothCommand):
+    """A wrong token is a common mistake, and not a crash."""
+    both.state["bot_error"] = discord.LoginFailure("Improper token has been passed.")
+
+    result = both.run()
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "error: the Discord login failed" in result.stderr
+    assert "Improper token has been passed." in result.stderr
+
+
+def test_both_keeps_the_api_running_when_the_collector_dies(both: _BothCommand):
+    """A Discord outage must not take the API down.
+
+    The API keeps serving while the collector is away, and the collector
+    is tried again — otherwise the archive would stay empty until the
+    container is restarted.
+    """
+    result = both.run()
+
+    # The API was still serving when the collector died.
+    assert both.state["api_was_up"] is True
+    # The collector is tried again.
+    assert sum(bot.starts for bot in both.bots) > 1
+    # The command ends with the reason of the API, not with the failure
+    # of the collector.
+    assert "the API server stopped" in result.stderr

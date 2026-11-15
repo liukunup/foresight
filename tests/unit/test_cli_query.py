@@ -367,7 +367,11 @@ port = 8000
     monkeypatch.setattr(uvicorn, "Server", _FakeServer)
 
     result = runner.invoke(app, ["both", "--config", str(config_path)])
-    assert result.exit_code == 0, result.output
+    # The fake API stops right away, and a dead API is reported: the
+    # collector stays alive on its own, so the death of the API is the
+    # end of the command.
+    assert result.exit_code == 1, result.output
+    assert "the API server stopped" in result.output
     # The collector writes, the API reads: two engines, one of them
     # read-only.
     assert [readonly for readonly, _ in engines] == [False, True]

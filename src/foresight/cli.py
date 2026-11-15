@@ -6,8 +6,9 @@ import asyncio
 import logging
 import os
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NamedTuple, NoReturn, Optional
+from typing import Any, NoReturn, Optional
 
 import typer
 
@@ -22,6 +23,12 @@ app = typer.Typer(add_completion=False, help="ForeSight — Discord message dump
 # collector starts. A message that was never analysed must not wait for
 # the next restart of the operator (spec §10.3).
 PENDING_REQUEUE_LIMIT = 1000
+
+# How long the collector waits before it tries to reach Discord again, in
+# seconds. A Discord outage must not take the API down: the collector is
+# tried again after this pause, and the API keeps serving in the
+# meantime.
+COLLECTOR_RETRY_SECONDS = 30.0
 
 
 def _load(config_path: Optional[str]) -> Config:
@@ -93,12 +100,17 @@ def init_db(
     typer.echo(f"schema ready at {settings.database.path}")
 
 
-class _CollectorResources(NamedTuple):
+@dataclass
+class _CollectorResources:
     """Everything a running collector owns.
 
     The command that built them releases them again, in the order the
     service needs: the bot first, so that no event arrives any more, then
     the workers, then the writer and finally the engine.
+
+    The bot is replaced when the collector is started again after a
+    Discord outage, so that the command releases the bot that is really
+    running.
     """
 
     engine: Any
@@ -106,6 +118,7 @@ class _CollectorResources(NamedTuple):
     bot: Any
     media_worker: Any
     analysis_worker: Any
+    handler: Any = None
 
 
 async def _requeue_pending_analysis(repo: Any, worker: Any) -> int:
@@ -235,7 +248,7 @@ async def _build_collector(settings: Config) -> _CollectorResources:
         )
         bot = build_bot(settings, handler)
         return _CollectorResources(
-            engine, writer, bot, media_worker, analysis_worker
+            engine, writer, bot, media_worker, analysis_worker, handler
         )
     except BaseException:
         # The resources that were already built are released again, so
@@ -282,6 +295,8 @@ def run(
     config: Optional[str] = typer.Option(None, "--config", help="Path to config.toml"),
 ) -> None:
     """Start the Discord collector."""
+    import discord
+
     from foresight.bot import require_token
 
     settings = _load(config)
@@ -305,7 +320,13 @@ def run(
                 ", ".join(str(cid) for cid in settings.discord.channel_ids),
                 settings.database.path,
             )
-            await resources.bot.start(token)
+            try:
+                await resources.bot.start(token)
+            except discord.LoginFailure as exc:
+                # A wrong, an expired or a revoked token is one of the
+                # most common mistakes of an operator: the reason is
+                # reported, and not a traceback.
+                _fail(f"the Discord login failed: {exc}")
         finally:
             logger.info("collector stopping")
             # Every step runs, even when the one before it failed: the bot
@@ -405,6 +426,44 @@ def _report_task_failure(task: Any) -> None:
         raise exc
 
 
+async def _run_collector(
+    settings: Config, resources: _CollectorResources, token: str
+) -> None:
+    """Keep the collector running while the API serves.
+
+    A Discord outage must not take the API down: the collector is built
+    again and started after a pause, so that the archive keeps filling up
+    once Discord answers again. The API keeps serving in the meantime.
+
+    A login failure is not an outage: the token is wrong or revoked, and
+    no retry can fix that. The operator is told and the process leaves.
+    """
+    import discord
+
+    from foresight.bot import build_bot
+
+    while True:
+        bot = resources.bot
+        try:
+            await bot.start(token)
+        except discord.LoginFailure as exc:
+            _fail(f"the Discord login failed: {exc}")
+        except Exception:
+            logger.exception("the collector stopped with an error")
+        else:
+            logger.error("the collector stopped on its own")
+        finally:
+            with suppress(Exception):
+                await bot.close()
+        # Discord is asked again after a pause, so that an outage does
+        # not turn into a flood of logins.
+        await asyncio.sleep(COLLECTOR_RETRY_SECONDS)
+        # A bot that was connected cannot be connected a second time, so
+        # every attempt gets a bot of its own. The resources hold the
+        # bot that is really running, so that the command releases it.
+        resources.bot = build_bot(settings, resources.handler)
+
+
 @app.command()
 def both(
     config: Optional[str] = typer.Option(None, "--config", help="Path to config.toml"),
@@ -457,8 +516,12 @@ def both(
             )
             # The collector and the API are watched together: when the API
             # dies, the collector stops as well instead of running on
-            # without it.
-            bot_task = asyncio.create_task(resources.bot.start(token))
+            # without it. The other way round it is not the case: the
+            # collector comes back after a pause, and the API keeps
+            # serving while Discord is away.
+            bot_task = asyncio.create_task(
+                _run_collector(settings, resources, token)
+            )
             server_task = asyncio.create_task(_run_server(server))
             done, _pending = await asyncio.wait(
                 {bot_task, server_task}, return_when=asyncio.FIRST_COMPLETED
@@ -473,7 +536,7 @@ def both(
                     await bot_task
                 _fail(reason)
             if bot_task in done:
-                # The collector stopped on its own: its reason belongs to
+                # The collector stopped for good: its reason belongs to
                 # the caller.
                 _report_task_failure(bot_task)
         finally:
@@ -507,6 +570,8 @@ def backfill(
     config: Optional[str] = typer.Option(None, "--config", help="Path to config.toml"),
 ) -> None:
     """Import historical messages from Discord."""
+    import discord
+
     from foresight.backfill import BackfillRunner, parse_window, require_token
     from foresight.storage.db import create_engine, init_db as create_tables
     from foresight.storage.repository import Repository
@@ -566,7 +631,13 @@ def backfill(
             await writer.start()
             try:
                 runner = BackfillRunner(settings, writer)
-                return await runner.run(channel_ids, window, limit=limit)
+                try:
+                    return await runner.run(channel_ids, window, limit=limit)
+                except discord.LoginFailure as exc:
+                    # A wrong, an expired or a revoked token is one of
+                    # the most common mistakes of an operator: the
+                    # reason is reported, and not a traceback.
+                    _fail(f"the Discord login failed: {exc}")
             finally:
                 await writer.stop()
         finally:
