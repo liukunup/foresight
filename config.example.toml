@@ -30,6 +30,8 @@ use_path_style = true
 host = "127.0.0.1"
 port = 8000
 metrics_token = ""
+# How often the database gauges are refreshed when /metrics is scraped.
+metrics_refresh_seconds = 30
 
 [ai]
 enabled = false

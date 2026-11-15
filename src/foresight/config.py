@@ -120,6 +120,7 @@ class ApiConfig:
     host: str = "127.0.0.1"
     port: int = 8000
     metrics_token: str = ""
+    metrics_refresh_seconds: int = 30
 
 
 @dataclass(frozen=True)
@@ -295,6 +296,9 @@ def _build(raw: dict[str, Any], config_path: Path) -> Config:
         host=api_host,
         port=api_port,
         metrics_token=_as_str(api_raw.get("metrics_token", ""), "api.metrics_token"),
+        metrics_refresh_seconds=_as_int(
+            api_raw.get("metrics_refresh_seconds", 30), "api.metrics_refresh_seconds"
+        ),
     )
 
     ai_raw = _section(raw, "ai")
