@@ -21,16 +21,16 @@ jobs:
     # The image is built and started before it is published: a release that
     # cannot serve the API is worse than no release.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # A manual run publishes the tag it was given, not the branch it
           # was started from.
           ref: ${{ inputs.tag || github.ref }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Build the image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
@@ -95,42 +95,66 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
+          # The tags of the repository are needed to tell whether this
+          # release is the newest one.
+          fetch-depth: 0
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to the registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Work out the tags
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          # The tag the release is made for, so that a manual run computes
-          # the same tags a push of the tag would.
-          ref: ${{ inputs.tag || github.ref }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+        id: tags
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+          major="${version%%.*}"
+          rest="${version#*.}"
+          minor="${rest%%.*}"
+
+          tags="${IMAGE}:${TAG}"
+          tags="${tags},${IMAGE}:${version}"
+          tags="${tags},${IMAGE}:${major}.${minor}"
+
+          # `latest` belongs to the newest tag of the repository.
+          newest="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1)"
+          if [ "${TAG}" = "${newest}" ]; then
+            tags="${tags},${IMAGE}:latest"
+          fi
+
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "published: ${tags}"
 
       - name: Build and push the image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=ForeSight
+            org.opencontainers.image.description=Discord 频道消息转储服务
+            org.opencontainers.image.version=${{ steps.tags.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -140,13 +164,13 @@ jobs:
             echo "### The image"
             echo
             echo '```'
-            echo "${{ steps.meta.outputs.tags }}"
+            echo "${{ steps.tags.outputs.tags }}"
             echo '```'
             echo
             echo "Pull it with:"
             echo
             echo '```bash'
-            echo "docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}"
+            echo "docker pull ghcr.io/${{ github.repository }}:${{ inputs.tag || github.ref_name }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -157,7 +181,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ inputs.tag || github.ref }}
@@ -167,11 +191,21 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          gh release create "$TAG" \
-            --title "ForeSight $TAG" \
-            --generate-notes \
-            --notes "The image is published as \`ghcr.io/${{ github.repository }}:$TAG\`.
+          notes="The image is published as \`ghcr.io/${{ github.repository }}:$TAG\`.
 
           \`\`\`bash
           docker pull ghcr.io/${{ github.repository }}:$TAG
           \`\`\`"
+
+          # The workflow may be run again for a tag that already has a
+          # release: the release is then updated instead of failing.
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --title "ForeSight $TAG" --notes "$notes"
+            echo "the release of $TAG was updated"
+          else
+            gh release create "$TAG" \
+              --title "ForeSight $TAG" \
+              --generate-notes \
+              --notes "$notes"
+            echo "the release of $TAG was created"
+          fi
