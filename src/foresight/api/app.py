@@ -34,6 +34,12 @@ from foresight.storage.db import create_engine
 
 logger = logging.getLogger(__name__)
 
+# How long the counts of the dump are kept before they are read again.
+# The gauges must not be older than this: a consumer that reads them
+# has to see the dump as it is now, not as it was when the last scrape
+# happened.
+DEFAULT_METRICS_REFRESH_SECONDS = 30.0
+
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -101,21 +107,84 @@ def _observe_request(request: Request, status: str, elapsed: float) -> None:
     api_request_duration_seconds.labels(method=request.method, path=path).observe(elapsed)
 
 
-async def _refresh_database_gauges(engine: AsyncEngine) -> None:
-    """Publish the counts of the dump as the gauges of the database.
+def _refresh_interval(config: Config) -> float:
+    """The interval between two reads of the counts of the dump.
 
-    A database that cannot be read must not take the metrics down with
-    it: the gauges keep the value of the last scrape and the reason goes
-    into the log, so that a scrape still answers with the metrics of the
-    rest of the service.
+    The interval comes from the configuration of the API, so that a
+    deployment can trade the freshness of the gauges against the load
+    the counts put on the database. A configuration that names no
+    interval gets the default.
     """
+    named = getattr(
+        config.api, "metrics_refresh_seconds", DEFAULT_METRICS_REFRESH_SECONDS
+    )
     try:
-        await health.publish_counts(engine)
-    except SQLAlchemyError as exc:
-        logger.warning("could not refresh the database gauges: %s", exc)
+        interval = float(named)
+    except (TypeError, ValueError):
+        return DEFAULT_METRICS_REFRESH_SECONDS
+    return max(interval, 0.0)
 
 
-def create_app(config: Config, engine: AsyncEngine | None = None) -> FastAPI:
+class _DatabaseGauges:
+    """The gauges that hold the counts of the dump.
+
+    The counts are read at most once per interval, and the gauges keep
+    the value of the last read in between: a count is a full table scan
+    on PostgreSQL and on MySQL, and Prometheus scrapes the endpoint
+    every few seconds.
+
+    The clock is injected, so that a test can drive the interval
+    without waiting for it.
+    """
+
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        interval_seconds: float,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._engine = engine
+        self._interval = interval_seconds
+        self._clock = clock
+        self._read_at: float | None = None
+
+    async def refresh(self) -> bool:
+        """Read the counts of the dump and publish them as the gauges.
+
+        The counts are read again once the interval has passed. A
+        database that cannot be read must not take the metrics down with
+        it: the gauges keep the value of the last read, the reason goes
+        into the log, and the next scrape tries again.
+        """
+        now = self._clock()
+        if self._read_at is not None and now - self._read_at < self._interval:
+            return False
+        # The slot is taken before the counts are read, so that two
+        # scrapes that arrive together do not read them twice.
+        self._read_at = now
+        try:
+            await health.publish_counts(self._engine)
+        except SQLAlchemyError as exc:
+            logger.warning("could not refresh the database gauges: %s", exc)
+            # The slot is given back: a database that answers again must
+            # not wait for the whole interval.
+            self._read_at = None
+            return False
+        except BaseException:
+            # The same for an error nobody expected: the gauges must not
+            # stay stale because of it.
+            self._read_at = None
+            raise
+        return True
+
+
+def create_app(
+    config: Config,
+    engine: AsyncEngine | None = None,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+) -> FastAPI:
     """Build the read-only API application.
 
     The API never writes: when it opens the database itself it uses the
@@ -125,6 +194,9 @@ def create_app(config: Config, engine: AsyncEngine | None = None) -> FastAPI:
 
     The schema is not created here either: the API is a reader, the tables
     belong to `foresight init-db` and to the collector.
+
+    The clock is injected, so that a test can drive the interval of the
+    gauges of the database without waiting for it.
     """
     app = FastAPI(title="ForeSight API", version="0.1.0", lifespan=_lifespan)
     if engine is None:
@@ -135,6 +207,11 @@ def create_app(config: Config, engine: AsyncEngine | None = None) -> FastAPI:
     app.state.engine = engine
     app.state.owns_engine = owns_engine
     app.state.config = config
+    # The gauges of the database are refreshed by the metrics endpoint,
+    # and not on every scrape: a count is a full table scan on
+    # PostgreSQL and on MySQL.
+    gauges = _DatabaseGauges(engine, _refresh_interval(config), clock=clock)
+    app.state.database_gauges = gauges
     # The free-form SQL endpoint runs on a runner of its own: the
     # SQLite runner opens a read-only connection with an authorizer
     # that denies every write, which the async engine cannot do.
@@ -177,11 +254,13 @@ def create_app(config: Config, engine: AsyncEngine | None = None) -> FastAPI:
         metrics token guards it separately, for the deployments that do
         not want the endpoint open.
 
-        The gauges of the database are refreshed here, on every scrape:
-        the health endpoint sits behind the bearer token, so a probe that
-        has no token would never reach it and the gauges would stay at
-        zero while the dump holds rows. One count query per scrape is
-        cheap.
+        The gauges of the database are refreshed here: the health
+        endpoint sits behind the bearer token, so a probe that has no
+        token would never reach it and the gauges would stay at zero
+        while the dump holds rows. The counts are read at most once per
+        interval, and the gauges keep the value of the last read in
+        between — a scrape must not turn into a full table scan on the
+        database.
         """
         expected = getattr(app.state.config.api, "metrics_token", "") or ""
         if expected:
@@ -197,7 +276,7 @@ def create_app(config: Config, engine: AsyncEngine | None = None) -> FastAPI:
                     status_code=401,
                     media_type="application/json",
                 )
-        await _refresh_database_gauges(app.state.engine)
+        await gauges.refresh()
         return Response(content=get_metrics(), media_type=metrics_content_type())
 
     return app

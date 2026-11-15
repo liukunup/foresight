@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
+from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from foresight.api.deps import get_engine
@@ -42,6 +44,31 @@ async def publish_counts(engine: AsyncEngine) -> tuple[int, int]:
     return total, media
 
 
+def _database_size_mb(url: URL) -> float:
+    """The size of the database file, in megabytes.
+
+    Only a file-backed database has a file to measure. On PostgreSQL and
+    on MySQL the name of the database is the name of the database on the
+    server — not a path — and the dump is spread over the files of the
+    server, so there is no single file to measure and the size of the
+    dump is reported as zero.
+    """
+    if url.get_backend_name() != "sqlite":
+        return 0.0
+    raw = url.database
+    if not raw:
+        return 0.0
+    if raw.startswith("file:"):
+        # A read-only SQLite connection is opened through a `file:` URI,
+        # so the path of the database file carries that prefix — and the
+        # path is escaped once more, because the driver unescapes it.
+        raw = unquote(raw.removeprefix("file:"))
+    db_path = Path(raw)
+    if not db_path.exists():
+        return 0.0
+    return round(db_path.stat().st_size / (1024 * 1024), 3)
+
+
 @router.get("/health", response_model=HealthOut)
 async def health(engine: AsyncEngine = Depends(get_engine)) -> HealthOut:
     """Report the state of the dump.
@@ -49,6 +76,10 @@ async def health(engine: AsyncEngine = Depends(get_engine)) -> HealthOut:
     The counts come from the database itself, so the endpoint answers the
     question the caller really has: how much data has been dumped and when
     was the last row written.
+
+    The size of the database is only a number for SQLite, the one backend
+    that stores the dump in a file: PostgreSQL and MySQL spread the dump
+    over the files of the server, so the size is reported as zero.
     """
     async with engine.connect() as conn:
         total, media = await _counts(conn)
@@ -62,21 +93,10 @@ async def health(engine: AsyncEngine = Depends(get_engine)) -> HealthOut:
                 .limit(1)
             )
         ).first()
-    size_mb = 0.0
-    path = getattr(engine.url, "database", None)
-    if path:
-        # A read-only SQLite connection is opened through a `file:` URI, so
-        # the path of the database file carries that prefix.
-        raw = str(path)
-        if raw.startswith("file:"):
-            raw = raw[len("file:") :]
-        db_path = Path(raw)
-        if db_path.exists():
-            size_mb = round(db_path.stat().st_size / (1024 * 1024), 3)
     return HealthOut(
         status="ok",
         total_messages=total,
         total_attachments=media,
-        db_size_mb=size_mb,
+        db_size_mb=_database_size_mb(engine.url),
         last_captured_at=last[0] if last else None,
     )

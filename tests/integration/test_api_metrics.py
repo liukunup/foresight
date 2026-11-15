@@ -4,13 +4,19 @@ The metrics are the ones an operator watches: how much was captured, how
 fast the API answers, how much the database holds. The endpoint itself is
 outside `/api`, so Prometheus can scrape it without a bearer token — unless
 a metrics token is configured, which then guards it.
+
+The gauges of the database are read at most once per interval: a count is a
+full table scan on PostgreSQL and on MySQL, and Prometheus scrapes the
+endpoint every few seconds.
 """
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy import event
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from foresight.api.app import create_app
 from foresight.domain.models import MessageRecord, OpKind, WriteOp
@@ -18,6 +24,46 @@ from foresight.events import EventHandler
 from foresight.storage.db import init_db
 from foresight.storage.repository import Repository
 from foresight.writer import Writer
+
+from .conftest import api_config
+
+
+class _Clock:
+    """A clock the test drives, so that the interval costs no time."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@contextmanager
+def _record_selects(engine: AsyncEngine):
+    """Collect the SELECT statements the engine runs inside the block.
+
+    The listener sits on the synchronous engine behind the async wrapper:
+    the async engine fires the events of its synchronous counterpart.
+    """
+    recorded: list[str] = []
+
+    def _before(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            recorded.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _before)
+    try:
+        yield recorded
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _before)
+
+
+def _count_statements(statements: list[str]) -> list[str]:
+    """The statements that counted the rows of a table."""
+    return [statement for statement in statements if "count(" in statement.lower()]
 
 
 def _stored_message(message_id: int) -> MessageRecord:
@@ -160,6 +206,127 @@ async def test_a_scrape_publishes_the_database_gauges_without_a_health_call(
     assert "foresight_db_messages_total 3.0" in response.text
     assert "foresight_db_attachments_total 0.0" in response.text
     await engine.dispose()
+
+
+async def test_two_scrapes_in_a_row_count_the_dump_once(tmp_path):
+    """A scrape must not count the dump again before the interval passed.
+
+    A count is a full table scan on PostgreSQL and on MySQL, and
+    Prometheus scrapes the endpoint every few seconds: the counts are
+    read at most once per interval, and the gauges keep the value of the
+    last read in between.
+    """
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'm.db'}")
+    await init_db(engine)
+    repo = Repository(engine)
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _stored_message(1))])
+    clock = _Clock()
+    app = create_app(api_config(tmp_path / "m.db"), engine=engine, clock=clock)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        with _record_selects(engine) as statements:
+            first = await client.get("/metrics")
+            counted = _count_statements(statements)
+            # One count per table, and no more.
+            assert len(counted) == 2
+            second = await client.get("/metrics")
+            assert _count_statements(statements) == counted
+    assert first.status_code == 200
+    assert second.status_code == 200
+    # The gauges keep the value of the last read, so they stay true.
+    assert "foresight_db_messages_total 1.0" in second.text
+    await engine.dispose()
+
+
+async def test_a_scrape_after_the_interval_counts_the_dump_again(tmp_path):
+    """The counts are read again once the interval has passed."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'm.db'}")
+    await init_db(engine)
+    repo = Repository(engine)
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _stored_message(1))])
+    clock = _Clock()
+    app = create_app(api_config(tmp_path / "m.db"), engine=engine, clock=clock)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        with _record_selects(engine) as statements:
+            await client.get("/metrics")
+            counted = len(_count_statements(statements))
+            clock.advance(31)
+            response = await client.get("/metrics")
+            assert len(_count_statements(statements)) == counted + 2
+    assert response.status_code == 200
+    await engine.dispose()
+
+
+async def test_the_default_interval_keeps_the_counts_for_thirty_seconds(tmp_path):
+    """A configuration that names no interval gets a sensible default."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'm.db'}")
+    await init_db(engine)
+    clock = _Clock()
+    app = create_app(api_config(tmp_path / "m.db"), engine=engine, clock=clock)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        with _record_selects(engine) as statements:
+            await client.get("/metrics")
+            counted = len(_count_statements(statements))
+            clock.advance(29)
+            await client.get("/metrics")
+            assert len(_count_statements(statements)) == counted
+            clock.advance(2)
+            await client.get("/metrics")
+            assert len(_count_statements(statements)) == counted + 2
+    await engine.dispose()
+
+
+async def test_the_refresh_interval_comes_from_the_configuration(tmp_path):
+    """The interval is the one the configuration of the API names."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'm.db'}")
+    await init_db(engine)
+    clock = _Clock()
+    config = api_config(tmp_path / "m.db")
+    config.api.metrics_refresh_seconds = 60
+    app = create_app(config, engine=engine, clock=clock)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        with _record_selects(engine) as statements:
+            await client.get("/metrics")
+            counted = len(_count_statements(statements))
+            clock.advance(31)
+            await client.get("/metrics")
+            assert len(_count_statements(statements)) == counted
+            clock.advance(30)
+            await client.get("/metrics")
+            assert len(_count_statements(statements)) == counted + 2
+    await engine.dispose()
+
+
+async def test_a_database_that_cannot_be_read_does_not_take_the_metrics_down(
+    tmp_path, caplog
+):
+    """A scrape answers with the gauges of the last read, and logs the reason."""
+    db_path = tmp_path / "m.db"
+    writer = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    await init_db(writer)
+    repo = Repository(writer)
+    await repo.apply_batch([WriteOp(OpKind.MESSAGE, _stored_message(1))])
+    await writer.dispose()
+    # The API reads the database through a read-only connection, so a
+    # missing file is an error and not an empty database.
+    engine = create_async_engine(f"sqlite+aiosqlite:///file:{db_path}?mode=ro&uri=true")
+    clock = _Clock()
+    app = create_app(api_config(tmp_path / "m.db"), engine=engine, clock=clock)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        await client.get("/metrics")
+        # The database is gone and the interval has passed: the scrape
+        # must still answer, with the value of the last read.
+        await engine.dispose()
+        db_path.unlink()
+        clock.advance(31)
+        response = await client.get("/metrics")
+    assert response.status_code == 200
+    assert "foresight_db_messages_total 1.0" in response.text
+    assert "could not refresh the database gauges" in caplog.text
 
 
 def _discord_message(channel_id: int = 20, guild_id: int = 10, message_id: int = 100):
