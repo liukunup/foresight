@@ -21,9 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          # The version the project declares as its floor: the suite has to
+          # pass on it.
+          python-version: "3.13"
 
       - name: Install the dependencies
         run: uv sync --frozen
@@ -70,9 +73,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
+          # The version the project declares as its floor: the suite has to
+          # pass on it.
+          python-version: "3.13"
 
       - name: Install the dependencies
         run: uv sync --frozen
