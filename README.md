@@ -106,9 +106,9 @@ compose 另外用一个 `FORESIGHT_PORT` 决定宿主机上映射出来的端口
 | `foresight query --sql "SELECT ..." --db data/foresight.db` | 只读查询 |
 | `foresight stats --db data/foresight.db` | 概览统计 |
 
-每条命令都接受 `--config` 指定别的配置文件。
+除 `query` 和 `stats` 外，每条命令都接受 `--config` 指定别的配置文件 —— 这两条命令直接读数据库文件，用 `--db` 指定路径。
 
-`foresight stats` 的 `--since` / `--until` 与 API 的时间边界同义：纯日期表示整天，写法不对会直接报错退出（退出码 2）。
+`foresight stats` 的 `--since` / `--until` 与 API 的时间边界同义：纯日期表示整天，写法不对会直接报错退出（退出码 2）。`foresight analyze --since` 和 `foresight backfill --since` 用的是同一套规则，写法不对同样报错退出，不会静悄悄地什么都没做。
 
 ## 安装 AI Skill
 
@@ -123,10 +123,11 @@ export FORESIGHT_API_TOKEN="..."                 # 脚本会提示下一步
 
 ## API
 
-除 `/metrics` 外，所有请求都需要 `Authorization: Bearer <FORESIGHT_API_TOKEN>`。
+设置了 `FORESIGHT_API_TOKEN` 时，`/api/*` 下的所有请求都需要 `Authorization: Bearer <FORESIGHT_API_TOKEN>`；不设置时（这时只允许绑定本机地址）API 接受匿名请求。`/metrics` 和 `/healthz` 不在 `/api` 下，不需要 Bearer token —— `/metrics` 可以用 `api.metrics_token` 单独再加一道令牌。
 
 | 端点 | 说明 |
 |---|---|
+| `GET /healthz` | 存活探针，不需要 token，不返回任何关于数据的内容 |
 | `GET /api/health` | 状态与计数 |
 | `GET /api/messages` | 消息列表，支持频道/作者/时间/关键词过滤 |
 | `GET /api/messages/{id}` | 单条消息（带 AI 分析结果） |
@@ -170,10 +171,13 @@ Discord 开发者后台的 **MESSAGE CONTENT INTENT** 没开。在 Bot 页面打
 API 绑定到 `0.0.0.0`（非本机）时必须设置 token，否则服务拒绝启动。Docker compose 就是绑定 `0.0.0.0`，所以 `.env` 里的 `FORESIGHT_API_TOKEN` 必须填。
 
 **容器起来但写不了数据库（permission denied）**
-容器内的服务用 uid `10001` 运行，`./data` 必须对它可写。Linux 上建目录时用 `sudo chown -R 10001:10001 data`；macOS / Windows 的 Docker Desktop 一般不用管。
+容器内的服务用 uid `10001` 运行，数据目录必须归它所有。`docker compose up` 会先跑一个 `init-data` 容器把 `./data` 交给这个用户，你不用手动处理；手动 `docker run` 时请自己建好目录并 `chown 10001:10001 data`。
 
-**容器一直显示 unhealthy**
-健康检查打的是 `/metrics`。如果你在 `config.toml` 里填了 `api.metrics_token`，这个端点就需要令牌，探针拿不到 200，容器就会被判为不健康 —— 把 `metrics_token` 留空即可。
+**容器反复重启（restart loop）**
+先看 `docker compose logs foresight`，原因都在日志里。常见两种：Discord 登录失败（token 写错、过期或被吊销）时进程会退出，容器按 `restart: unless-stopped` 反复重启 —— 改好 `DISCORD_TOKEN` 后 `docker compose restart foresight`；端口被占用时换一个 `FORESIGHT_API_PORT`。
+
+**Discord 断线了，API 还在吗**
+在。`both` 里采集器和 API 是分开看的：采集器掉线（网络故障、Discord 挂掉）时它会等一会儿再连，API 这段时间照常服务，日志里会写明采集器停了。只有登录失败是致命的 —— token 错了重试也没用，这时进程会退出。
 
 **机器人报 403 / 看不到频道**
 bot 没被邀请进服务器，或没有该频道的读取权限（`Read Message History`）。

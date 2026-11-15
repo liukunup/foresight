@@ -73,3 +73,12 @@ def test_compose_gives_the_data_directory_to_the_service():
     content = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     assert "chown 10001:10001 /app/data" in content
     assert "service_completed_successfully" in content
+
+
+def test_env_example_lists_the_ports_and_the_configuration():
+    """The README tells the operator to set them: the example has to."""
+    content = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "FORESIGHT_PORT=" in content
+    assert "FORESIGHT_CONFIG=" in content
+    assert "FORESIGHT_API_HOST=" in content
+    assert "FORESIGHT_API_PORT=" in content
