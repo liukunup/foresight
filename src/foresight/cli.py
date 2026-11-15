@@ -45,6 +45,47 @@ def _fail(message: str) -> NoReturn:
     raise typer.Exit(code=1)
 
 
+def _time_bound(value: str | None, option: str, *, upper: bool = False) -> str | None:
+    """The time bound of the command, read the way the API reads it.
+
+    A bare date names a whole day, and a bound that cannot be read is
+    refused instead of answering with an empty range. The message names
+    the option the operator typed, and not the parameter of the API.
+    """
+    from foresight.api.deps import normalize_time_bounds
+
+    if value is None:
+        return None
+    if upper:
+        return normalize_time_bounds(None, value, until_name=option).until
+    return normalize_time_bounds(value, None, since_name=option).since
+
+
+def _fail_bound(exc: ValueError) -> NoReturn:
+    """Report a bound that cannot be read and stop the command.
+
+    A bound that cannot be read is a mistake of the operator, so the
+    command leaves with the code of a bad argument and not with the
+    code of a failure.
+    """
+    typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+    raise typer.Exit(code=2)
+
+
+def _database_target(database: DatabaseConfig) -> str:
+    """The place the schema was created at.
+
+    A SQLite database is a file, and the file has a name. A PostgreSQL
+    or a MySQL database is a database on a server: there is no file to
+    name, and the path of the configuration is not one.
+    """
+    if database.backend == "sqlite":
+        return database.path
+    return (
+        f"{database.backend}://{database.host}:{database.port}/{database.database}"
+    )
+
+
 def _require_token_for_host(host: str) -> None:
     """Refuse to expose the API remotely without a token.
 
@@ -97,7 +138,7 @@ def init_db(
             await engine.dispose()
 
     asyncio.run(_create_schema())
-    typer.echo(f"schema ready at {settings.database.path}")
+    typer.echo(f"schema ready at {_database_target(settings.database)}")
 
 
 @dataclass
@@ -357,12 +398,21 @@ def serve(
     # The application builds its own engine, and that engine can only
     # read: the API is a reader, the dump belongs to the collector.
     application = create_app(settings)
-    uvicorn.run(
-        application,
-        host=bind_host,
-        port=bind_port,
-        log_level=settings.logging.level.lower(),
+    server = uvicorn.Server(
+        uvicorn.Config(
+            application,
+            host=bind_host,
+            port=bind_port,
+            log_level=settings.logging.level.lower(),
+        )
     )
+    try:
+        server.run()
+    except SystemExit as exc:
+        # The server leaves with its own exit code when it cannot bind
+        # the port — 3, and a message of its own. The operator gets one
+        # line and the exit code the other commands use.
+        _fail(_describe_server_failure(exc))
 
 
 async def _stop_server(server_task: Any) -> None:
@@ -399,22 +449,28 @@ async def _run_server(server: Any) -> BaseException | None:
     return None
 
 
-def _server_failure(server_task: Any) -> str:
-    """The reason the API server stopped, in one line."""
-    if server_task.cancelled():
-        return "the API server was cancelled"
-    exc = server_task.result()
+def _describe_server_failure(exc: BaseException | None) -> str:
+    """The reason the API server stopped, in one line.
+
+    The server leaves with a `SystemExit` when it cannot bind the port:
+    the exit code says nothing, but the error it was raised for does —
+    "[Errno 48] address already in use".
+    """
     if exc is None:
         return "the API server stopped"
     if isinstance(exc, SystemExit):
-        # The server leaves with a `SystemExit` when it cannot bind the
-        # port: the exit code says nothing, but the error it was raised
-        # for does — "[Errno 48] address already in use".
         cause = exc.__cause__ or exc.__context__
         if cause is not None:
             return f"the API server stopped: {cause}"
         return f"the API server stopped with exit code {exc.code}"
     return f"the API server stopped: {exc}"
+
+
+def _server_failure(server_task: Any) -> str:
+    """The reason the API server stopped, in one line."""
+    if server_task.cancelled():
+        return "the API server was cancelled"
+    return _describe_server_failure(server_task.result())
 
 
 def _report_task_failure(task: Any) -> None:
@@ -581,9 +637,12 @@ def backfill(
     if days is None and since is None:
         days = 7
     try:
-        window = parse_window(days, since)
+        # The bound is read the way the API reads it: a bare date names
+        # a whole day, and a bound that cannot be read is reported
+        # instead of importing nothing.
+        window = parse_window(days, _time_bound(since, "--since"))
     except ValueError as exc:
-        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2)
     try:
         # The token is checked before the database is opened: an import
@@ -627,7 +686,12 @@ def backfill(
             # so it belongs to the startup: the background task of the
             # writer is not running yet, so it cannot race the replay for
             # the database lock.
-            await recover_failed_batches(writer, failure_path)
+            try:
+                await recover_failed_batches(writer, failure_path)
+            except Exception as exc:
+                # A failure file that cannot be read or parsed is a
+                # problem of the operator, not a crash of the import.
+                _fail(f"cannot replay the failure file {failure_path}: {exc}")
             await writer.start()
             try:
                 runner = BackfillRunner(settings, writer)
@@ -667,13 +731,20 @@ def analyze(
     from foresight.storage.repository import Repository
 
     settings = _load(config)
+    try:
+        # The bound is read the way the API reads it: a bare date names
+        # a whole day, and a bound that cannot be read is reported
+        # instead of analysing nothing.
+        since = _time_bound(since, "--since")
+    except ValueError as exc:
+        _fail_bound(exc)
     if not settings.ai.enabled:
         typer.secho(
             "[ai].enabled is false, nothing to do", fg=typer.colors.YELLOW, err=True
         )
         raise typer.Exit(code=2)
 
-    async def _run() -> int:
+    async def _run() -> tuple[int, int, int]:
         from sqlalchemy.exc import SQLAlchemyError
 
         engine: Any = None
@@ -714,10 +785,16 @@ def analyze(
         finally:
             if engine is not None:
                 await engine.dispose()
-        return len(pending)
+        # The worker knows what it did: a message that carried nothing to
+        # analyse was skipped, and a message the model refused was not
+        # analysed at all.
+        return worker.analysed, worker.skipped, worker.failed
 
-    count = asyncio.run(_run())
-    typer.echo(f"analysed {count} messages")
+    analysed, skipped, failed = asyncio.run(_run())
+    summary = f"analysed {analysed} messages"
+    if skipped or failed:
+        summary += f" ({skipped} skipped, {failed} failed)"
+    typer.echo(summary)
 
 
 @app.command()
@@ -764,7 +841,6 @@ def stats(
     from sqlalchemy.exc import SQLAlchemyError
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    from foresight.api.deps import normalize_time_bounds
     from foresight.storage.stats import StatsService
 
     # The bounds are normalized the way the API normalizes them: a bare
@@ -772,10 +848,10 @@ def stats(
     # day it names. A bound that cannot be read is reported instead of
     # answering with an empty range.
     try:
-        bounds = normalize_time_bounds(since, until)
+        since = _time_bound(since, "--since")
+        until = _time_bound(until, "--until", upper=True)
     except ValueError as exc:
-        typer.secho(str(exc), fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2)
+        _fail_bound(exc)
 
     async def _run() -> dict:
         # The engine is built here and not through the storage layer: this
@@ -785,9 +861,7 @@ def stats(
         url = DatabaseConfig(backend="sqlite", path=db).readonly_sqlalchemy_url
         engine = create_async_engine(url)
         try:
-            return await StatsService(engine).overview(
-                since=bounds.since, until=bounds.until
-            )
+            return await StatsService(engine).overview(since=since, until=until)
         except SQLAlchemyError as exc:
             # A file that is not there, a database without the schema: the
             # operator gets the cause, not a traceback.

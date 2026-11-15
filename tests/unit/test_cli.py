@@ -251,12 +251,16 @@ def collector(
     )
 
 
-def _seed_pending_messages(db_path: Path, count: int = 2) -> None:
+def _seed_pending_messages(
+    db_path: Path, count: int = 2, contents: list[str] | None = None
+) -> None:
     """Put messages that wait for their analysis into the database."""
     from foresight.config import DatabaseConfig
     from foresight.domain.models import MessageRecord, OpKind, WriteOp
     from foresight.storage.db import create_engine, init_db
     from foresight.storage.repository import Repository
+
+    texts = contents if contents is not None else [f"waiting {index}" for index in range(count)]
 
     async def _run() -> None:
         engine = create_engine(DatabaseConfig(backend="sqlite", path=str(db_path)))
@@ -271,7 +275,7 @@ def _seed_pending_messages(db_path: Path, count: int = 2) -> None:
                         guild_id=10,
                         channel_id=1,
                         author_id=30,
-                        content=f"waiting {index}",
+                        content=texts[index],
                         message_type=0,
                         created_at=f"2026-11-1{index}T00:00:00+00:00",
                         captured_at="2026-11-11T00:00:00+00:00",
@@ -865,6 +869,11 @@ class _FakeAnalysingWorker:
         self._pending = 0
         self.started = False
         self.stopped = False
+        # The counts of the real worker: a message that carries nothing
+        # is skipped, every other message is analysed.
+        self.analysed = 0
+        self.skipped = 0
+        self.failed = 0
 
     async def start(self) -> None:
         self.started = True
@@ -877,6 +886,10 @@ class _FakeAnalysingWorker:
     def submit(self, message_id: int, content: str) -> bool:
         self.submitted.append((message_id, content))
         self._pending += 1
+        if not (content or "").strip():
+            self.skipped += 1
+        else:
+            self.analysed += 1
         # The worker takes the message on the next turn of the event loop.
         asyncio.get_running_loop().call_soon(self._finish)
         return True
@@ -1114,3 +1127,115 @@ def test_both_keeps_the_api_running_when_the_collector_dies(both: _BothCommand):
     # The command ends with the reason of the API, not with the failure
     # of the collector.
     assert "the API server stopped" in result.stderr
+
+
+def test_analyze_refuses_a_bound_that_cannot_be_read(analyze: _AnalyzeCommand):
+    """A typo in the bound must not look like an empty archive.
+
+    The bound is read the way the API reads it, and a bound that cannot
+    be read is reported instead of answering with nothing.
+    """
+    result = analyze.run(["--since", "last-tuesday"])
+    assert result.exit_code == 2
+    assert "Traceback" not in result.output
+    assert "--since" in result.output
+    # Nothing was analysed.
+    assert analyze.workers == []
+
+
+def test_analyze_counts_only_the_messages_that_were_analysed(
+    analyze: _AnalyzeCommand,
+):
+    """A message the model refused is not an analysed message."""
+    _seed_pending_messages(analyze.db_path, count=1, contents=[""])
+
+    result = analyze.run()
+
+    assert result.exit_code == 0, result.output
+    assert "analysed 0 messages" in result.output
+    assert "1 skipped" in result.output
+
+
+def test_backfill_refuses_a_bound_that_cannot_be_read(backfill: _BackfillCommand):
+    """The message names the option, and not the Python that failed."""
+    result = backfill.run(["--since", "last-tuesday"])
+    assert result.exit_code == 2
+    assert "Traceback" not in result.output
+    assert "--since" in result.output
+    assert "Invalid isoformat" not in result.output
+    # Nothing was imported.
+    assert backfill.runners == []
+
+
+def test_backfill_reports_a_failure_file_that_cannot_be_replayed(
+    backfill: _BackfillCommand, monkeypatch: pytest.MonkeyPatch
+):
+    """A corrupt failure file is a problem of the operator, not a crash."""
+
+    async def failing_recover(writer: Any, path: Path | None) -> int:
+        raise OSError("the failure file cannot be read")
+
+    monkeypatch.setattr("foresight.writer.recover_failed_batches", failing_recover)
+
+    result = backfill.run()
+
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "error:" in result.stderr
+    assert "cannot replay the failure file" in result.stderr
+
+
+def test_init_db_names_the_database_and_not_a_file(tmp_path: Path, monkeypatch):
+    """A server database has no file: the message must not name one."""
+
+    class _FakeEngine:
+        async def dispose(self) -> None:
+            return None
+
+    async def fake_init_db(engine: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "foresight.storage.db.create_engine", lambda config: _FakeEngine()
+    )
+    monkeypatch.setattr("foresight.storage.db.init_db", fake_init_db)
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[discord]
+channel_ids = [1]
+
+[database]
+backend = "postgresql"
+host = "db.example"
+port = 5432
+database = "foresight"
+""",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["init-db", "--config", str(config_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "data/foresight.db" not in result.output
+    assert "postgresql" in result.output
+
+
+def test_serve_reports_a_port_that_is_already_taken(tmp_path: Path):
+    """The port is taken: one line, and the exit code of the others."""
+    import socket
+
+    config_path = _write_config(tmp_path)
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        port = sock.getsockname()[1]
+
+        result = runner.invoke(
+            app, ["serve", "--config", str(config_path), "--port", str(port)]
+        )
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "error:" in result.stderr

@@ -99,6 +99,9 @@ def _normalize_bound(value: str, name: str, *, end_of_day: bool) -> str:
 def normalize_time_bounds(
     since: str | None = None,
     until: str | None = None,
+    *,
+    since_name: str = "since",
+    until_name: str = "until",
 ) -> TimeBounds:
     """Read and normalize the time bounds.
 
@@ -107,12 +110,20 @@ def normalize_time_bounds(
     bound that cannot be read is refused instead of answering with a
     silently empty range.
 
+    The names of the bounds are part of the message: the API names the
+    parameter of the request, and the command line names the option of
+    the command.
+
     Raises a `ValueError` when a bound cannot be read — the caller
     decides how to report it.
     """
     return TimeBounds(
-        since=_normalize_bound(since, "since", end_of_day=False) if since else None,
-        until=_normalize_bound(until, "until", end_of_day=True) if until else None,
+        since=(
+            _normalize_bound(since, since_name, end_of_day=False) if since else None
+        ),
+        until=(
+            _normalize_bound(until, until_name, end_of_day=True) if until else None
+        ),
     )
 
 

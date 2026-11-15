@@ -133,3 +133,41 @@ async def test_the_health_endpoint_reports_no_size_for_a_server_database(
     assert body["total_messages"] == 1
     assert body["db_size_mb"] == 0.0
     await engine.dispose()
+
+
+async def test_the_liveness_route_answers_without_a_token(api_client):
+    """The probe of the container carries no token.
+
+    The liveness route sits outside `/api`, so the bearer token of the
+    API does not apply to it: a probe has no token, and it must not need
+    one.
+    """
+    response = await api_client.get("/healthz")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+async def test_the_liveness_route_says_nothing_about_the_dump(api_client):
+    """A liveness probe is a probe and not a question about the archive.
+
+    The route answers with the state of the service and with nothing
+    else: no counts, no size, no timestamp. A stranger that finds the
+    port learns nothing about the dump.
+    """
+    response = await api_client.get("/healthz")
+    body = response.json()
+    assert set(body) == {"status"}
+    assert "total_messages" not in body
+    assert "db_size_mb" not in body
+
+
+async def test_the_liveness_route_answers_with_a_metrics_token(api_harness):
+    """The token of the metrics does not guard the liveness route.
+
+    The metrics token is a separate thing: a deployment that guards
+    `/metrics` must still be able to probe the service.
+    """
+    harness = await api_harness([], token="secret-token")
+    harness.app.state.config.api.metrics_token = "metrics-secret"
+    response = await harness.client.get("/healthz")
+    assert response.status_code == 200

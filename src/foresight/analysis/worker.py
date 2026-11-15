@@ -114,6 +114,14 @@ class AnalysisWorker:
         self._tasks: list[asyncio.Task[None]] = []
         self._stopping = False
         self._pending = 0
+        # The counts of the run: how many messages the model analysed,
+        # how many carried nothing to analyse and how many the model
+        # could not analyse. The command that drives the worker reports
+        # them, and a message that was not analysed must not be counted
+        # as one that was.
+        self._analysed = 0
+        self._skipped = 0
+        self._failed = 0
         # The seam of the wait between two attempts: None means the
         # default wait of the module.
         self._sleep = sleep
@@ -198,6 +206,21 @@ class AnalysisWorker:
         """
         return self._pending
 
+    @property
+    def analysed(self) -> int:
+        """The number of messages the model analysed."""
+        return self._analysed
+
+    @property
+    def skipped(self) -> int:
+        """The number of messages that carried nothing to analyse."""
+        return self._skipped
+
+    @property
+    def failed(self) -> int:
+        """The number of messages the model could not analyse."""
+        return self._failed
+
     def _publish_depth(self) -> None:
         """Publish the number of messages that wait for their analysis.
 
@@ -228,6 +251,7 @@ class AnalysisWorker:
         if should_skip(content):
             # There is nothing to analyse: the message is skipped, not failed.
             await self._set_status(message_id, "skipped")
+            self._skipped += 1
             return
         last_error = "analysis failed"
         for attempt in range(MAX_RETRIES + 1):
@@ -254,8 +278,10 @@ class AnalysisWorker:
                     await self._wait(RETRY_DELAYS[attempt])
                 continue
             await self._store(message_id, result)
+            self._analysed += 1
             return
         await self._store_failure(message_id, last_error)
+        self._failed += 1
 
     async def _wait(self, delay: float) -> None:
         """Wait between two attempts."""

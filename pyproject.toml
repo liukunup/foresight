@@ -29,6 +29,7 @@ dev = [
 
 [project.scripts]
 foresight = "foresight.cli:main"
+foresight-healthcheck = "foresight.healthcheck:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -245,6 +245,20 @@ def create_app(
         _observe_request(request, str(response.status_code), time.perf_counter() - started)
         return response
 
+    @app.get("/healthz", include_in_schema=False)
+    async def healthz() -> dict[str, str]:
+        """Say that the service is alive.
+
+        The route sits outside `/api`, so the bearer token of the API
+        does not apply to it: a liveness probe carries no token, and it
+        must not need one.
+
+        It says nothing about the dump — no counts, no size, no
+        timestamp — because a liveness probe must not tell a stranger
+        what the archive holds.
+        """
+        return {"status": "ok"}
+
     @app.get("/metrics", include_in_schema=False)
     async def metrics(request: Request) -> Response:
         """Serve the metrics in the Prometheus exposition format.
