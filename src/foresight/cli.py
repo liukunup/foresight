@@ -642,8 +642,7 @@ def backfill(
         # instead of importing nothing.
         window = parse_window(days, _time_bound(since, "--since"))
     except ValueError as exc:
-        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2)
+        _fail_bound(exc)
     try:
         # The token is checked before the database is opened: an import
         # that cannot log in must not write anything.

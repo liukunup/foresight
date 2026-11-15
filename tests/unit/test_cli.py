@@ -260,7 +260,11 @@ def _seed_pending_messages(
     from foresight.storage.db import create_engine, init_db
     from foresight.storage.repository import Repository
 
-    texts = contents if contents is not None else [f"waiting {index}" for index in range(count)]
+    texts = (
+        contents
+        if contents is not None
+        else [f"waiting {index}" for index in range(count)]
+    )
 
     async def _run() -> None:
         engine = create_engine(DatabaseConfig(backend="sqlite", path=str(db_path)))
@@ -1086,7 +1090,9 @@ def both(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _BothCommand:
     monkeypatch.setattr("foresight.writer.recover_failed_batches", fake_recover)
     monkeypatch.setattr("foresight.storage.db.create_engine", fake_create_engine)
     monkeypatch.setattr("foresight.media_worker.MediaWorker", make_media_worker)
-    monkeypatch.setattr("foresight.analysis.worker.AnalysisWorker", make_analysis_worker)
+    monkeypatch.setattr(
+        "foresight.analysis.worker.AnalysisWorker", make_analysis_worker
+    )
     monkeypatch.setattr(
         "foresight.storage.media.build_media_store", lambda config: "media-store"
     )
