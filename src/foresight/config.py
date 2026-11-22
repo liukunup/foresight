@@ -259,6 +259,20 @@ def _env_bool(
     )
 
 
+def _env_int_list(
+    env_key: str,
+    raw: dict[str, Any],
+    key: str,
+    label: str,
+) -> tuple[int, ...]:
+    value = os.environ.get(env_key)
+    if not value:
+        return _as_int_list(raw.get(key, []), label)
+    return _as_int_list(
+        [part.strip() for part in value.split(",") if part.strip()], env_key
+    )
+
+
 def load_config(path: str | Path | None = None) -> Config:
     """Load configuration from TOML plus environment overrides.
 
@@ -280,8 +294,8 @@ def load_config(path: str | Path | None = None) -> Config:
 
 def _build(raw: dict[str, Any], config_path: Path) -> Config:
     discord_raw = _section(raw, "discord")
-    channel_ids = _as_int_list(
-        discord_raw.get("channel_ids", []), "discord.channel_ids"
+    channel_ids = _env_int_list(
+        "DISCORD_CHANNEL_IDS", discord_raw, "channel_ids", "discord.channel_ids"
     )
 
     db_raw = _section(raw, "database")

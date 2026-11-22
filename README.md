@@ -105,6 +105,7 @@ uv run foresight both        # 采集器 + API 同时跑
 | `COMPOSE_PROFILES` | Docker 部署 | 逗号分隔的可选服务：`mysql` / `postgresql` / `rustfs`；留空为 SQLite + 本地附件 |
 | `FORESIGHT_DATABASE_BACKEND`、`FORESIGHT_MEDIA_BACKEND` | 可选 | 应用使用的数据库 / 媒体后端；非空时覆盖 `config.toml` |
 | `DISCORD_TOKEN` | 采集 / `backfill` 时 | Discord bot token |
+| `DISCORD_CHANNEL_IDS` | 可选 | 逗号分隔的频道 ID，覆盖 `config.toml` 的 `[discord].channel_ids` |
 | `FORESIGHT_API_TOKEN` | API 不在本机监听时 | API 的 Bearer token；不设置且绑定 `0.0.0.0` 时服务拒绝启动 |
 | `FORESIGHT_LLM_API_KEY` | 开启 AI 分析时 | 模型服务的 key |
 | `FORESIGHT_DB_PASSWORD` | PostgreSQL / MySQL 时 | 数据库密码 |

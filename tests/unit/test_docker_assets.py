@@ -136,6 +136,7 @@ def test_env_example_lists_the_profiles():
     assert "mysql,rustfs" in content
     assert "FORESIGHT_DATABASE_BACKEND=" in content
     assert "FORESIGHT_MEDIA_BACKEND=" in content
+    assert "DISCORD_CHANNEL_IDS=" in content
 
 
 def test_compose_passes_the_env_file_to_the_service():

@@ -7,7 +7,8 @@
 # deployment architecture.
 
 [discord]
-# Whitelist of channel IDs to capture.
+# Whitelist of channel IDs to capture. DISCORD_CHANNEL_IDS in .env overrides
+# this with a comma-separated list.
 channel_ids = [123456789012345678]
 
 [database]

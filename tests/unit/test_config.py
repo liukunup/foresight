@@ -111,6 +111,24 @@ def test_empty_environment_values_fall_back_to_toml(
     assert config.database.host == "db"
 
 
+def test_env_overrides_channel_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_config(tmp_path, "[discord]\nchannel_ids = [1]\n")
+    monkeypatch.setenv("DISCORD_CHANNEL_IDS", "111, 222")
+    config = load_config(path)
+    assert config.discord.channel_ids == (111, 222)
+
+
+def test_invalid_channel_ids_from_environment_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_config(tmp_path, "")
+    monkeypatch.setenv("DISCORD_CHANNEL_IDS", "111, nope")
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
 def test_unknown_backend_from_environment_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
