@@ -125,9 +125,27 @@ def test_compose_selects_rustfs_with_a_profile():
     assert "image: rustfs/rustfs:" in content
     assert 'profiles: ["rustfs"]' in content
     assert "rustfs-data:/data" in content
-    assert "mc mb --ignore-existing rustfs/foresight" in content
+    assert "mc mb --ignore-existing s3/foresight" in content
     assert "${FORESIGHT_S3_ACCESS_KEY_ID:-}" in content
     assert "${FORESIGHT_S3_SECRET_ACCESS_KEY:-}" in content
+
+
+def test_compose_initializes_the_bucket_with_a_generic_service_name():
+    """The bucket init service is not tied to the rustfs profile name."""
+    content = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "  s3-init:" in content
+    assert "rustfs-bucket" not in content
+    assert "image: minio/mc:" in content
+    assert "minio/minio" not in content
+
+
+def test_no_minio_backend_support():
+    """MinIO is not advertised as a storage backend, only as a client tool."""
+    paths = [ROOT / "README.md"]
+    paths += list((ROOT / "src").rglob("*.py"))
+    paths += list((ROOT / "docs").rglob("*.md"))
+    for path in paths:
+        assert "minio" not in path.read_text(encoding="utf-8").lower(), path
 
 
 def test_env_example_lists_the_profiles():

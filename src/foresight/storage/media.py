@@ -83,7 +83,7 @@ class LocalMediaStore:
 class S3MediaStore:
     """Stores attachments in an S3 compatible bucket.
 
-    AWS S3, MinIO, Cloudflare R2 and Aliyun OSS all speak the S3 protocol,
+    AWS S3, RustFS, Cloudflare R2 and Aliyun OSS all speak the S3 protocol,
     so one client serves them all: they differ in the endpoint and in the
     way the bucket is addressed.
     """
@@ -99,7 +99,7 @@ class S3MediaStore:
         import aioboto3
         from botocore.config import Config as BotoConfig
 
-        # MinIO, R2 and OSS are reached with the path style: the bucket is
+        # RustFS, R2 and OSS are reached with the path style: the bucket is
         # a path of the endpoint and not a name of a DNS host.
         addressing = "path" if self._config.use_path_style else "auto"
         return aioboto3.Session().client(
