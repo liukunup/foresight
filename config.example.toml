@@ -1,33 +1,46 @@
 # Copy to config.toml and adjust. Secrets belong in environment variables,
 # never in this file.
+#
+# This is the only config template. COMPOSE_PROFILES in .env selects which
+# optional services compose starts; non-empty FORESIGHT_* environment values
+# override the matching settings here, so .env alone can drive the whole
+# deployment architecture.
 
 [discord]
-# Whitelist of channel IDs to capture.
+# Whitelist of channel IDs to capture. DISCORD_CHANNEL_IDS in .env overrides
+# this with a comma-separated list.
 channel_ids = [123456789012345678]
 
 [database]
 backend = "sqlite"          # sqlite | postgresql | mysql
-path = "data/foresight.db"
-# host = "localhost"
+path = "data/foresight.db"  # sqlite only
+# For mysql / postgresql set host, port, database and user to match the
+# compose service:
+# host = "postgres"
+# host = "mysql"
 # port = 5432
+# port = 3306
 # database = "foresight"
 # user = "foresight"
+# The password is read only from FORESIGHT_DB_PASSWORD in .env.
 
 [media]
 backend = "local"            # local | s3
-local_root = "data/media"
+local_root = "data/media"    # local only
 max_download_size_mb = 100
 download_concurrency = 3
 
 [media.s3]
-bucket = ""
-endpoint_url = ""
-region = "auto"
+bucket = "foresight"                  # created automatically when rustfs is enabled
+endpoint_url = "http://rustfs:9000"   # service name on the compose network
+region = "us-east-1"                  # matches RUSTFS_REGION in docker-compose.yml
 prefix = "foresight"
 use_path_style = true
+# Keys are read only from FORESIGHT_S3_ACCESS_KEY_ID and
+# FORESIGHT_S3_SECRET_ACCESS_KEY in .env.
 
 [api]
-host = "127.0.0.1"
+host = "127.0.0.1"           # compose overrides this with 0.0.0.0
 port = 8000
 metrics_token = ""
 # How often the database gauges are refreshed when /metrics is scraped.
@@ -35,11 +48,12 @@ metrics_refresh_seconds = 30
 
 [ai]
 enabled = false
-base_url = "https://api.openai.com/v1"
+base_url = "https://api.openai.com/v1"   # any OpenAI-compatible endpoint
 model = "gpt-4o-mini"
 translation_target = "zh-CN"
 max_concurrency = 2
 timeout_seconds = 30
+# The key is read only from FORESIGHT_LLM_API_KEY in .env.
 
 [writer]
 batch_size = 100

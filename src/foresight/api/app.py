@@ -198,7 +198,14 @@ def create_app(
     The clock is injected, so that a test can drive the interval of the
     gauges of the database without waiting for it.
     """
-    app = FastAPI(title="ForeSight API", version="0.1.0", lifespan=_lifespan)
+    app = FastAPI(
+        title="ForeSight API",
+        version="0.1.0",
+        lifespan=_lifespan,
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
+    )
     if engine is None:
         engine = create_engine(config.database, readonly=True)
         owns_engine = True

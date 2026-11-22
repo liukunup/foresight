@@ -83,15 +83,11 @@
 ```
 foresight/
 ├── pyproject.toml
-├── config.example.toml
-├── config.postgresql.example.toml   # PostgreSQL 部署的 [database] 模板
-├── config.mysql.example.toml        # MySQL 部署的 [database] 模板
+├── config.example.toml              # 所有后端的配置模板
 ├── .env.example
 ├── README.md
 ├── Dockerfile
-├── docker-compose.yml               # 默认 SQLite
-├── docker-compose.postgresql.yml    # PostgreSQL + ForeSight
-├── docker-compose.mysql.yml         # MySQL + ForeSight
+├── docker-compose.yml               # 一份编排，profile 选择可选服务
 ├── .dockerignore
 ├── docs/superpowers/specs/2026-11-11-discord-message-dump-design.md
 ├── scripts/
@@ -463,7 +459,7 @@ writer 落库成功 → 消息入分析队列 → worker（并发 max_concurrenc
 - 认证：`Authorization: Bearer <token>`，token 从环境变量 `FORESIGHT_API_TOKEN` 读取
 - 默认监听 `127.0.0.1:8000`（`api.host` / `api.port` 可配）
 - **若绑定到非本机地址而未设置 token，服务直接拒绝启动**
-- FastAPI 自动生成 `/docs`（OpenAPI），AI 可自行读取接口定义
+- FastAPI 自动生成三份接口文档：`/docs`（Swagger UI）、`/redoc`（ReDoc）、`/openapi.json`（OpenAPI JSON）；它们在 `/api` 之外，不需要 Bearer token，AI 可自行读取接口定义
 
 ### 11.2 数据库连接
 
@@ -656,6 +652,11 @@ level = "INFO"
 
 | 环境变量 | 覆盖 |
 |---|---|
+| `COMPOSE_PROFILES` | compose 启动的可选服务（`mysql` / `postgresql` / `rustfs`） |
+| `DISCORD_CHANNEL_IDS` | `discord.channel_ids`（逗号分隔） |
+| `FORESIGHT_DATABASE_BACKEND`、`FORESIGHT_DATABASE_HOST`、`FORESIGHT_DATABASE_PORT`、`FORESIGHT_DATABASE_NAME`、`FORESIGHT_DATABASE_USER`、`FORESIGHT_DATABASE_PATH` | `[database]` 对应项 |
+| `FORESIGHT_MEDIA_BACKEND`、`FORESIGHT_MEDIA_LOCAL_ROOT` | `[media]` 对应项 |
+| `FORESIGHT_S3_BUCKET`、`FORESIGHT_S3_ENDPOINT_URL`、`FORESIGHT_S3_REGION`、`FORESIGHT_S3_PREFIX`、`FORESIGHT_S3_USE_PATH_STYLE` | `[media.s3]` 对应项（密钥仍走专用变量） |
 | `FORESIGHT_API_HOST` | `api.host` |
 | `FORESIGHT_API_PORT` | `api.port` |
 | `FORESIGHT_CONFIG` | 配置文件路径本身（默认 `config.toml`） |
@@ -713,7 +714,7 @@ services:
 
 `init-data` 先把 `./data` 交给 uid 10001，否则 collector 在 Linux 上写不了；`./data` 承载 SQLite 文件、本地媒体和失败批次文件。`FORESIGHT_PORT` 只改宿主机映射出来的端口。
 
-另外两份 compose 把数据库也编排进来：`docker-compose.postgresql.yml`（`postgres:17-alpine`，数据在 `postgres-data` 卷）和 `docker-compose.mysql.yml`（`mysql:8.4`，数据在 `mysql-data` 卷）。ForeSight 等数据库健康检查通过后再启动；数据库密码只从 `.env` 的 `FORESIGHT_DB_PASSWORD` 读取，`[database]` 的 backend/host/port/database/user 用 `config.postgresql.example.toml` / `config.mysql.example.toml` 模板。用法见 README「使用 MySQL / PostgreSQL 部署」。
+可选的服务器都在同一份 compose 里，用 `.env` 的 `COMPOSE_PROFILES` 选择：`mysql`（`mysql:8.4`，数据在 `mysql-data` 卷）、`postgresql`（`postgres:17-alpine`，数据在 `postgres-data` 卷）、`rustfs`（S3 兼容对象存储，数据在 `rustfs-data` 卷），可组合，留空则只用 SQLite + 本地附件。ForeSight 等启用的服务通过健康检查后再启动；数据库密码只从 `.env` 的 `FORESIGHT_DB_PASSWORD` 读取，`[database]` 的 backend/host/port/database/user 和 `[media]` 的后端都写在唯一的 `config.example.toml` 模板里。用法见 README「快速开始（Docker，推荐）」。
 
 `.env` 存放所有密钥。因为 compose 里 API 监听 `0.0.0.0`（非本机地址），**`.env` 必须包含 `FORESIGHT_API_TOKEN`**，否则按 §11.1 的规则服务拒绝启动。`.env.example` 提供模板。
 

@@ -1,26 +1,38 @@
 # 部署
 
-默认 compose 用 SQLite，数据库就是 `./data` 里的一个文件（容器内 `/app/data`）。端口默认 `8000`；想换就设环境变量 `FORESIGHT_PORT=8080 docker compose up -d`。停止用 `docker compose down`，数据在宿主机的 `./data` 里，`down` 不会删掉它。仓库还附带了两份把数据库也一起编排进来的 compose 文件：
+只有一份 `docker-compose.yml`。`.env` 里的环境变量同时决定启动哪些服务和应用程序使用哪些后端，不需要改 `config.toml` 就能切换架构。
 
-| 数据库 | compose 文件 | 配置模板 |
+| `COMPOSE_PROFILES` | 启动的服务 | `.env` 中的后端变量 |
 |---|---|---|
-| PostgreSQL | `docker-compose.postgresql.yml` | `config.postgresql.example.toml` |
-| MySQL | `docker-compose.mysql.yml` | `config.mysql.example.toml` |
-
-## 使用 MySQL / PostgreSQL 部署
-
-以 PostgreSQL 为例：
+| 留空 | SQLite + 本地附件 | `FORESIGHT_DATABASE_BACKEND=sqlite`、`FORESIGHT_MEDIA_BACKEND=local` |
+| `mysql` | MySQL + 本地附件 | `FORESIGHT_DATABASE_BACKEND=mysql`、`FORESIGHT_MEDIA_BACKEND=local` |
+| `postgresql` | PostgreSQL + 本地附件 | `FORESIGHT_DATABASE_BACKEND=postgresql` |
+| `rustfs` | SQLite + RustFS | `FORESIGHT_MEDIA_BACKEND=s3` |
+| `mysql,rustfs` | MySQL + RustFS | `FORESIGHT_DATABASE_BACKEND=mysql`、`FORESIGHT_MEDIA_BACKEND=s3` |
 
 ```bash
-cp config.postgresql.example.toml config.toml   # 填入 channel_ids；host/port/user/database 已对应 compose
-cp .env.example .env                            # 填入 DISCORD_TOKEN、FORESIGHT_API_TOKEN、FORESIGHT_DB_PASSWORD
-docker compose -f docker-compose.postgresql.yml up -d
-docker compose -f docker-compose.postgresql.yml logs -f foresight
+cp config.example.toml config.toml   # 填入 channel_ids，选好 backend
+cp .env.example .env                 # 填入 token 和 COMPOSE_PROFILES
+
+docker compose up -d
+docker compose logs -f foresight
 ```
 
-MySQL 把上面的 `postgresql` 换成 `mysql` 即可：用 `config.mysql.example.toml` 和 `docker-compose.mysql.yml`。
+## 数据、端口与密钥
 
-- 数据库跑在同一个 compose 里，ForeSight 会等数据库通过健康检查后再启动；数据库数据在命名卷 `postgres-data` / `mysql-data` 里，`down` 不会删掉它。要连已有的外部数据库，就只用默认 compose 并在 `config.toml` 的 `[database]` 里填 `backend` 和连接信息。
-- 连接信息（backend/host/port/database/user）写在 `config.toml` 的 `[database]` 段；**密码只从 `.env` 的 `FORESIGHT_DB_PASSWORD` 读取**，不要写进 config.toml。`FORESIGHT_API_TOKEN` 同样必须设置，因为 API 绑定 `0.0.0.0`。
-- `./data` 仍然放本地媒体和失败批次文件，仍由 `init-data` 容器先交给 uid `10001`；换成 S3 媒体后端时可以不管这个目录。
-- 改宿主机端口仍用 `FORESIGHT_PORT`；停止用 `docker compose -f docker-compose.postgresql.yml down`（MySQL 换成对应文件）。
+- 启用数据库 / RustFS 时，ForeSight 会等服务通过健康检查后再启动；数据在命名卷 `mysql-data` / `postgres-data` / `rustfs-data` 里，`down` 不会删掉。`./data` 只放 SQLite 文件、本地附件和失败批次文件，仍由 `init-data` 容器先交给 uid `10001`；换成 S3 媒体后端时可以不管这个目录。
+- 非空的 `FORESIGHT_*` 环境变量覆盖 `config.toml` 中同名设置；连接信息可用 `FORESIGHT_DATABASE_HOST` / `_PORT` / `_NAME` / `_USER` / `_PATH`，S3 可用 `FORESIGHT_S3_BUCKET` / `_ENDPOINT_URL` / `_REGION` / `_PREFIX` / `_USE_PATH_STYLE`。密码仍只从 `.env` 的 `FORESIGHT_DB_PASSWORD` 读取。`FORESIGHT_API_TOKEN` 也必须设置，因为 API 绑定 `0.0.0.0`。
+- 启用 `rustfs` 时 `rustfs-bucket` 会先建好 `foresight` 桶，不用手动去控制台创建。`FORESIGHT_S3_ACCESS_KEY_ID` / `FORESIGHT_S3_SECRET_ACCESS_KEY` 同时是 RustFS 根账号和 ForeSight 签名用的密钥；access key 只用大写字母和数字，secret 用 `openssl rand -base64 24` 生成，不要用默认的 `rustfsadmin`。
+- 端口：`FORESIGHT_PORT` 控制宿主机 API 端口（默认 `8000`），`RUSTFS_PORT` / `RUSTFS_CONSOLE_PORT` 控制 RustFS 的 S3 API 和控制台（默认 `9000` / `9001`）。停止：`docker compose down`。
+- 用 MiniMax 这类 OpenAI 兼容接口时，在 `.env` 里设 `FORESIGHT_LLM_API_KEY`，并在 `config.toml` 里写：
+
+  ```toml
+  [ai]
+  enabled = true
+  base_url = "https://api.minimax.chat/v1"
+  model = "MiniMax-M3.1-Flash"
+  ```
+
+## 连接已有的外部数据库
+
+要连已有的外部数据库，就只用默认 compose（不启用数据库 profile），并在 `config.toml` 的 `[database]` 段填 `backend` 和连接信息，或用 `.env` 里的 `FORESIGHT_DATABASE_*` 变量覆盖。密码只从 `FORESIGHT_DB_PASSWORD` 读取，不要写进 `config.toml`。
