@@ -181,5 +181,5 @@ ForeSight 自托管已就绪（MySQL + RustFS）
   采集频道 ID:           ${CHANNEL_IDS}
 
 以上密钥已写入 .env（权限 600），不要提交到版本库。采集前请在 Discord 开发者后台开启 MESSAGE CONTENT INTENT 并把 bot 邀请进服务器。
-常用命令: make selfhost-logs / make selfhost-status / make selfhost-down
+常用命令: make status / make down / make restart
 EOF
