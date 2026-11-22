@@ -67,6 +67,72 @@ def test_env_overrides_api_host_and_port(
     assert config.api.port == 8123
 
 
+def test_env_selects_the_deployment_architecture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_config(tmp_path, "")
+    monkeypatch.setenv("FORESIGHT_DATABASE_BACKEND", "mysql")
+    monkeypatch.setenv("FORESIGHT_DATABASE_PATH", "other.db")
+    monkeypatch.setenv("FORESIGHT_DATABASE_HOST", "db")
+    monkeypatch.setenv("FORESIGHT_DATABASE_PORT", "3307")
+    monkeypatch.setenv("FORESIGHT_DATABASE_NAME", "fs")
+    monkeypatch.setenv("FORESIGHT_DATABASE_USER", "fsuser")
+    monkeypatch.setenv("FORESIGHT_MEDIA_BACKEND", "s3")
+    monkeypatch.setenv("FORESIGHT_MEDIA_LOCAL_ROOT", "other-media")
+    monkeypatch.setenv("FORESIGHT_S3_BUCKET", "bucket")
+    monkeypatch.setenv("FORESIGHT_S3_ENDPOINT_URL", "http://s3:9000")
+    monkeypatch.setenv("FORESIGHT_S3_REGION", "us-east-1")
+    monkeypatch.setenv("FORESIGHT_S3_PREFIX", "media")
+    monkeypatch.setenv("FORESIGHT_S3_USE_PATH_STYLE", "false")
+    config = load_config(path)
+    assert config.database.backend == "mysql"
+    assert config.database.path == "other.db"
+    assert config.database.host == "db"
+    assert config.database.port == 3307
+    assert config.database.database == "fs"
+    assert config.database.user == "fsuser"
+    assert config.media.backend == "s3"
+    assert config.media.local_root == "other-media"
+    assert config.media.s3.bucket == "bucket"
+    assert config.media.s3.endpoint_url == "http://s3:9000"
+    assert config.media.s3.region == "us-east-1"
+    assert config.media.s3.prefix == "media"
+    assert config.media.s3.use_path_style is False
+
+
+def test_empty_environment_values_fall_back_to_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _postgres_config(tmp_path)
+    monkeypatch.setenv("FORESIGHT_DATABASE_BACKEND", "")
+    monkeypatch.setenv("FORESIGHT_DATABASE_HOST", "")
+    config = load_config(path)
+    assert config.database.backend == "postgresql"
+    assert config.database.host == "db"
+
+
+def test_unknown_backend_from_environment_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_config(tmp_path, "")
+    monkeypatch.setenv("FORESIGHT_DATABASE_BACKEND", "oracle")
+    with pytest.raises(ConfigError):
+        load_config(path)
+    monkeypatch.setenv("FORESIGHT_DATABASE_BACKEND", "")
+    monkeypatch.setenv("FORESIGHT_MEDIA_BACKEND", "gdrive")
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_invalid_s3_path_style_from_environment_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_config(tmp_path, "")
+    monkeypatch.setenv("FORESIGHT_S3_USE_PATH_STYLE", "maybe")
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
 def test_unknown_database_backend_raises(tmp_path: Path) -> None:
     path = _write_config(tmp_path, '[database]\nbackend = "oracle"\n')
     with pytest.raises(ConfigError):

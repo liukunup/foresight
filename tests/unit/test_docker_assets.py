@@ -134,6 +134,14 @@ def test_env_example_lists_the_profiles():
     content = (ROOT / ".env.example").read_text(encoding="utf-8")
     assert "COMPOSE_PROFILES=" in content
     assert "mysql,rustfs" in content
+    assert "FORESIGHT_DATABASE_BACKEND=" in content
+    assert "FORESIGHT_MEDIA_BACKEND=" in content
+
+
+def test_compose_passes_the_env_file_to_the_service():
+    content = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "env_file:" in content
+    assert "path: .env" in content
 
 
 def test_config_example_documents_every_backend():

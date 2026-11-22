@@ -213,6 +213,52 @@ def _as_log_level(value: Any, key: str = "logging.level") -> str:
     return level
 
 
+def _env_str(
+    env_key: str,
+    raw: dict[str, Any],
+    key: str,
+    default: str,
+    label: str,
+) -> str:
+    value = os.environ.get(env_key)
+    if value:
+        return _as_str(value, env_key)
+    return _as_str(raw.get(key, default), label)
+
+
+def _env_int(
+    env_key: str,
+    raw: dict[str, Any],
+    key: str,
+    default: int,
+    label: str,
+) -> int:
+    value = os.environ.get(env_key)
+    if value:
+        return _as_int(value, env_key)
+    return _as_int(raw.get(key, default), label)
+
+
+def _env_bool(
+    env_key: str,
+    raw: dict[str, Any],
+    key: str,
+    default: bool,
+    label: str,
+) -> bool:
+    value = os.environ.get(env_key)
+    if not value:
+        return _as_bool(raw.get(key, default), label)
+    lowered = value.strip().lower()
+    if lowered in ("1", "true", "yes", "on"):
+        return True
+    if lowered in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(
+        f"invalid value for {env_key}: {value!r} (expected a boolean)"
+    )
+
+
 def load_config(path: str | Path | None = None) -> Config:
     """Load configuration from TOML plus environment overrides.
 
@@ -239,28 +285,54 @@ def _build(raw: dict[str, Any], config_path: Path) -> Config:
     )
 
     db_raw = _section(raw, "database")
-    backend = db_raw.get("backend", "sqlite")
+    backend = _env_str(
+        "FORESIGHT_DATABASE_BACKEND", db_raw, "backend", "sqlite", "database.backend"
+    )
     if backend not in ("sqlite", "postgresql", "mysql"):
         raise ConfigError(f"unsupported database backend: {backend!r}")
     database = DatabaseConfig(
         backend=backend,
-        path=_as_str(db_raw.get("path", "data/foresight.db"), "database.path"),
-        host=_as_str(db_raw.get("host", "localhost"), "database.host"),
-        port=_as_int(db_raw.get("port", 5432), "database.port"),
-        database=_as_str(db_raw.get("database", "foresight"), "database.database"),
-        user=_as_str(db_raw.get("user", "foresight"), "database.user"),
+        path=_env_str(
+            "FORESIGHT_DATABASE_PATH",
+            db_raw,
+            "path",
+            "data/foresight.db",
+            "database.path",
+        ),
+        host=_env_str(
+            "FORESIGHT_DATABASE_HOST", db_raw, "host", "localhost", "database.host"
+        ),
+        port=_env_int(
+            "FORESIGHT_DATABASE_PORT", db_raw, "port", 5432, "database.port"
+        ),
+        database=_env_str(
+            "FORESIGHT_DATABASE_NAME",
+            db_raw,
+            "database",
+            "foresight",
+            "database.database",
+        ),
+        user=_env_str(
+            "FORESIGHT_DATABASE_USER", db_raw, "user", "foresight", "database.user"
+        ),
         password=os.environ.get("FORESIGHT_DB_PASSWORD", ""),
     )
 
     media_raw = _section(raw, "media")
-    media_backend = media_raw.get("backend", "local")
+    media_backend = _env_str(
+        "FORESIGHT_MEDIA_BACKEND", media_raw, "backend", "local", "media.backend"
+    )
     if media_backend not in ("local", "s3"):
         raise ConfigError(f"unsupported media backend: {media_backend!r}")
     s3_raw = _section(media_raw, "s3")
     media = MediaConfig(
         backend=media_backend,
-        local_root=_as_str(
-            media_raw.get("local_root", "data/media"), "media.local_root"
+        local_root=_env_str(
+            "FORESIGHT_MEDIA_LOCAL_ROOT",
+            media_raw,
+            "local_root",
+            "data/media",
+            "media.local_root",
         ),
         max_download_size_mb=_as_int(
             media_raw.get("max_download_size_mb", 100), "media.max_download_size_mb"
@@ -269,14 +341,28 @@ def _build(raw: dict[str, Any], config_path: Path) -> Config:
             media_raw.get("download_concurrency", 3), "media.download_concurrency"
         ),
         s3=S3Config(
-            bucket=_as_str(s3_raw.get("bucket", ""), "media.s3.bucket"),
-            endpoint_url=_as_str(
-                s3_raw.get("endpoint_url", ""), "media.s3.endpoint_url"
+            bucket=_env_str(
+                "FORESIGHT_S3_BUCKET", s3_raw, "bucket", "", "media.s3.bucket"
             ),
-            region=_as_str(s3_raw.get("region", "auto"), "media.s3.region"),
-            prefix=_as_str(s3_raw.get("prefix", "foresight"), "media.s3.prefix"),
-            use_path_style=_as_bool(
-                s3_raw.get("use_path_style", True), "media.s3.use_path_style"
+            endpoint_url=_env_str(
+                "FORESIGHT_S3_ENDPOINT_URL",
+                s3_raw,
+                "endpoint_url",
+                "",
+                "media.s3.endpoint_url",
+            ),
+            region=_env_str(
+                "FORESIGHT_S3_REGION", s3_raw, "region", "auto", "media.s3.region"
+            ),
+            prefix=_env_str(
+                "FORESIGHT_S3_PREFIX", s3_raw, "prefix", "foresight", "media.s3.prefix"
+            ),
+            use_path_style=_env_bool(
+                "FORESIGHT_S3_USE_PATH_STYLE",
+                s3_raw,
+                "use_path_style",
+                True,
+                "media.s3.use_path_style",
             ),
             access_key_id=os.environ.get("FORESIGHT_S3_ACCESS_KEY_ID", ""),
             secret_access_key=os.environ.get("FORESIGHT_S3_SECRET_ACCESS_KEY", ""),

@@ -1,8 +1,10 @@
 # Copy to config.toml and adjust. Secrets belong in environment variables,
 # never in this file.
 #
-# This is the only config template. The servers that back these settings are
-# selected with COMPOSE_PROFILES in .env (mysql, postgresql, rustfs).
+# This is the only config template. COMPOSE_PROFILES in .env selects which
+# optional services compose starts; non-empty FORESIGHT_* environment values
+# override the matching settings here, so .env alone can drive the whole
+# deployment architecture.
 
 [discord]
 # Whitelist of channel IDs to capture.
