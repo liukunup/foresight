@@ -5,7 +5,7 @@ Discord 频道消息转储服务：只要用户在受监控的频道发言，消
 ## 特性
 
 - **实时采集**：消息、编辑、删除、表情回应全部捕获（编辑只保留最新内容，删除是软删除）
-- **附件归档**：图片/视频/音频下载到本地或任意 S3 兼容存储（MinIO、R2、OSS）
+- **附件归档**：图片/视频/音频下载到本地或任意 S3 兼容存储（RustFS、MinIO、R2、OSS）
 - **AI 分析**：一次模型调用同时产出翻译、情绪、问题提取
 - **查询 API**：资源端点 + 统计端点 + 只读 SQL 端点，全部只读连接
 - **Agent Skill**：装上之后 AI 就能自己查、自己分析、自己出结论
@@ -67,6 +67,26 @@ MySQL 把上面的 `postgresql` 换成 `mysql` 即可：用 `config.mysql.exampl
 - `./data` 仍然放本地媒体和失败批次文件，仍由 `init-data` 容器先交给 uid `10001`；换成 S3 媒体后端时可以不管这个目录。
 - 改宿主机端口仍用 `FORESIGHT_PORT`；停止用 `docker compose -f docker-compose.postgresql.yml down`（MySQL 换成对应文件）。
 
+## 使用 MySQL + RustFS 部署
+
+需要把消息元数据和附件都交给外部服务时，用这份编排：MySQL 存消息，RustFS（S3 兼容对象存储）存附件，`./data` 只留失败批次文件。
+
+| 组成 | compose 文件 | 配置模板 |
+|---|---|---|
+| MySQL + RustFS | `docker-compose.mysql-rustfs.yml` | `config.mysql-rustfs.example.toml` |
+
+```bash
+cp config.mysql-rustfs.example.toml config.toml   # 填入 channel_ids；其余已和 compose 对齐
+cp .env.example .env                              # 填入 DISCORD_TOKEN、FORESIGHT_API_TOKEN、FORESIGHT_DB_PASSWORD 和 S3 密钥
+docker compose -f docker-compose.mysql-rustfs.yml up -d
+docker compose -f docker-compose.mysql-rustfs.yml logs -f foresight
+```
+
+- `FORESIGHT_S3_ACCESS_KEY_ID` / `FORESIGHT_S3_SECRET_ACCESS_KEY` 同时是 RustFS 的根账号和 ForeSight 访问对象存储用的密钥。access key 只用大写字母和数字，secret 用 `openssl rand -base64 24` 生成；不要用默认的 `rustfsadmin`。`FORESIGHT_API_TOKEN` 也必须设置，因为 API 绑定 `0.0.0.0`。
+- `rustfs-bucket` 服务会在 ForeSight 启动前建好 `foresight` 桶，不用手动去控制台创建。
+- 数据在命名卷 `mysql-data` / `rustfs-data` 里，`down` 不会删掉。RustFS 的 S3 API 和控制台默认映射到宿主机 `9000` / `9001`，可用 `RUSTFS_PORT` / `RUSTFS_CONSOLE_PORT` 改；控制台用上面那一对密钥登录。
+- API 端口仍由 `FORESIGHT_PORT` 控制；停止用 `docker compose -f docker-compose.mysql-rustfs.yml down`。
+
 ## 快速开始（本地）
 
 ```bash
@@ -112,12 +132,12 @@ uv run foresight both        # 采集器 + API 同时跑
 | `FORESIGHT_API_TOKEN` | API 不在本机监听时 | API 的 Bearer token；不设置且绑定 `0.0.0.0` 时服务拒绝启动 |
 | `FORESIGHT_LLM_API_KEY` | 开启 AI 分析时 | 模型服务的 key |
 | `FORESIGHT_DB_PASSWORD` | PostgreSQL / MySQL 时 | 数据库密码 |
-| `FORESIGHT_S3_ACCESS_KEY_ID` | `media.backend = "s3"` 时 | 对象存储的 access key |
-| `FORESIGHT_S3_SECRET_ACCESS_KEY` | `media.backend = "s3"` 时 | 对象存储的 secret |
+| `FORESIGHT_S3_ACCESS_KEY_ID` | `media.backend = "s3"` 时 | 对象存储的 access key；mysql+rustfs 编排里同时也是 RustFS 根账号 |
+| `FORESIGHT_S3_SECRET_ACCESS_KEY` | `media.backend = "s3"` 时 | 对象存储的 secret；mysql+rustfs 编排里同时也是 RustFS 根密码 |
 | `FORESIGHT_CONFIG` | 可选 | 配置文件路径，默认 `config.toml` |
 | `FORESIGHT_API_HOST` / `FORESIGHT_API_PORT` | 可选 | 覆盖 `[api].host` / `[api].port` |
 
-compose 另外用一个 `FORESIGHT_PORT` 决定宿主机上映射出来的端口（默认 `8000`），它只影响 compose，不影响服务本身。
+compose 另外用一个 `FORESIGHT_PORT` 决定宿主机上映射出来的端口（默认 `8000`），它只影响 compose，不影响服务本身。MySQL + RustFS 编排还用 `RUSTFS_PORT` / `RUSTFS_CONSOLE_PORT`（默认 `9000` / `9001`）控制对象存储和控制台的宿主机端口。
 
 ## 命令
 
