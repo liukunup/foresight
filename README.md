@@ -177,6 +177,18 @@ export FORESIGHT_API_TOKEN="..."                 # 脚本会提示下一步
 | `POST /api/query` | 只读 SQL（单条 SELECT/WITH，写操作被数据库引擎拒绝） |
 | `GET /metrics` | Prometheus 指标（不在 `/api` 下，不需要 token） |
 
+### 接口文档
+
+FastAPI 自动生成三份接口文档，都在 `/api` 之外，**不需要 Bearer token**：
+
+| 端点 | 说明 |
+|---|---|
+| `GET /docs` | Swagger UI，可直接在页面上试调用各个 API |
+| `GET /redoc` | ReDoc，另一种只读的接口文档视图 |
+| `GET /openapi.json` | OpenAPI JSON，供 AI / 脚本读取机器可定义的接口契约 |
+
+文档只描述路由和参数，不包含任何 token 或数据库内容。调用 `/api/*` 时仍按上面的规则带 `Authorization: Bearer <FORESIGHT_API_TOKEN>`。
+
 分页信封：`{"total": N, "limit": 50, "offset": 0, "has_more": true, "items": []}`。
 
 时间边界 `since` / `until` 两种写法都可以：
