@@ -46,6 +46,27 @@ docker compose logs -f foresight
 
 服务会在 <http://127.0.0.1:8000> 提供 API，接口文档在 <http://127.0.0.1:8000/docs>。启用数据库 / RustFS 时，ForeSight 会等服务通过健康检查后再启动；`./data` 只放 SQLite 文件、本地附件和失败批次文件，停止用 `docker compose down`（数据不会被删掉）。更多部署细节见 [部署](docs/deployment.md)。
 
+## 一键自托管（make selfhost）
+
+生产架构（**MySQL + RustFS**）只需一条命令：Makefile 会生成 API token、数据库密码和 RustFS 密钥，写好 `.env` / `config.toml`，初始化数据库，启动全部服务，并把连接地址和密钥打印到控制台。
+
+```bash
+make selfhost
+```
+
+脚本会交互询问 Discord bot token 和要采集的频道 ID；也可以提前用环境变量给出，完全非交互：
+
+```bash
+DISCORD_TOKEN="你的 bot token" DISCORD_CHANNEL_IDS="123456789012345678,987654321098765432" make selfhost
+```
+
+- 需要本机有 `make`、`docker` 和 Compose 插件；`make help` 列出所有命令。
+- 已有的 `.env` 不会被覆盖：密钥和端口保持原值，重新运行只补齐缺失项并重建服务，不会清空数据库。
+- 打印出来的密钥同时存放在 `.env`（权限 600，已在 `.gitignore` 中），不要提交到版本库。
+- 采集前仍需在 Discord 开发者后台开启 **MESSAGE CONTENT INTENT** 并把 bot 邀请进服务器；改完用 `make restart` 重启。
+- `make selfhost-status` 看状态、`make selfhost-logs` 跟日志、`make selfhost-down` 停止、`make restart` 重启。
+- `make clean` 清理容器和本地 `./data`，保留 `.env`、`config.toml` 与数据卷；`make uninstall` 彻底卸载，连数据卷、配置、本地数据和镜像一起删除，之后再次 `make selfhost` 即从零开始。
+
 ## 文档
 
 - [入门（Discord 机器人、本地运行、开发）](docs/getting-started.md)
