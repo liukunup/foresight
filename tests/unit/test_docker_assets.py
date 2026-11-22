@@ -25,6 +25,14 @@ def test_compose_exposes_port_8000_and_persists_data():
     assert 'command: ["both"]' in content
 
 
+def test_compose_pulls_the_published_image_without_building_locally():
+    """`docker compose up` must work on a host that has no source checkout."""
+    content = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "build:" not in content
+    # Both the data init service and the app run the published image.
+    assert content.count("image: liukunup/foresight:latest") == 2
+
+
 def test_env_example_lists_required_secrets():
     content = (ROOT / ".env.example").read_text(encoding="utf-8")
     assert "DISCORD_TOKEN=" in content
@@ -93,8 +101,8 @@ def test_env_example_lists_the_ports_and_the_configuration():
 @pytest.mark.parametrize(
     ("profile", "service", "image", "host", "port", "volume"),
     [
-        ("postgresql", "postgres", "postgres:17-alpine", "postgres", "5432", "postgres-data"),
-        ("mysql", "mysql", "mysql:8.4", "mysql", "3306", "mysql-data"),
+        ("postgresql", "postgres", "postgres:19", "postgres", "5432", "postgres-data"),
+        ("mysql", "mysql", "mysql:8.4.13", "mysql", "3306", "mysql-data"),
     ],
 )
 def test_compose_runs_each_database_after_a_healthy_service(

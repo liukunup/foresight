@@ -8,13 +8,13 @@
 #
 # The app picks its own backends in config.toml ([database].backend and
 # [media].backend); the profiles only decide which servers are started.
+# The app image is pulled from Docker Hub, so `up` never builds locally.
 
 services:
   # The service runs as uid 10001: ./data has to belong to it before the
   # collector starts, or it cannot write the database and the failed batches.
   init-data:
-    build: .
-    image: foresight:latest
+    image: liukunup/foresight:latest
     user: root
     entrypoint:
       - sh
@@ -25,7 +25,7 @@ services:
     restart: "no"
 
   mysql:
-    image: mysql:8.4
+    image: mysql:8.4.13
     container_name: foresight-mysql
     profiles: ["mysql"]
     environment:
@@ -43,7 +43,7 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: postgres:17-alpine
+    image: postgres:19
     container_name: foresight-postgres
     profiles: ["postgresql"]
     environment:
@@ -109,8 +109,7 @@ services:
     restart: "no"
 
   foresight:
-    build: .
-    image: foresight:latest
+    image: liukunup/foresight:latest
     container_name: foresight
     command: ["both"]
     depends_on:
