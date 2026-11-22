@@ -61,6 +61,26 @@ docker compose logs -f foresight
   model = "MiniMax-M3.1-Flash"
   ```
 
+## 一键自托管（make selfhost）
+
+生产架构（**MySQL + RustFS**）只需一条命令：Makefile 会生成 API token、数据库密码和 RustFS 密钥，写好 `.env` / `config.toml`，初始化数据库，启动全部服务，并把连接地址和密钥打印到控制台。
+
+```bash
+make selfhost
+```
+
+脚本会交互询问 Discord bot token 和要采集的频道 ID；也可以提前用环境变量给出，完全非交互：
+
+```bash
+DISCORD_TOKEN="你的 bot token" DISCORD_CHANNEL_IDS="123456789012345678,987654321098765432" make selfhost
+```
+
+- 需要本机有 `make`、`docker` 和 Compose 插件；`make help` 列出所有命令。
+- 已有的 `.env` 不会被覆盖：密钥和端口保持原值，重新运行只补齐缺失项并重建服务，不会清空数据库。
+- 打印出来的密钥同时存放在 `.env`（权限 600，已在 `.gitignore` 中），不要提交到版本库。
+- 采集前仍需在 Discord 开发者后台开启 **MESSAGE CONTENT INTENT** 并把 bot 邀请进服务器；改完重启用 `make selfhost-down && make selfhost`。
+- `make selfhost-status` 看状态、`make selfhost-logs` 跟日志、`make selfhost-down` 停止（数据卷保留）。
+
 ## 快速开始（本地）
 
 ```bash
