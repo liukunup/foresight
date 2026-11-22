@@ -54,13 +54,17 @@ def _settings(path):
 
 def test_makefile_exposes_the_one_click_target():
     content = (ROOT / "Makefile").read_text(encoding="utf-8")
-    assert "selfhost:" in content
     assert "bash scripts/selfhost.sh" in content
     assert ".PHONY" in content
-    assert "selfhost-down:" in content
-    assert "restart:" in content
-    assert "clean:" in content
-    assert "uninstall:" in content
+    targets = {
+        line.split(":", 1)[0]
+        for line in content.splitlines()
+        if line
+        and not line.startswith((" ", "\t", "#", "."))
+        and ":" in line
+        and ":=" not in line
+    }
+    assert targets == {"selfhost", "status", "down", "restart", "clean", "uninstall"}
 
 
 def test_selfhost_generates_secrets_initializes_and_starts(tmp_path):
