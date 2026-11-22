@@ -459,7 +459,7 @@ writer 落库成功 → 消息入分析队列 → worker（并发 max_concurrenc
 - 认证：`Authorization: Bearer <token>`，token 从环境变量 `FORESIGHT_API_TOKEN` 读取
 - 默认监听 `127.0.0.1:8000`（`api.host` / `api.port` 可配）
 - **若绑定到非本机地址而未设置 token，服务直接拒绝启动**
-- FastAPI 自动生成 `/docs`（OpenAPI），AI 可自行读取接口定义
+- FastAPI 自动生成三份接口文档：`/docs`（Swagger UI）、`/redoc`（ReDoc）、`/openapi.json`（OpenAPI JSON）；它们在 `/api` 之外，不需要 Bearer token，AI 可自行读取接口定义
 
 ### 11.2 数据库连接
 
