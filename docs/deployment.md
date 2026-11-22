@@ -1,6 +1,6 @@
 # 部署
 
-只有一份 `docker-compose.yml`。`.env` 里的环境变量同时决定启动哪些服务和应用程序使用哪些后端，不需要改 `config.toml` 就能切换架构。
+只有一份 `docker-compose.yml`。`.env` 里的环境变量同时决定启动哪些服务和应用程序使用哪些后端，不需要改 `config.toml` 就能切换架构。应用镜像 `liukunup/foresight:latest` 直接从 Docker Hub 拉取，`docker compose up` 不会在本地构建源码；要固定版本就把 compose 里的 `image` 改成对应的 tag。
 
 | `COMPOSE_PROFILES` | 启动的服务 | `.env` 中的后端变量 |
 |---|---|---|

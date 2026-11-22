@@ -24,5 +24,5 @@ uninstall:
 	@docker compose $(PROFILES) down -v --remove-orphans
 	@rm -rf data
 	@rm -f .env config.toml
-	@docker image rm foresight:latest >/dev/null 2>&1 || true
+	@docker image rm liukunup/foresight:latest >/dev/null 2>&1 || true
 	@printf '已卸载：容器、数据卷、配置、./data 与镜像均已移除\n'

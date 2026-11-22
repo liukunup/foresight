@@ -25,6 +25,14 @@ def test_compose_exposes_port_8000_and_persists_data():
     assert 'command: ["both"]' in content
 
 
+def test_compose_pulls_the_published_image_without_building_locally():
+    """`docker compose up` must work on a host that has no source checkout."""
+    content = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "build:" not in content
+    # Both the data init service and the app run the published image.
+    assert content.count("image: liukunup/foresight:latest") == 2
+
+
 def test_env_example_lists_required_secrets():
     content = (ROOT / ".env.example").read_text(encoding="utf-8")
     assert "DISCORD_TOKEN=" in content

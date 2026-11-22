@@ -23,7 +23,7 @@ Discord 频道消息转储服务：只要用户在受监控的频道发言，消
 
 先按 [准备 Discord 机器人](docs/getting-started.md#准备-discord-机器人) 拿到 bot token 和频道 ID。
 
-只有一份 `docker-compose.yml`。`.env` 里的环境变量同时决定启动哪些服务和应用程序使用哪些后端，不需要改 `config.toml` 就能切换架构。
+只有一份 `docker-compose.yml`。`.env` 里的环境变量同时决定启动哪些服务和应用程序使用哪些后端，不需要改 `config.toml` 就能切换架构。应用镜像从 Docker Hub 拉取 `liukunup/foresight:latest`，不需要本地构建。
 
 | `COMPOSE_PROFILES` | 启动的服务 | `.env` 中的后端变量 |
 |---|---|---|

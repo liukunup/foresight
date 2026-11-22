@@ -187,7 +187,7 @@ def test_make_uninstall_removes_volumes_configuration_and_image(tmp_path):
     assert result.returncode == 0, result.stderr
     commands = (tmp_path / "docker.log").read_text(encoding="utf-8").splitlines()
     assert commands[0] == "compose --profile mysql --profile rustfs down -v --remove-orphans"
-    assert commands[1] == "image rm foresight:latest"
+    assert commands[1] == "image rm liukunup/foresight:latest"
     assert not (tmp_path / ".env").exists()
     assert not (tmp_path / "config.toml").exists()
     assert not (tmp_path / "data").exists()
