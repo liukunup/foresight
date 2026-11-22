@@ -394,7 +394,7 @@ class MediaStore(Protocol):
 ### 9.2 两个实现
 
 - `LocalMediaStore(root="data/media")` —— 默认。写入 `data/media/YYYY/MM/DD/<attachment_id>.<ext>`，返回 `file://` URI
-- `S3MediaStore(bucket, endpoint_url, region, access_key_id, secret_access_key, prefix, use_path_style)` —— 兼容 AWS S3 / MinIO / Cloudflare R2 / 阿里云 OSS（S3 协议），返回 `s3://bucket/<key>` URI
+- `S3MediaStore(bucket, endpoint_url, region, access_key_id, secret_access_key, prefix, use_path_style)` —— 兼容 AWS S3 / RustFS / Cloudflare R2 / 阿里云 OSS（S3 协议），返回 `s3://bucket/<key>` URI
 
 **key 统一用 `attachment.id` 命名**（不用原文件名），避免重名覆盖和非法字符；原文件名另存字段。日期分目录避免单目录文件过多。
 
@@ -607,7 +607,7 @@ download_concurrency = 3
 
 [media.s3]
 bucket = ""
-endpoint_url = ""               # MinIO/R2: http://localhost:9000
+endpoint_url = ""               # RustFS/R2: http://localhost:9000
 region = "auto"
 prefix = "foresight"
 use_path_style = true
