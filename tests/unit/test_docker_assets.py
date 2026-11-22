@@ -93,8 +93,8 @@ def test_env_example_lists_the_ports_and_the_configuration():
 @pytest.mark.parametrize(
     ("profile", "service", "image", "host", "port", "volume"),
     [
-        ("postgresql", "postgres", "postgres:17-alpine", "postgres", "5432", "postgres-data"),
-        ("mysql", "mysql", "mysql:8.4", "mysql", "3306", "mysql-data"),
+        ("postgresql", "postgres", "postgres:19", "postgres", "5432", "postgres-data"),
+        ("mysql", "mysql", "mysql:8.4.13", "mysql", "3306", "mysql-data"),
     ],
 )
 def test_compose_runs_each_database_after_a_healthy_service(

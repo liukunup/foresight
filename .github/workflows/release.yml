@@ -14,6 +14,9 @@ on:
 permissions:
   contents: read
 
+env:
+  DOCKER_HUB_REPO: liukunup/foresight
+
 jobs:
   verify:
     name: Verify the image
@@ -106,7 +109,13 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
-      - name: Log in to the registry
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Log in to the GitHub Container Registry
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -126,14 +135,20 @@ jobs:
           rest="${version#*.}"
           minor="${rest%%.*}"
 
-          tags="${IMAGE}:${TAG}"
-          tags="${tags},${IMAGE}:${version}"
-          tags="${tags},${IMAGE}:${major}.${minor}"
+          images=("${DOCKER_HUB_REPO}" "${IMAGE}")
+          tags=""
+          for image in "${images[@]}"; do
+            tags="${tags:+${tags},}${image}:${TAG}"
+            tags="${tags},${image}:${version}"
+            tags="${tags},${image}:${major}.${minor}"
+          done
 
           # `latest` belongs to the newest tag of the repository.
           newest="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1)"
           if [ "${TAG}" = "${newest}" ]; then
-            tags="${tags},${IMAGE}:latest"
+            for image in "${images[@]}"; do
+              tags="${tags},${image}:latest"
+            done
           fi
 
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
@@ -170,7 +185,7 @@ jobs:
             echo "Pull it with:"
             echo
             echo '```bash'
-            echo "docker pull ghcr.io/${{ github.repository }}:${{ inputs.tag || github.ref_name }}"
+            echo "docker pull ${DOCKER_HUB_REPO}:${{ inputs.tag || github.ref_name }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -191,10 +206,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          notes="The image is published as \`ghcr.io/${{ github.repository }}:$TAG\`.
+          notes="The image is published as \`${DOCKER_HUB_REPO}:$TAG\`.
 
           \`\`\`bash
-          docker pull ghcr.io/${{ github.repository }}:$TAG
+          docker pull ${DOCKER_HUB_REPO}:$TAG
           \`\`\`"
 
           # The workflow may be run again for a tag that already has a
