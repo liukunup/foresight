@@ -84,10 +84,14 @@
 foresight/
 ├── pyproject.toml
 ├── config.example.toml
+├── config.postgresql.example.toml   # PostgreSQL 部署的 [database] 模板
+├── config.mysql.example.toml        # MySQL 部署的 [database] 模板
 ├── .env.example
 ├── README.md
 ├── Dockerfile
-├── docker-compose.yml
+├── docker-compose.yml               # 默认 SQLite
+├── docker-compose.postgresql.yml    # PostgreSQL + ForeSight
+├── docker-compose.mysql.yml         # MySQL + ForeSight
 ├── .dockerignore
 ├── docs/superpowers/specs/2026-11-11-discord-message-dump-design.md
 ├── scripts/
@@ -121,7 +125,7 @@ foresight/
 │   │   ├── db.py
 │   │   ├── tables.py
 │   │   ├── repository.py
-│   │   ├── backend.py
+│   │   ├── stats.py
 │   │   └── media.py
 │   ├── analysis/
 │   │   ├── __init__.py
@@ -133,6 +137,8 @@ foresight/
 │       ├── app.py
 │       ├── deps.py
 │       ├── metrics.py
+│       ├── query.py
+│       ├── schemas.py
 │       └── routers/
 │           ├── health.py
 │           ├── messages.py
@@ -611,9 +617,10 @@ prefix = "foresight"
 use_path_style = true
 
 [api]
-host = "127.0.1"
+host = "127.0.0.1"
 port = 8000
 metrics_token = ""              # 留空则 /metrics 不认证
+metrics_refresh_seconds = 30    # /metrics 抓取时数据库 gauge 的刷新间隔
 
 [ai]
 enabled = true
@@ -657,39 +664,58 @@ level = "INFO"
 
 ### 15.1 Dockerfile
 
-多阶段构建：
+多阶段构建，基础镜像为 `python:3.15-slim`：
 
-- `builder`：`python:3.13-slim` + `uv`，依赖装到 `/venv`
-- `runtime`：`python:3.13-slim`，非 root 用户（uid 10001），COPY `/venv` + `src/`，`ENTRYPOINT ["foresight"]`
-- `HEALTHCHECK` 调 `GET /api/health`
+- `builder`：用摘要固定的 `uv` 按 `uv.lock` 安装到 `/opt/venv`（`uv sync --frozen --no-dev --no-editable`）；
+- `runtime`：只复制 `/opt/venv`，不复制源码；非 root 用户（uid 10001）运行，`ENTRYPOINT ["foresight"]`；
+- `HEALTHCHECK` 用 `foresight-healthcheck` 探 `GET /healthz`：该路由在 `/api` 之外、不需要 Bearer token，端口跟随 `FORESIGHT_API_PORT` 或配置。探 `/api/health` 会因没有 token 得到 401，容器永远不健康。
 
-三个入口：`foresight run` / `foresight serve` / `foresight both`。
+入口：`foresight run` / `foresight serve` / `foresight both` / `foresight init-db` 等。
 
-`both` 在**单进程内**用 `asyncio.gather` 同跑机器人与 API —— SQLite 只有一个进程在写，不会出现双进程写竞争。
+`both` 在**单进程内**把采集器和 API 作为两个任务一起跑（采集器掉线后重连，API 继续服务）—— SQLite 只有一个进程在写，不会出现双进程写竞争。
 
 ### 15.2 docker-compose.yml
 
+默认 compose 用 SQLite，数据库就是 `./data` 里的一个文件：
+
 ```yaml
 services:
+  init-data:
+    build: .
+    image: foresight:latest
+    user: root
+    entrypoint: ["sh", "-c", "mkdir -p /app/data && chown 10001:10001 /app/data"]
+    volumes:
+      - ./data:/app/data
+    restart: "no"
+
   foresight:
     build: .
     image: foresight:latest
     command: ["both"]
+    depends_on:
+      init-data:
+        condition: service_completed_successfully
     ports:
-      - "8000:8000"          # 默认 8000，可用 .env 覆盖
-    env_file: [".env"]
+      - "${FORESIGHT_PORT:-8000}:8000"
+    env_file:
+      - path: .env
+        required: false
     environment:
       FORESIGHT_API_HOST: "0.0.0.0"
       FORESIGHT_API_PORT: "8000"
+      FORESIGHT_CONFIG: "/app/config.toml"
     volumes:
       - ./config.toml:/app/config.toml:ro
-      - ./data:/app/data      # 数据库 + 媒体文件持久化
+      - ./data:/app/data
     restart: unless-stopped
 ```
 
-`.env` 存放所有密钥。`./data` 卷同时承载 SQLite 文件与本地媒体。
+`init-data` 先把 `./data` 交给 uid 10001，否则 collector 在 Linux 上写不了；`./data` 承载 SQLite 文件、本地媒体和失败批次文件。`FORESIGHT_PORT` 只改宿主机映射出来的端口。
 
-因为 compose 里 API 监听 `0.0.0.0`（非本机地址），**`.env` 必须包含 `FORESIGHT_API_TOKEN`**，否则按 §11.1 的规则服务拒绝启动。`.env.example` 提供模板。
+另外两份 compose 把数据库也编排进来：`docker-compose.postgresql.yml`（`postgres:17-alpine`，数据在 `postgres-data` 卷）和 `docker-compose.mysql.yml`（`mysql:8.4`，数据在 `mysql-data` 卷）。ForeSight 等数据库健康检查通过后再启动；数据库密码只从 `.env` 的 `FORESIGHT_DB_PASSWORD` 读取，`[database]` 的 backend/host/port/database/user 用 `config.postgresql.example.toml` / `config.mysql.example.toml` 模板。用法见 README「使用 MySQL / PostgreSQL 部署」。
+
+`.env` 存放所有密钥。因为 compose 里 API 监听 `0.0.0.0`（非本机地址），**`.env` 必须包含 `FORESIGHT_API_TOKEN`**，否则按 §11.1 的规则服务拒绝启动。`.env.example` 提供模板。
 
 ## 16. Agent Skill
 
@@ -791,9 +817,11 @@ pytest + pytest-asyncio，外部依赖全部 mock。
 
 ## 20. 依赖清单
 
-**运行时**：`discord.py>=2.7`、`SQLAlchemy[asyncio]>=2.0`、`aiosqlite`、`asyncpg`（PG）、`asyncmy`（MySQL）、`fastapi`、`uvicorn`、`httpx`、`aioboto3`、`prometheus-client>=0.20`、`typer`、`rich`、`pydantic>=2`、`pydantic-settings`、`tomli`（<3.11 兜底，3.13 用内置 `tomllib`）
+以 `pyproject.toml` 与 `uv.lock` 为准。
 
-**开发**：`pytest`、`pytest-asyncio`、`pytest-cov`、`respx`、`moto[server]`
+**运行时**：`discord.py>=2.7`、`SQLAlchemy[asyncio]>=2.0`、`aiosqlite>=0.20`、`asyncpg>=0.30`（PG）、`asyncmy>=0.2`（MySQL）、`fastapi>=0.162.5`、`uvicorn[standard]>=0.54.0`、`httpx>=0.27`、`aioboto3>=13.4`、`prometheus-client>=0.21`、`typer>=0.12`、`rich>=13.9`。配置解析用标准库 `tomllib`；请求/响应模型用的 `pydantic` 由 FastAPI 带来，不单独声明。
+
+**开发**：`pytest>=8.3`、`pytest-asyncio>=0.24`、`pytest-cov>=6.0`、`respx>=0.21`、`moto[s3,server]>=5.2.5`。
 
 ## 21. 风险与已知限制
 

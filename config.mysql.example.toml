@@ -1,0 +1,13 @@
+# Use with docker-compose.mysql.yml. Copy to config.toml, set the channel
+# IDs, and leave the database section as it is. The password comes from
+# FORESIGHT_DB_PASSWORD in .env, never from this file.
+
+[discord]
+channel_ids = [123456789012345678]
+
+[database]
+backend = "mysql"
+host = "mysql"
+port = 3306
+database = "foresight"
+user = "foresight"
