@@ -8,7 +8,7 @@
 
 **Tech Stack:** Bash、Docker、Compose、Markdown、Python（skill 自带查询脚本）。
 
-> 本文是当时的实施记录，步骤里的镜像版本和 Dockerfile 片段可能已随依赖升级变化；当前交付的部署方式以 `README.md` 和设计规范 §15 为准（含 `docker-compose.postgresql.yml` 与 `docker-compose.mysql.yml`）。
+> 本文是当时的实施记录，步骤里的镜像版本和 Dockerfile 片段可能已随依赖升级变化；当前交付的部署方式以 `README.md` 和设计规范 §15 为准（单份 `docker-compose.yml`，用 `COMPOSE_PROFILES` 选择可选服务）。
 
 **前置条件：** M1、M2、M3 已完成。
 

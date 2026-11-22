@@ -5,7 +5,7 @@ Discord 频道消息转储服务：只要用户在受监控的频道发言，消
 ## 特性
 
 - **实时采集**：消息、编辑、删除、表情回应全部捕获（编辑只保留最新内容，删除是软删除）
-- **附件归档**：图片/视频/音频下载到本地或任意 S3 兼容存储（MinIO、R2、OSS）
+- **附件归档**：图片/视频/音频下载到本地或任意 S3 兼容存储（RustFS、MinIO、R2、OSS）
 - **AI 分析**：一次模型调用同时产出翻译、情绪、问题提取
 - **查询 API**：资源端点 + 统计端点 + 只读 SQL 端点，全部只读连接
 - **Agent Skill**：装上之后 AI 就能自己查、自己分析、自己出结论
@@ -25,12 +25,22 @@ Discord 频道消息转储服务：只要用户在受监控的频道发言，消
 
 ## 快速开始（Docker，推荐）
 
+只有一份 `docker-compose.yml`。`.env` 里的环境变量同时决定启动哪些服务和应用程序使用哪些后端，不需要改 `config.toml` 就能切换架构。
+
+| `COMPOSE_PROFILES` | 启动的服务 | `.env` 中的后端变量 |
+|---|---|---|
+| 留空 | SQLite + 本地附件 | `FORESIGHT_DATABASE_BACKEND=sqlite`、`FORESIGHT_MEDIA_BACKEND=local` |
+| `mysql` | MySQL + 本地附件 | `FORESIGHT_DATABASE_BACKEND=mysql`、`FORESIGHT_MEDIA_BACKEND=local` |
+| `postgresql` | PostgreSQL + 本地附件 | `FORESIGHT_DATABASE_BACKEND=postgresql` |
+| `rustfs` | SQLite + RustFS | `FORESIGHT_MEDIA_BACKEND=s3` |
+| `mysql,rustfs` | MySQL + RustFS | `FORESIGHT_DATABASE_BACKEND=mysql`、`FORESIGHT_MEDIA_BACKEND=s3` |
+
 ```bash
 git clone https://github.com/liukunup/foresight.git
 cd foresight
 
-cp config.example.toml config.toml   # 填入 [discord].channel_ids
-cp .env.example .env                 # 填入 DISCORD_TOKEN 与 FORESIGHT_API_TOKEN
+cp config.example.toml config.toml   # 填入 channel_ids，选好 backend
+cp .env.example .env                 # 填入 token 和 COMPOSE_PROFILES
 
 docker compose up -d
 docker compose logs -f foresight
@@ -38,34 +48,18 @@ docker compose logs -f foresight
 
 服务会在 <http://127.0.0.1:8000> 提供 API，接口文档在 <http://127.0.0.1:8000/docs>。
 
-- 数据库和下载的附件都落在仓库里的 `./data` 目录（容器内 `/app/data`）。
-- 端口默认 `8000`；想换就设环境变量 `FORESIGHT_PORT=8080 docker compose up -d`。
-- 停止：`docker compose down`（数据在宿主机的 `./data` 里，`down` 不会删掉它）。
+- 启用数据库 / RustFS 时，ForeSight 会等服务通过健康检查后再启动；数据在命名卷 `mysql-data` / `postgres-data` / `rustfs-data` 里，`down` 不会删掉。`./data` 只放 SQLite 文件、本地附件和失败批次文件。
+- 非空的 `FORESIGHT_*` 环境变量覆盖 `config.toml` 中同名设置；连接信息可用 `FORESIGHT_DATABASE_HOST` / `_PORT` / `_NAME` / `_USER` / `_PATH`，S3 可用 `FORESIGHT_S3_BUCKET` / `_ENDPOINT_URL` / `_REGION` / `_PREFIX` / `_USE_PATH_STYLE`。密码仍只从 `.env` 的 `FORESIGHT_DB_PASSWORD` 读取。`FORESIGHT_API_TOKEN` 也必须设置，因为 API 绑定 `0.0.0.0`。
+- 启用 `rustfs` 时 `rustfs-bucket` 会先建好 `foresight` 桶，不用手动去控制台创建。`FORESIGHT_S3_ACCESS_KEY_ID` / `FORESIGHT_S3_SECRET_ACCESS_KEY` 同时是 RustFS 根账号和 ForeSight 签名用的密钥；access key 只用大写字母和数字，secret 用 `openssl rand -base64 24` 生成，不要用默认的 `rustfsadmin`。
+- 端口：`FORESIGHT_PORT` 控制宿主机 API 端口（默认 `8000`），`RUSTFS_PORT` / `RUSTFS_CONSOLE_PORT` 控制 RustFS 的 S3 API 和控制台（默认 `9000` / `9001`）。停止：`docker compose down`。
+- 用 MiniMax 这类 OpenAI 兼容接口时，在 `.env` 里设 `FORESIGHT_LLM_API_KEY`，并在 `config.toml` 里写：
 
-## 使用 MySQL / PostgreSQL 部署
-
-默认 compose 用 SQLite，数据库就是 `./data` 里的一个文件。仓库还附带了两份把数据库也一起编排进来的 compose 文件：
-
-| 数据库 | compose 文件 | 配置模板 |
-|---|---|---|
-| PostgreSQL | `docker-compose.postgresql.yml` | `config.postgresql.example.toml` |
-| MySQL | `docker-compose.mysql.yml` | `config.mysql.example.toml` |
-
-以 PostgreSQL 为例：
-
-```bash
-cp config.postgresql.example.toml config.toml   # 填入 channel_ids；host/port/user/database 已对应 compose
-cp .env.example .env                            # 填入 DISCORD_TOKEN、FORESIGHT_API_TOKEN、FORESIGHT_DB_PASSWORD
-docker compose -f docker-compose.postgresql.yml up -d
-docker compose -f docker-compose.postgresql.yml logs -f foresight
-```
-
-MySQL 把上面的 `postgresql` 换成 `mysql` 即可：用 `config.mysql.example.toml` 和 `docker-compose.mysql.yml`。
-
-- 数据库跑在同一个 compose 里，ForeSight 会等数据库通过健康检查后再启动；数据库数据在命名卷 `postgres-data` / `mysql-data` 里，`down` 不会删掉它。要连已有的外部数据库，就只用默认 compose 并在 `config.toml` 的 `[database]` 里填 `backend` 和连接信息。
-- 连接信息（backend/host/port/database/user）写在 `config.toml` 的 `[database]` 段；**密码只从 `.env` 的 `FORESIGHT_DB_PASSWORD` 读取**，不要写进 config.toml。`FORESIGHT_API_TOKEN` 同样必须设置，因为 API 绑定 `0.0.0.0`。
-- `./data` 仍然放本地媒体和失败批次文件，仍由 `init-data` 容器先交给 uid `10001`；换成 S3 媒体后端时可以不管这个目录。
-- 改宿主机端口仍用 `FORESIGHT_PORT`；停止用 `docker compose -f docker-compose.postgresql.yml down`（MySQL 换成对应文件）。
+  ```toml
+  [ai]
+  enabled = true
+  base_url = "https://api.minimax.chat/v1"
+  model = "MiniMax-M3.1-Flash"
+  ```
 
 ## 快速开始（本地）
 
@@ -108,16 +102,19 @@ uv run foresight both        # 采集器 + API 同时跑
 
 | 环境变量 | 什么时候必须设置 | 说明 |
 |---|---|---|
+| `COMPOSE_PROFILES` | Docker 部署 | 逗号分隔的可选服务：`mysql` / `postgresql` / `rustfs`；留空为 SQLite + 本地附件 |
+| `FORESIGHT_DATABASE_BACKEND`、`FORESIGHT_MEDIA_BACKEND` | 可选 | 应用使用的数据库 / 媒体后端；非空时覆盖 `config.toml` |
 | `DISCORD_TOKEN` | 采集 / `backfill` 时 | Discord bot token |
+| `DISCORD_CHANNEL_IDS` | 可选 | 逗号分隔的频道 ID，覆盖 `config.toml` 的 `[discord].channel_ids` |
 | `FORESIGHT_API_TOKEN` | API 不在本机监听时 | API 的 Bearer token；不设置且绑定 `0.0.0.0` 时服务拒绝启动 |
 | `FORESIGHT_LLM_API_KEY` | 开启 AI 分析时 | 模型服务的 key |
 | `FORESIGHT_DB_PASSWORD` | PostgreSQL / MySQL 时 | 数据库密码 |
-| `FORESIGHT_S3_ACCESS_KEY_ID` | `media.backend = "s3"` 时 | 对象存储的 access key |
-| `FORESIGHT_S3_SECRET_ACCESS_KEY` | `media.backend = "s3"` 时 | 对象存储的 secret |
+| `FORESIGHT_S3_ACCESS_KEY_ID` | `media.backend = "s3"` 时 | 对象存储的 access key；启用 `rustfs` profile 时同时也是 RustFS 根账号 |
+| `FORESIGHT_S3_SECRET_ACCESS_KEY` | `media.backend = "s3"` 时 | 对象存储的 secret；启用 `rustfs` profile 时同时也是 RustFS 根密码 |
 | `FORESIGHT_CONFIG` | 可选 | 配置文件路径，默认 `config.toml` |
 | `FORESIGHT_API_HOST` / `FORESIGHT_API_PORT` | 可选 | 覆盖 `[api].host` / `[api].port` |
 
-compose 另外用一个 `FORESIGHT_PORT` 决定宿主机上映射出来的端口（默认 `8000`），它只影响 compose，不影响服务本身。
+compose 另外用一个 `FORESIGHT_PORT` 决定宿主机上映射出来的端口（默认 `8000`），它只影响 compose，不影响服务本身。启用 `rustfs` profile 时还有 `RUSTFS_PORT` / `RUSTFS_CONSOLE_PORT`（默认 `9000` / `9001`）控制对象存储和控制台的宿主机端口。
 
 ## 命令
 
