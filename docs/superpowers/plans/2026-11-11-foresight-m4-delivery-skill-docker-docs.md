@@ -8,6 +8,8 @@
 
 **Tech Stack:** Bash、Docker、Compose、Markdown、Python（skill 自带查询脚本）。
 
+> 本文是当时的实施记录，步骤里的镜像版本和 Dockerfile 片段可能已随依赖升级变化；当前交付的部署方式以 `README.md` 和设计规范 §15 为准（含 `docker-compose.postgresql.yml` 与 `docker-compose.mysql.yml`）。
+
 **前置条件：** M1、M2、M3 已完成。
 
 ## Global Constraints
@@ -16,7 +18,7 @@
 - Skill 目录名固定为 `foresight-analytics`，`SKILL.md` 必须带 `name` 与 `description` frontmatter
 - Skill **只读**：任何情况下不得写入或修改数据库
 - Skill 的连接信息来自 `~/.config/foresight/connection.toml`，token 只存**环境变量名**，不存明文
-- 镜像基础为 `python:3.13-slim`，运行时使用非 root 用户（uid 10001）
+- 镜像基础随 Dependabot 升级（当前 Dockerfile 为 `python:3.15-slim`），运行时使用非 root 用户（uid 10001）
 - compose 默认端口 **8000**，可通过 `.env` 覆盖
 - compose 的 API 监听 `0.0.0.0`，因此 `.env` 必须包含 `FORESIGHT_API_TOKEN`，否则容器拒绝启动
 - `./data` 卷同时承载数据库文件与本地媒体

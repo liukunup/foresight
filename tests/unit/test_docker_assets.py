@@ -1,6 +1,8 @@
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -86,3 +88,47 @@ def test_env_example_lists_the_ports_and_the_configuration():
     assert "FORESIGHT_CONFIG=" in content
     assert "FORESIGHT_API_HOST=" in content
     assert "FORESIGHT_API_PORT=" in content
+
+
+@pytest.mark.parametrize(
+    ("compose", "config", "service", "image", "host", "port", "volume"),
+    [
+        (
+            "docker-compose.postgresql.yml",
+            "config.postgresql.example.toml",
+            "postgres",
+            "postgres:17-alpine",
+            "postgres",
+            "5432",
+            "postgres-data",
+        ),
+        (
+            "docker-compose.mysql.yml",
+            "config.mysql.example.toml",
+            "mysql",
+            "mysql:8.4",
+            "mysql",
+            "3306",
+            "mysql-data",
+        ),
+    ],
+)
+def test_database_compose_runs_the_service_after_a_healthy_database(
+    compose, config, service, image, host, port, volume
+):
+    """Both database stacks must be runnable without editing the compose."""
+    content = (ROOT / compose).read_text(encoding="utf-8")
+    assert f"image: {image}" in content
+    assert f"  {service}:" in content
+    assert "condition: service_healthy" in content
+    assert "condition: service_completed_successfully" in content
+    assert "chown 10001:10001 /app/data" in content
+    assert '"${FORESIGHT_PORT:-8000}:8000"' in content
+    assert 'command: ["both"]' in content
+    assert "${FORESIGHT_DB_PASSWORD:?set FORESIGHT_DB_PASSWORD in .env}" in content
+    assert f"{volume}:/var/lib/" in content
+    assert f"\nvolumes:\n  {volume}:" in content
+
+    settings = (ROOT / config).read_text(encoding="utf-8")
+    assert f'host = "{host}"' in settings
+    assert f"port = {port}" in settings
