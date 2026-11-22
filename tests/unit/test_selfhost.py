@@ -58,6 +58,9 @@ def test_makefile_exposes_the_one_click_target():
     assert "bash scripts/selfhost.sh" in content
     assert ".PHONY" in content
     assert "selfhost-down:" in content
+    assert "restart:" in content
+    assert "clean:" in content
+    assert "uninstall:" in content
 
 
 def test_selfhost_generates_secrets_initializes_and_starts(tmp_path):
@@ -132,3 +135,55 @@ def test_selfhost_requires_credentials_in_non_interactive_runs(tmp_path):
     assert result.returncode != 0
     assert "DISCORD_TOKEN" in result.stderr
     assert not (tmp_path / "docker.log").exists()
+
+
+def _make(tmp_path, target, env):
+    shutil.copy(ROOT / "Makefile", tmp_path / "Makefile")
+    (tmp_path / ".env").write_text("DISCORD_TOKEN=token\n", encoding="utf-8")
+    (tmp_path / "config.toml").write_text("[discord]\n", encoding="utf-8")
+    data = tmp_path / "data" / "media"
+    data.mkdir(parents=True)
+    (data / "file").write_text("attachment", encoding="utf-8")
+    return subprocess.run(
+        ["make", target],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_make_restart_restarts_the_stack_without_touching_files(tmp_path):
+    env = _prepare(tmp_path)
+    result = _make(tmp_path, "restart", env)
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "docker.log").read_text(encoding="utf-8").splitlines() == [
+        "compose --profile mysql --profile rustfs restart"
+    ]
+    assert (tmp_path / ".env").exists()
+    assert (tmp_path / "config.toml").exists()
+    assert (tmp_path / "data" / "media" / "file").exists()
+
+
+def test_make_clean_keeps_configuration_and_volumes(tmp_path):
+    env = _prepare(tmp_path)
+    result = _make(tmp_path, "clean", env)
+    assert result.returncode == 0, result.stderr
+    commands = (tmp_path / "docker.log").read_text(encoding="utf-8").splitlines()
+    assert commands == ["compose --profile mysql --profile rustfs down --remove-orphans"]
+    assert not (tmp_path / "data").exists()
+    assert (tmp_path / ".env").exists()
+    assert (tmp_path / "config.toml").exists()
+
+
+def test_make_uninstall_removes_volumes_configuration_and_image(tmp_path):
+    env = _prepare(tmp_path)
+    result = _make(tmp_path, "uninstall", env)
+    assert result.returncode == 0, result.stderr
+    commands = (tmp_path / "docker.log").read_text(encoding="utf-8").splitlines()
+    assert commands[0] == "compose --profile mysql --profile rustfs down -v --remove-orphans"
+    assert commands[1] == "image rm foresight:latest"
+    assert not (tmp_path / ".env").exists()
+    assert not (tmp_path / "config.toml").exists()
+    assert not (tmp_path / "data").exists()

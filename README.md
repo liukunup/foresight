@@ -78,8 +78,9 @@ DISCORD_TOKEN="你的 bot token" DISCORD_CHANNEL_IDS="123456789012345678,9876543
 - 需要本机有 `make`、`docker` 和 Compose 插件；`make help` 列出所有命令。
 - 已有的 `.env` 不会被覆盖：密钥和端口保持原值，重新运行只补齐缺失项并重建服务，不会清空数据库。
 - 打印出来的密钥同时存放在 `.env`（权限 600，已在 `.gitignore` 中），不要提交到版本库。
-- 采集前仍需在 Discord 开发者后台开启 **MESSAGE CONTENT INTENT** 并把 bot 邀请进服务器；改完重启用 `make selfhost-down && make selfhost`。
-- `make selfhost-status` 看状态、`make selfhost-logs` 跟日志、`make selfhost-down` 停止（数据卷保留）。
+- 采集前仍需在 Discord 开发者后台开启 **MESSAGE CONTENT INTENT** 并把 bot 邀请进服务器；改完用 `make restart` 重启。
+- `make selfhost-status` 看状态、`make selfhost-logs` 跟日志、`make selfhost-down` 停止、`make restart` 重启。
+- `make clean` 清理容器和本地 `./data`，保留 `.env`、`config.toml` 与数据卷；`make uninstall` 彻底卸载，连数据卷、配置、本地数据和镜像一起删除，之后再次 `make selfhost` 即从零开始。
 
 ## 快速开始（本地）
 
